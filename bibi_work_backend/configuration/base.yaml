@@ -1,0 +1,54 @@
+---
+application:
+  host: 0.0.0.0
+  port: 8361
+database:
+  database_name: bibi_work
+  host: 127.0.0.1
+  password: password
+  port: 5433
+  require_ssl: false
+  username: postgres
+  timeout_milliseconds: 10000
+redis:
+  url: "redis://127.0.0.1:6380"
+ferriskey:
+  issuer: http://localhost:3333/realms/bibi-work
+  audience: bibi-work-backend
+  trusted_authorized_parties:
+    - bibi-work-desktop
+    - bibi-work-web
+  discovery_url: http://localhost:3333/realms/bibi-work/.well-known/openid-configuration
+  jwks_uri: null
+  default_tenant_slug: bibi-work
+  timeout_milliseconds: 2000
+internal:
+  shared_token: ${APP_INTERNAL__SHARED_TOKEN}
+agent_runtime:
+  base_url: null
+  shared_token: ${APP_INTERNAL__SHARED_TOKEN}
+  timeout_milliseconds: 5000
+object_store:
+  enabled: true
+  endpoint: "http://localhost:9004"
+  access_key: rustfsadmin
+  secret_key: rustfsadmin
+  region: us-east-1
+  files_bucket: bibi-work-files
+  audit_bucket: bibi-work-audit
+  timeout_milliseconds: 5000
+memory_vector:
+  enabled: true
+  embedding_endpoint: "http://172.24.250.231:8335/embed"
+  qdrant_rest_url: "http://127.0.0.1:6337"
+  qdrant_collection: "bibi_work_memories"
+  timeout_milliseconds: 5000
+  max_context_chars: 1200
+  worker_interval_milliseconds: 10000
+  worker_batch_size: 10
+  worker_max_attempts: 5
+audit_hash_chain:
+  auto_seal_enabled: true
+  worker_interval_milliseconds: 60000
+  worker_tenant_batch_size: 20
+  segment_max_rows: 1000

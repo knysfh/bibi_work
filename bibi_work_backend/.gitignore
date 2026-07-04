@@ -1,0 +1,7 @@
+/target
+*.pem
+.env.local
+
+# Python-generated files from local scripts
+__pycache__/
+*.py[oc]
