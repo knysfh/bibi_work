@@ -8,6 +8,12 @@ import pytest
 
 from bibi_work_agent.api.schemas import ActorRef
 from bibi_work_agent.clients.rust_client import RustClient
+from bibi_work_agent.runtime.cancellation import RunCancelled
+from bibi_work_agent.runtime.tool_context import (
+    clear_file_tool_contexts,
+    remember_file_tool_call,
+)
+from bibi_work_agent.tools import wrapper as wrapper_module
 from bibi_work_agent.tools.wrapper import (
     PlatformToolWrapper,
     ToolDenied,
@@ -77,6 +83,94 @@ def test_tool_wrapper_allows_authorized_tool() -> None:
     )
 
 
+def test_file_tool_completion_correlates_with_stream_tool_call_id() -> None:
+    clear_file_tool_contexts()
+    remember_file_tool_call(
+        tool_call_id="call-stream-write",
+        tool_name="write_file",
+        path="/artifacts/report.txt",
+        operation="write_file",
+    )
+    tool_wrapper = wrapper("allow")
+    wrapped = tool_wrapper.wrap(
+        "write_file",
+        lambda path, content, expected_revision: None,
+    )
+
+    wrapped(
+        path="/artifacts/report.txt",
+        content="done",
+        expected_revision=0,
+    )
+
+    event = tool_wrapper.rust.emitted_events[0]["events"][0]
+    assert event["payload"]["tool_call_id"] == tool_wrapper.rust.tool_call_id
+    assert event["payload"]["ui_tool_call_id"] == "call-stream-write"
+    clear_file_tool_contexts()
+
+
+def test_tool_wrapper_skips_authorize_when_run_cancelled(monkeypatch) -> None:
+    rust = FakeRust("allow")
+    called = False
+    tool_wrapper = PlatformToolWrapper(
+        rust=rust,
+        tenant_id=str(uuid4()),
+        actor=ActorRef(user_id=uuid4()),
+        conversation_id=str(uuid4()),
+        run_id=str(uuid4()),
+    )
+
+    def mark_called() -> str:
+        nonlocal called
+        called = True
+        return "ok"
+
+    wrapped = tool_wrapper.wrap("write_file", mark_called)
+    monkeypatch.setattr(wrapper_module, "is_run_cancelled", lambda _run_id: True)
+
+    with pytest.raises(RunCancelled):
+        wrapped()
+
+    assert called is False
+    assert rust.payloads == []
+    assert rust.emitted_events == []
+
+
+def test_tool_wrapper_stops_after_tool_when_cancelled_before_artifact(
+    monkeypatch,
+) -> None:
+    rust = FakeRust("allow")
+    calls = 0
+    tool_wrapper = PlatformToolWrapper(
+        rust=rust,
+        tenant_id=str(uuid4()),
+        actor=ActorRef(user_id=uuid4(), device_id=uuid4(), session_id=uuid4()),
+        conversation_id=str(uuid4()),
+        run_id=str(uuid4()),
+        project_id=str(uuid4()),
+    )
+
+    def query_users() -> list[dict[str, str]]:
+        nonlocal calls
+        calls += 1
+        return [{"name": f"user-{index}"} for index in range(25)]
+
+    states = iter([False, False, False, True])
+    monkeypatch.setattr(
+        wrapper_module,
+        "is_run_cancelled",
+        lambda _run_id: next(states, True),
+    )
+    wrapped = tool_wrapper.wrap("query_users", query_users)
+
+    with pytest.raises(RunCancelled):
+        wrapped()
+
+    assert calls == 1
+    assert rust.file_writes == []
+    assert rust.emitted_events == []
+
+
 def test_tool_wrapper_redacts_input_summary() -> None:
     tool_wrapper = wrapper("allow")
     wrapped = tool_wrapper.wrap("send_secret", lambda **_: "ok")
@@ -111,6 +205,82 @@ def test_tool_wrapper_applies_output_obligations() -> None:
     assert "[REDACTED]" in event["payload"]["output_summary"]
 
 
+def test_browser_tool_emits_compact_structured_projection() -> None:
+    tool_wrapper = wrapper("allow")
+    wrapped = tool_wrapper.wrap(
+        "browser_snapshot",
+        lambda: {
+            "kind": "browser",
+            "action": "snapshot",
+            "session_id": "browser-session-1",
+            "profile": "research",
+            "url": "https://www.math.pku.edu.cn/teachers",
+            "title": "北京大学数学科学学院",
+            "text": "large page text" * 1_000,
+            "elements": [{"ref": "e1", "label": "教授名单"}],
+            "element_count": 1,
+        },
+    )
+
+    wrapped()
+
+    event = tool_wrapper.rust.emitted_events[0]["events"][0]
+    assert event["payload"]["browser"] == {
+        "kind": "browser",
+        "action": "snapshot",
+        "session_id": "browser-session-1",
+        "profile": "research",
+        "url": "https://www.math.pku.edu.cn/teachers",
+        "title": "北京大学数学科学学院",
+        "element_count": 1,
+    }
+    assert "text" not in event["payload"]["browser"]
+    assert "elements" not in event["payload"]["browser"]
+
+
+def test_retryable_browser_failure_is_returned_to_the_agent_loop() -> None:
+    tool_wrapper = wrapper("allow")
+    recoverable = {
+        "kind": "browser",
+        "action": "click",
+        "session_id": "browser-session-1",
+        "status": "failed",
+        "retryable": True,
+        "error": {
+            "code": "BROWSER_TARGET_NOT_ACTIONABLE",
+            "message": "stale ref",
+        },
+        "recovery": {
+            "attempt": 1,
+            "failure_fingerprint": "abcdef0123456789",
+        },
+        "recovery_snapshot": {
+            "kind": "browser",
+            "action": "snapshot",
+            "session_id": "browser-session-1",
+            "url": "https://portal.example.test/home",
+            "title": "Home",
+            "element_count": 2,
+        },
+    }
+    wrapped = tool_wrapper.wrap("browser_click", lambda: recoverable)
+
+    assert wrapped() == recoverable
+    event = tool_wrapper.rust.emitted_events[0]["events"][0]
+    assert event["type"] == "tool.call.failed"
+    assert event["payload"]["retryable"] is True
+    assert event["payload"]["error_type"] == "BROWSER_TARGET_NOT_ACTIONABLE"
+    assert event["payload"]["recovery_attempt"] == 1
+    assert event["payload"]["browser"] == {
+        "kind": "browser",
+        "action": "snapshot",
+        "session_id": "browser-session-1",
+        "url": "https://portal.example.test/home",
+        "title": "Home",
+        "element_count": 2,
+    }
+
+
 def test_tool_wrapper_writes_large_tool_result_artifact() -> None:
     rust = FakeRust("allow")
     tool_wrapper = PlatformToolWrapper(
@@ -140,13 +310,14 @@ def test_tool_wrapper_passes_ui_hints_to_presenter() -> None:
     wrapped = tool_wrapper.wrap(
         "metrics",
         lambda: {"spec": {"mark": "bar", "encoding": {}}},
-        ui_hints={"view": "chart"},
+        ui_hints={"view": "chart", "title": "Metrics chart"},
     )
 
     wrapped()
 
     event = tool_wrapper.rust.emitted_events[0]["events"][0]
     assert event["payload"]["views"][0]["kind"] == "chart"
+    assert event["payload"]["views"][0]["title"] == "Metrics chart"
 
 
 def test_tool_wrapper_emits_failed_event_and_reraises() -> None:
@@ -225,6 +396,7 @@ def test_tool_wrapper_emits_completed_event_through_rust_http() -> None:
     authorize_payload = requests[0][1]
     assert authorize_payload["tenant_id"] == tenant_id
     assert authorize_payload["run_id"] == run_id
+    assert authorize_payload["trace_id"] == "trace-1"
     assert authorize_payload["tool_name"] == "read_secret"
     assert json.loads(authorize_payload["input_summary"]) == {"args": [], "kwargs": {}}
 
@@ -242,6 +414,46 @@ def test_tool_wrapper_emits_completed_event_through_rust_http() -> None:
     assert event["payload"]["views"][0] == {
         "kind": "json",
         "value_preview": {"status": "ok", "token": "[REDACTED]"},
+    }
+
+
+def test_tool_wrapper_maps_local_exec_to_critical_local_exec_resource() -> None:
+    device_id = uuid4()
+    tool_wrapper = PlatformToolWrapper(
+        rust=FakeRust("allow"),
+        tenant_id=str(uuid4()),
+        actor=ActorRef(user_id=uuid4(), device_id=device_id),
+        conversation_id=str(uuid4()),
+        run_id=str(uuid4()),
+    )
+    wrapped = tool_wrapper.wrap("local_exec", lambda command: {"status": "queued"})
+
+    wrapped(["pwd"])
+
+    payload = tool_wrapper.rust.payloads[0]
+    assert payload.risk_level == "critical"
+    assert payload.resource == {"type": "local_exec", "id": str(device_id)}
+
+
+def test_tool_wrapper_maps_sql_tool_and_query_resources() -> None:
+    sql_tool_id = uuid4()
+    tool_wrapper = wrapper("allow")
+    sql_tool = tool_wrapper.wrap("sql_execute", lambda **_: {"rows": []})
+
+    sql_tool(sql_tool_id=sql_tool_id)
+
+    assert tool_wrapper.rust.payloads[0].resource == {
+        "type": "sql_tool",
+        "id": str(sql_tool_id),
+    }
+
+    query_hash = "sha256:query"
+    sql_query = tool_wrapper.wrap("sql_query", lambda **_: {"rows": []})
+    sql_query(query_hash=query_hash)
+
+    assert tool_wrapper.rust.payloads[1].resource == {
+        "type": "sql_query",
+        "id": query_hash,
     }
 
 
@@ -311,16 +523,39 @@ def test_tool_wrapper_failed_event_emit_does_not_mask_tool_error() -> None:
 
 
 def test_tool_wrapper_raises_for_review() -> None:
-    wrapped = wrapper("review").wrap("deploy_site", lambda: "deployed")
+    tool_wrapper = wrapper("review")
+    called = False
+
+    def deploy_site() -> str:
+        nonlocal called
+        called = True
+        return "deployed"
+
+    wrapped = tool_wrapper.wrap("deploy_site", deploy_site)
 
     with pytest.raises(ToolRequiresApproval) as exc:
         wrapped()
 
     assert exc.value.approval_id is not None
+    assert called is False
+    assert len(tool_wrapper.rust.payloads) == 1
+    assert tool_wrapper.rust.emitted_events == []
 
 
 def test_tool_wrapper_denies_tool() -> None:
-    wrapped = wrapper("deny").wrap("delete_file", lambda: "deleted")
+    tool_wrapper = wrapper("deny")
+    called = False
+
+    def delete_file() -> str:
+        nonlocal called
+        called = True
+        return "deleted"
+
+    wrapped = tool_wrapper.wrap("delete_file", delete_file)
 
     with pytest.raises(ToolDenied):
         wrapped()
+
+    assert called is False
+    assert len(tool_wrapper.rust.payloads) == 1
+    assert tool_wrapper.rust.emitted_events == []

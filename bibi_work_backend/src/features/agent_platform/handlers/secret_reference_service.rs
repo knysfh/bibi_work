@@ -43,7 +43,7 @@ pub async fn list_secret_refs(
     let refs = std::env::var("BIBI_WORK_SECRET_REFS")
         .unwrap_or_default()
         .split(',')
-        .filter_map(parse_secret_ref_entry)
+        .filter_map(|entry| parse_secret_ref_entry(&state.secret_resolver, entry))
         .filter(|item| {
             requested_purpose == "all"
                 || item.purpose.as_str() == requested_purpose
@@ -53,7 +53,10 @@ pub async fn list_secret_refs(
     Ok(Json(refs))
 }
 
-fn parse_secret_ref_entry(raw: &str) -> Option<SecretRefResponse> {
+fn parse_secret_ref_entry(
+    resolver: &secret_resolver::SecretResolver,
+    raw: &str,
+) -> Option<SecretRefResponse> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
@@ -73,15 +76,8 @@ fn parse_secret_ref_entry(raw: &str) -> Option<SecretRefResponse> {
         label: label.trim().to_string(),
         purpose: purpose.trim().to_string(),
         scheme,
-        available: secret_available(secret_ref),
+        available: resolver.is_configured(secret_ref),
     })
-}
-
-fn secret_available(secret_ref: &str) -> bool {
-    secret_resolver::env_name_from_secret_ref(secret_ref)
-        .ok()
-        .and_then(|name| std::env::var(name).ok())
-        .is_some()
 }
 
 #[cfg(test)]
@@ -93,7 +89,8 @@ mod tests {
         unsafe {
             std::env::set_var("BIBI_TEST_LISTED_SECRET", "hidden");
         }
-        let parsed = parse_secret_ref_entry("llm:OpenAI=env://BIBI_TEST_LISTED_SECRET")
+        let resolver = secret_resolver::SecretResolver::env_only_for_tests();
+        let parsed = parse_secret_ref_entry(&resolver, "llm:OpenAI=env://BIBI_TEST_LISTED_SECRET")
             .expect("entry parsed");
 
         assert_eq!(parsed.id, "env://BIBI_TEST_LISTED_SECRET");

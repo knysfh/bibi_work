@@ -1,13 +1,21 @@
 use std::time::Duration;
 
-use reqwest::{Client, Method};
+use reqwest::{Client, Method, RequestBuilder};
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use sqlx::{AssertSqlSafe, Row, postgres::PgRow};
+use sqlx::{
+    AssertSqlSafe, PgPool, Row,
+    postgres::{PgConnectOptions, PgPoolOptions, PgRow, PgSslMode},
+};
 use uuid::Uuid;
 
 use crate::{features::core::errors::AppError, startup::AppState};
 
-use super::models::{McpToolCallRequest, SqlToolExecuteRequest, ThirdPartyToolCallRequest};
+use super::{
+    local_runtime_queue, mcp_http,
+    models::{McpToolCallRequest, SqlToolExecuteRequest, ThirdPartyToolCallRequest},
+    secret_resolver,
+};
 
 const DEFAULT_TOOL_HTTP_TIMEOUT_MS: u64 = 30_000;
 const MAX_SQL_ROWS_HARD_LIMIT: i64 = 10_000;
@@ -16,9 +24,16 @@ struct McpExecutionTarget {
     mcp_tool_id: Option<Uuid>,
     server_id: Uuid,
     tool_name: String,
+    schema: Value,
     transport: String,
     config: Value,
     secret_ref: Option<String>,
+}
+
+pub struct McpExecutionAuthzTarget {
+    pub mcp_tool_id: Uuid,
+    pub mcp_server_id: Uuid,
+    pub risk_level: String,
 }
 
 struct SqlExecutionTarget {
@@ -26,12 +41,33 @@ struct SqlExecutionTarget {
     sql_tool_id: Uuid,
     connection_id: Uuid,
     operation: String,
+    risk_level: String,
+    requires_approval: bool,
     sql_template: String,
     query_hash: String,
     max_rows: i32,
     statement_timeout_ms: i32,
     database_kind: String,
+    host: Option<String>,
+    port: Option<i32>,
+    database_name: Option<String>,
+    username_ref: Option<String>,
     password_secret_ref: Option<String>,
+    tls_config_ref: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SqlTlsSecretConfig {
+    mode: String,
+    root_cert_pem: Option<String>,
+    client_cert_pem: Option<String>,
+    client_key_pem: Option<String>,
+}
+
+pub struct SqlExecutionAuthzTarget {
+    pub sql_tool_id: Uuid,
+    pub query_hash: String,
+    pub risk_level: String,
 }
 
 struct ThirdPartyExecutionTarget {
@@ -39,6 +75,7 @@ struct ThirdPartyExecutionTarget {
     tool_version_id: Uuid,
     tool_name: String,
     schema_snapshot: Value,
+    secret_ref: Option<String>,
 }
 
 pub async fn execute_mcp_tool(
@@ -46,15 +83,12 @@ pub async fn execute_mcp_tool(
     payload: &McpToolCallRequest,
 ) -> Result<Value, AppError> {
     let target = load_mcp_execution_target(state, payload).await?;
-    if target.secret_ref.is_some() {
-        return Err(AppError::InvalidInput(
-            "mcp secret resolver is not configured; refusing to execute secret-backed MCP tool"
-                .to_string(),
-        ));
+    if target.transport == "stdio" {
+        return execute_stdio_mcp_tool(state, payload, target).await;
     }
     if !matches!(
         target.transport.as_str(),
-        "http" | "streamable-http" | "sse" | "json-rpc"
+        "http" | "streamable-http" | "streamable_http" | "sse" | "json-rpc"
     ) {
         return Err(AppError::InvalidInput(format!(
             "unsupported MCP transport for Rust executor: {}",
@@ -62,30 +96,117 @@ pub async fn execute_mcp_tool(
         )));
     }
 
-    let endpoint = mcp_endpoint(&target.config)?;
-    let timeout_ms = json_u64(&target.config, "timeout_ms").unwrap_or(DEFAULT_TOOL_HTTP_TIMEOUT_MS);
-    let http = Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
-        .build()
-        .map_err(|err| AppError::InvalidInput(format!("failed to build MCP client: {err}")))?;
-    let request_id = Uuid::new_v4().to_string();
-    let request_body = json!({
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "method": "tools/call",
-        "params": {
+    let mut value = mcp_http::request(
+        &state.secret_resolver,
+        &target.transport,
+        &target.config,
+        target.secret_ref.as_deref(),
+        "tools/call",
+        json!({
+            "name": target.tool_name,
+            "arguments": payload.arguments
+        }),
+    )
+    .await?;
+    if value.get("error").is_some() {
+        return Err(AppError::InvalidInput(format!(
+            "MCP tool returned error: {}",
+            redact_for_error(&value)
+        )));
+    }
+    if let Value::Object(ref mut map) = value {
+        map.insert(
+            "mcp_server_id".to_string(),
+            Value::String(target.server_id.to_string()),
+        );
+        if let Some(tool_id) = target.mcp_tool_id {
+            map.insert(
+                "mcp_tool_id".to_string(),
+                Value::String(tool_id.to_string()),
+            );
+        }
+    }
+    Ok(value)
+}
+
+pub async fn load_mcp_execution_authz_target(
+    state: &AppState,
+    payload: &McpToolCallRequest,
+) -> Result<McpExecutionAuthzTarget, AppError> {
+    let target = load_mcp_execution_target(state, payload).await?;
+    Ok(McpExecutionAuthzTarget {
+        mcp_tool_id: target
+            .mcp_tool_id
+            .ok_or_else(|| AppError::NotFound("MCP tool not found".to_string()))?,
+        mcp_server_id: target.server_id,
+        risk_level: trusted_mcp_risk_level(&target.tool_name, &target.schema).to_string(),
+    })
+}
+
+async fn execute_stdio_mcp_tool(
+    state: &AppState,
+    payload: &McpToolCallRequest,
+    target: McpExecutionTarget,
+) -> Result<Value, AppError> {
+    let device_id = payload.actor.device_id.ok_or_else(|| {
+        AppError::InvalidInput(
+            "MCP stdio execution requires the actor desktop device_id".to_string(),
+        )
+    })?;
+    let command = json_string(&target.config, "command")
+        .ok_or_else(|| AppError::InvalidInput("MCP stdio command is required".to_string()))?;
+    let timeout_ms = json_u64(&target.config, "timeout_ms")
+        .unwrap_or(DEFAULT_TOOL_HTTP_TIMEOUT_MS)
+        .clamp(1_000, 120_000) as i32;
+    let max_output_bytes = json_u64(&target.config, "max_output_bytes")
+        .unwrap_or(1_048_576)
+        .clamp(1_024, 8 * 1_048_576) as i32;
+    let work = json!({
+        "protocol": "local_runtime.v1",
+        "kind": "mcp_stdio",
+        "mcp_server_id": target.server_id,
+        "transport": {
+            "type": "stdio",
+            "command": command,
+            "args": target.config.get("args").cloned().unwrap_or_else(|| json!([])),
+            "env": target.config.get("env").cloned().unwrap_or_else(|| json!({})),
+            "timeout_ms": timeout_ms
+        },
+        "tool": {
             "name": target.tool_name,
             "arguments": payload.arguments
         }
     });
-
-    let response = http
-        .post(endpoint)
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|err| AppError::InvalidInput(format!("MCP tool call failed: {err}")))?;
-    let mut value = response_json_or_text(response).await?;
+    let request = local_runtime_queue::enqueue(
+        &state.connect_pool,
+        local_runtime_queue::EnqueueLocalRuntimeRequest {
+            tenant_id: payload.tenant_id,
+            device_id: Some(device_id),
+            project_id: None,
+            run_id: payload.run_id,
+            command: work,
+            timeout_ms,
+            max_output_bytes,
+        },
+    )
+    .await?;
+    let result = local_runtime_queue::wait_for_result(
+        &state.connect_pool,
+        request.id,
+        payload.tenant_id,
+        timeout_ms,
+    )
+    .await?;
+    if result.status != "completed" {
+        let summary = result
+            .error
+            .unwrap_or_else(|| "desktop local runtime did not complete the request".to_string());
+        return Err(AppError::InvalidInput(format!(
+            "MCP stdio local runtime request failed: {}",
+            summary.chars().take(2_000).collect::<String>()
+        )));
+    }
+    let mut value = result.result.unwrap_or(Value::Null);
     if value.get("error").is_some() {
         return Err(AppError::InvalidInput(format!(
             "MCP tool returned error: {}",
@@ -118,12 +239,6 @@ pub async fn execute_sql_tool(
             target.database_kind
         )));
     }
-    if target.password_secret_ref.is_some() {
-        return Err(AppError::InvalidInput(
-            "sql credential resolver is not configured; refusing to execute secret-backed SQL tool"
-                .to_string(),
-        ));
-    }
     if target.operation != "read" {
         return Err(AppError::InvalidInput(
             "only read SQL tools can execute in the built-in Rust executor".to_string(),
@@ -145,22 +260,8 @@ pub async fn execute_sql_tool(
         max_rows + 1
     );
 
-    let mut tx = state.connect_pool.begin().await?;
-    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
-        .bind(target.statement_timeout_ms.max(1).to_string())
-        .execute(&mut *tx)
-        .await?;
-    let mut query = sqlx::query(AssertSqlSafe(wrapped_sql));
-    for value in compiled.values {
-        query = bind_json_value(query, value)?;
-    }
-    let row = query.fetch_one(&mut *tx).await?;
-    tx.commit()
-        .await
-        .map_err(|_| AppError::DatabaseTransaction)?;
-
-    let rows: Value = row.try_get("rows")?;
-    let row_count: i64 = row.try_get("row_count")?;
+    let (rows, row_count) =
+        execute_postgres_read_query(state, &target, wrapped_sql, compiled.values).await?;
     let mut rows = rows.as_array().cloned().unwrap_or_default();
     let truncated = i64::try_from(rows.len())? > max_rows;
     if truncated {
@@ -176,6 +277,22 @@ pub async fn execute_sql_tool(
         "matched_row_count": row_count,
         "truncated": truncated
     }))
+}
+
+pub async fn load_sql_execution_authz_target(
+    state: &AppState,
+    payload: &SqlToolExecuteRequest,
+) -> Result<SqlExecutionAuthzTarget, AppError> {
+    let target = load_sql_execution_target(state, payload).await?;
+    Ok(SqlExecutionAuthzTarget {
+        sql_tool_id: target.sql_tool_id,
+        query_hash: target.query_hash,
+        risk_level: sql_execution_risk_level(
+            &target.operation,
+            &target.risk_level,
+            target.requires_approval,
+        ),
+    })
 }
 
 pub async fn execute_third_party_tool(
@@ -216,6 +333,13 @@ pub async fn execute_third_party_tool(
     for (name, value) in headers {
         request = request.header(name, value);
     }
+    request = apply_http_tool_secret_auth(
+        &state.secret_resolver,
+        request,
+        executor,
+        target.secret_ref.as_deref(),
+    )
+    .await?;
     request = if method == Method::GET {
         request
     } else {
@@ -240,7 +364,7 @@ async fn load_mcp_execution_target(
     let row = if let Some(mcp_tool_id) = payload.mcp_tool_id {
         sqlx::query(
             r#"
-            SELECT mt.id AS mcp_tool_id, mt.name AS tool_name,
+            SELECT mt.id AS mcp_tool_id, mt.name AS tool_name, mt.schema,
                    ms.id AS server_id, ms.transport, ms.config, ms.secret_ref
             FROM mcp_tools mt
             JOIN mcp_servers ms ON ms.id = mt.mcp_server_id
@@ -260,7 +384,7 @@ async fn load_mcp_execution_target(
         })?;
         sqlx::query(
             r#"
-            SELECT mt.id AS mcp_tool_id, mt.name AS tool_name,
+            SELECT mt.id AS mcp_tool_id, mt.name AS tool_name, mt.schema,
                    ms.id AS server_id, ms.transport, ms.config, ms.secret_ref
             FROM mcp_tools mt
             JOIN mcp_servers ms ON ms.id = mt.mcp_server_id
@@ -283,10 +407,38 @@ async fn load_mcp_execution_target(
         mcp_tool_id: row.try_get("mcp_tool_id")?,
         server_id: row.try_get("server_id")?,
         tool_name: row.try_get("tool_name")?,
+        schema: row.try_get("schema")?,
         transport: row.try_get("transport")?,
         config: row.try_get("config")?,
         secret_ref: row.try_get("secret_ref")?,
     })
+}
+
+fn trusted_mcp_risk_level(tool_name: &str, schema: &Value) -> &'static str {
+    let annotations = schema.get("annotations");
+    if annotations
+        .and_then(|value| value.get("destructiveHint"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return "high";
+    }
+    if annotations
+        .and_then(|value| value.get("readOnlyHint"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return "low";
+    }
+    let lowered = tool_name.to_ascii_lowercase();
+    if ["read", "list", "get", "search"]
+        .iter()
+        .any(|prefix| lowered.starts_with(prefix))
+    {
+        "medium"
+    } else {
+        "high"
+    }
 }
 
 async fn load_sql_execution_target(
@@ -332,8 +484,11 @@ fn sql_target_query(predicate: &str, order_by: &str) -> String {
     format!(
         r#"
         SELECT stv.id AS sql_tool_version_id, stv.sql_tool_id, stv.connection_id,
-               stv.operation, stv.sql_template, stv.query_hash,
-               sc.max_rows, sc.statement_timeout_ms, sc.database_kind, sc.password_secret_ref
+               stv.operation, stv.risk_level, stv.requires_approval,
+               stv.sql_template, stv.query_hash,
+               sc.max_rows, sc.statement_timeout_ms, sc.database_kind,
+               sc.host, sc.port, sc.database_name, sc.username_ref,
+               sc.password_secret_ref, sc.tls_config_ref
         FROM sql_tool_versions stv
         JOIN sql_connections sc ON sc.id = stv.connection_id
         JOIN sql_tools st ON st.id = stv.sql_tool_id
@@ -353,13 +508,219 @@ fn sql_target_from_row(row: PgRow) -> Result<SqlExecutionTarget, AppError> {
         sql_tool_id: row.try_get("sql_tool_id")?,
         connection_id: row.try_get("connection_id")?,
         operation: row.try_get("operation")?,
+        risk_level: row.try_get("risk_level")?,
+        requires_approval: row.try_get("requires_approval")?,
         sql_template: row.try_get("sql_template")?,
         query_hash: row.try_get("query_hash")?,
         max_rows: row.try_get("max_rows")?,
         statement_timeout_ms: row.try_get("statement_timeout_ms")?,
         database_kind: row.try_get("database_kind")?,
+        host: row.try_get("host")?,
+        port: row.try_get("port")?,
+        database_name: row.try_get("database_name")?,
+        username_ref: row.try_get("username_ref")?,
         password_secret_ref: row.try_get("password_secret_ref")?,
+        tls_config_ref: row.try_get("tls_config_ref")?,
     })
+}
+
+async fn execute_postgres_read_query(
+    state: &AppState,
+    target: &SqlExecutionTarget,
+    sql: String,
+    values: Vec<Value>,
+) -> Result<(Value, i64), AppError> {
+    if target.password_secret_ref.is_some() {
+        let pool = secret_backed_postgres_pool(&state.secret_resolver, target).await?;
+        fetch_postgres_json_rows(&pool, target.statement_timeout_ms, sql, values).await
+    } else {
+        fetch_postgres_json_rows(
+            &state.connect_pool,
+            target.statement_timeout_ms,
+            sql,
+            values,
+        )
+        .await
+    }
+}
+
+async fn secret_backed_postgres_pool(
+    secret_resolver: &secret_resolver::SecretResolver,
+    target: &SqlExecutionTarget,
+) -> Result<PgPool, AppError> {
+    let host = required_sql_connection_field(target.host.as_deref(), "host")?;
+    let database_name =
+        required_sql_connection_field(target.database_name.as_deref(), "database_name")?;
+    let username_ref =
+        required_sql_connection_field(target.username_ref.as_deref(), "username_ref")?;
+    let password_secret_ref = required_sql_connection_field(
+        target.password_secret_ref.as_deref(),
+        "password_secret_ref",
+    )?;
+    let username = resolve_optional_env_ref(username_ref)?;
+    let password = secret_resolver.resolve(password_secret_ref).await?;
+    let port = target.port.unwrap_or(5432).clamp(1, 65_535) as u16;
+    let options = PgConnectOptions::new()
+        .host(host)
+        .port(port)
+        .database(database_name)
+        .username(&username)
+        .password(&password);
+    let options =
+        apply_sql_tls_config(secret_resolver, options, target.tls_config_ref.as_deref()).await?;
+    PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .map_err(|err| AppError::InvalidInput(format!("SQL connection failed: {err}")))
+}
+
+async fn apply_sql_tls_config(
+    secret_resolver: &secret_resolver::SecretResolver,
+    mut options: PgConnectOptions,
+    tls_config_ref: Option<&str>,
+) -> Result<PgConnectOptions, AppError> {
+    let Some(tls_config_ref) = tls_config_ref else {
+        return Ok(options.ssl_mode(PgSslMode::Prefer));
+    };
+    let encoded = secret_resolver.resolve(tls_config_ref).await?;
+    if encoded.len() > 2 * 1024 * 1024 {
+        return Err(AppError::InvalidInput(
+            "SQL TLS secret config exceeds the size limit".to_string(),
+        ));
+    }
+    let config: SqlTlsSecretConfig = serde_json::from_str(&encoded).map_err(|_| {
+        AppError::InvalidInput("SQL TLS secret config must be valid JSON".to_string())
+    })?;
+    let mode = match config.mode.trim().to_ascii_lowercase().as_str() {
+        "require" => PgSslMode::Require,
+        "verify-ca" => PgSslMode::VerifyCa,
+        "verify-full" => PgSslMode::VerifyFull,
+        _ => {
+            return Err(AppError::InvalidInput(
+                "SQL TLS mode must be require, verify-ca, or verify-full".to_string(),
+            ));
+        }
+    };
+    if matches!(mode, PgSslMode::VerifyCa | PgSslMode::VerifyFull)
+        && config.root_cert_pem.as_deref().is_none_or(str::is_empty)
+    {
+        return Err(AppError::InvalidInput(
+            "SQL verify TLS mode requires root_cert_pem".to_string(),
+        ));
+    }
+    if config.client_cert_pem.is_some() != config.client_key_pem.is_some() {
+        return Err(AppError::InvalidInput(
+            "SQL TLS client_cert_pem and client_key_pem must be configured together".to_string(),
+        ));
+    }
+    options = options.ssl_mode(mode);
+    if let Some(root) = config.root_cert_pem {
+        validate_pem(&root, "CERTIFICATE")?;
+        options = options.ssl_root_cert_from_pem(root.into_bytes());
+    }
+    if let (Some(cert), Some(key)) = (config.client_cert_pem, config.client_key_pem) {
+        validate_pem(&cert, "CERTIFICATE")?;
+        if !(key.contains("-----BEGIN PRIVATE KEY-----")
+            || key.contains("-----BEGIN RSA PRIVATE KEY-----"))
+        {
+            return Err(AppError::InvalidInput(
+                "SQL TLS client key is not PEM encoded".to_string(),
+            ));
+        }
+        options = options
+            .ssl_client_cert_from_pem(cert.as_bytes())
+            .ssl_client_key_from_pem(key.as_bytes());
+    }
+    Ok(options)
+}
+
+fn validate_pem(value: &str, label: &str) -> Result<(), AppError> {
+    if value.len() > 1024 * 1024
+        || !value.contains(&format!("-----BEGIN {label}-----"))
+        || !value.contains(&format!("-----END {label}-----"))
+    {
+        return Err(AppError::InvalidInput(
+            "SQL TLS certificate is not valid bounded PEM".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn fetch_postgres_json_rows(
+    pool: &PgPool,
+    statement_timeout_ms: i32,
+    sql: String,
+    values: Vec<Value>,
+) -> Result<(Value, i64), AppError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+        .bind(statement_timeout_ms.max(1).to_string())
+        .execute(&mut *tx)
+        .await?;
+    let mut query = sqlx::query(AssertSqlSafe(sql));
+    for value in values {
+        query = bind_json_value(query, value)?;
+    }
+    let row = query.fetch_one(&mut *tx).await?;
+    tx.commit()
+        .await
+        .map_err(|_| AppError::DatabaseTransaction)?;
+
+    Ok((row.try_get("rows")?, row.try_get("row_count")?))
+}
+
+fn required_sql_connection_field<'a>(
+    value: Option<&'a str>,
+    field: &str,
+) -> Result<&'a str, AppError> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AppError::InvalidInput(format!("sql connection {field} is required")))
+}
+
+fn resolve_optional_env_ref(value: &str) -> Result<String, AppError> {
+    if value.starts_with("env://") || value.starts_with("env:") {
+        secret_resolver::resolve_env_secret_ref(value)
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn sql_execution_risk_level(
+    operation: &str,
+    configured_risk_level: &str,
+    requires_approval: bool,
+) -> String {
+    let configured = normalize_risk_level(configured_risk_level).unwrap_or("medium");
+    let operation = operation.trim().to_ascii_lowercase();
+    if matches!(operation.as_str(), "write" | "ddl") {
+        return "critical".to_string();
+    }
+    if requires_approval && risk_rank(configured) < risk_rank("high") {
+        return "high".to_string();
+    }
+    configured.to_string()
+}
+
+fn normalize_risk_level(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "critical" => Some("critical"),
+        _ => None,
+    }
+}
+
+fn risk_rank(value: &str) -> u8 {
+    match value {
+        "low" => 0,
+        "medium" => 1,
+        "high" => 2,
+        "critical" => 3,
+        _ => 1,
+    }
 }
 
 async fn load_third_party_execution_target(
@@ -370,7 +731,7 @@ async fn load_third_party_execution_target(
         sqlx::query(
             r#"
             SELECT t.id AS tool_id, tv.id AS tool_version_id, t.name AS tool_name,
-                   tv.schema_snapshot
+                   tv.schema_snapshot, tv.secret_ref
             FROM tool_versions tv
             JOIN tools t ON t.id = tv.tool_id
             WHERE tv.id = $1
@@ -387,7 +748,7 @@ async fn load_third_party_execution_target(
         sqlx::query(
             r#"
             SELECT t.id AS tool_id, tv.id AS tool_version_id, t.name AS tool_name,
-                   tv.schema_snapshot
+                   tv.schema_snapshot, tv.secret_ref
             FROM tool_versions tv
             JOIN tools t ON t.id = tv.tool_id
             WHERE t.id = $1
@@ -406,7 +767,7 @@ async fn load_third_party_execution_target(
         sqlx::query(
             r#"
             SELECT t.id AS tool_id, tv.id AS tool_version_id, t.name AS tool_name,
-                   tv.schema_snapshot
+                   tv.schema_snapshot, tv.secret_ref
             FROM tool_versions tv
             JOIN tools t ON t.id = tv.tool_id
             WHERE t.name = $1
@@ -433,6 +794,7 @@ async fn load_third_party_execution_target(
         tool_version_id: row.try_get("tool_version_id")?,
         tool_name: row.try_get("tool_name")?,
         schema_snapshot: row.try_get("schema_snapshot")?,
+        secret_ref: row.try_get("secret_ref")?,
     })
 }
 
@@ -560,24 +922,6 @@ fn is_identifier_continue(value: char) -> bool {
     value.is_ascii_alphanumeric() || value == '_'
 }
 
-fn mcp_endpoint(config: &Value) -> Result<String, AppError> {
-    if let Some(url) = json_string(config, "tool_call_url")
-        .or_else(|| json_string(config, "endpoint"))
-        .or_else(|| json_string(config, "url"))
-    {
-        return Ok(url);
-    }
-    let base_url = json_string(config, "base_url").ok_or_else(|| {
-        AppError::InvalidInput("MCP server endpoint/base_url is required".to_string())
-    })?;
-    let path = json_string(config, "path").unwrap_or_else(|| "/".to_string());
-    Ok(format!(
-        "{}/{}",
-        base_url.trim_end_matches('/'),
-        path.trim_start_matches('/')
-    ))
-}
-
 fn http_method(executor: &Value) -> Result<Method, AppError> {
     let method = json_string(executor, "method")
         .unwrap_or_else(|| "POST".to_string())
@@ -614,6 +958,38 @@ fn safe_headers(value: Option<&Value>) -> Result<Vec<(String, String)>, AppError
         result.push((name.clone(), header_value.to_string()));
     }
     Ok(result)
+}
+
+async fn apply_http_tool_secret_auth(
+    secret_resolver: &secret_resolver::SecretResolver,
+    request: RequestBuilder,
+    executor: &Value,
+    secret_ref: Option<&str>,
+) -> Result<RequestBuilder, AppError> {
+    let Some(secret_ref) = secret_ref else {
+        return Ok(request);
+    };
+    let secret = secret_resolver.resolve(secret_ref).await?;
+    let header_name = json_string(executor, "auth_header")
+        .or_else(|| json_string(executor, "secret_header"))
+        .or_else(|| json_string(executor, "api_key_header"))
+        .unwrap_or_else(|| "Authorization".to_string());
+    if header_name.trim().is_empty()
+        || header_name
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'-'))
+    {
+        return Err(AppError::InvalidInput(
+            "third-party tool auth header name is invalid".to_string(),
+        ));
+    }
+    let scheme = json_string(executor, "auth_scheme").unwrap_or_else(|| "Bearer".to_string());
+    let header_value = if scheme.eq_ignore_ascii_case("none") {
+        secret
+    } else {
+        format!("{scheme} {secret}")
+    };
+    Ok(request.header(header_name, header_value))
 }
 
 fn scalar_query_params(arguments: &Value) -> Result<Vec<(String, String)>, AppError> {
@@ -744,7 +1120,7 @@ fn redact_map(map: &mut Map<String, Value>) {
 
 #[cfg(test)]
 mod tests {
-    use axum::{Json, Router, routing::post};
+    use axum::{Json, Router, http::HeaderMap, routing::post};
     use redis::Client as RedisClient;
     use secrecy::SecretBox;
     use serde_json::json;
@@ -788,10 +1164,105 @@ mod tests {
     }
 
     #[test]
+    fn sql_execution_risk_level_uses_registered_operation_and_approval_flag() {
+        assert_eq!(sql_execution_risk_level("read", "medium", false), "medium");
+        assert_eq!(sql_execution_risk_level("read", "low", true), "high");
+        assert_eq!(
+            sql_execution_risk_level("write", "medium", false),
+            "critical"
+        );
+        assert_eq!(sql_execution_risk_level("ddl", "low", true), "critical");
+        assert_eq!(
+            sql_execution_risk_level("read", "unexpected", false),
+            "medium"
+        );
+    }
+
+    #[test]
     fn safe_headers_reject_secret_bearing_fields() {
         assert!(safe_headers(Some(&json!({"X-Trace": "ok"}))).is_ok());
         assert!(safe_headers(Some(&json!({"Authorization": "Bearer secret"}))).is_err());
         assert!(safe_headers(Some(&json!({"X-Api-Key": "secret"}))).is_err());
+    }
+
+    #[tokio::test]
+    async fn http_tool_secret_auth_uses_env_backed_secret_ref_without_exposing_secret_in_schema() {
+        unsafe {
+            std::env::set_var("BIBI_TEST_HTTP_TOOL_TOKEN", "http-tool-secret");
+        }
+        let http = Client::new();
+        let resolver = secret_resolver::SecretResolver::env_only_for_tests();
+        let request = apply_http_tool_secret_auth(
+            &resolver,
+            http.get("http://tools.invalid/test"),
+            &json!({"auth_header": "X-Api-Key", "auth_scheme": "none"}),
+            Some("env://BIBI_TEST_HTTP_TOOL_TOKEN"),
+        )
+        .await
+        .expect("env-backed tool secret should resolve")
+        .build()
+        .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("http-tool-secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_tls_config_is_resolved_as_bounded_json_and_fails_closed() {
+        unsafe {
+            std::env::set_var(
+                "BIBI_TEST_SQL_TLS_CONFIG",
+                serde_json::to_string(&json!({
+                    "mode": "verify-full",
+                    "root_cert_pem": "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----"
+                }))
+                .unwrap(),
+            );
+            std::env::set_var(
+                "BIBI_TEST_SQL_TLS_INVALID",
+                serde_json::to_string(&json!({"mode": "verify-full"})).unwrap(),
+            );
+        }
+        let resolver = secret_resolver::SecretResolver::env_only_for_tests();
+        assert!(
+            apply_sql_tls_config(
+                &resolver,
+                PgConnectOptions::new(),
+                Some("env://BIBI_TEST_SQL_TLS_CONFIG")
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            apply_sql_tls_config(
+                &resolver,
+                PgConnectOptions::new(),
+                Some("env://BIBI_TEST_SQL_TLS_INVALID")
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sql_username_ref_allows_plain_or_env_value() {
+        unsafe {
+            std::env::set_var("BIBI_TEST_SQL_USERNAME", "postgres");
+        }
+
+        assert_eq!(
+            resolve_optional_env_ref("plain_user").expect("plain username"),
+            "plain_user"
+        );
+        assert_eq!(
+            resolve_optional_env_ref("env://BIBI_TEST_SQL_USERNAME").expect("env username"),
+            "postgres"
+        );
     }
 
     #[test]
@@ -804,6 +1275,25 @@ mod tests {
             ]
         );
         assert!(scalar_query_params(&json!({"nested": {"x": 1}})).is_err());
+    }
+
+    #[test]
+    fn mcp_risk_uses_trusted_annotations_before_client_visible_name() {
+        assert_eq!(
+            trusted_mcp_risk_level(
+                "delete_everything",
+                &json!({"annotations": {"readOnlyHint": true, "destructiveHint": false}})
+            ),
+            "low"
+        );
+        assert_eq!(
+            trusted_mcp_risk_level(
+                "read_records",
+                &json!({"annotations": {"readOnlyHint": true, "destructiveHint": true}})
+            ),
+            "high"
+        );
+        assert_eq!(trusted_mcp_risk_level("read_records", &json!({})), "medium");
     }
 
     #[tokio::test]
@@ -838,6 +1328,50 @@ mod tests {
 
         assert_eq!(result["query_hash"], query_hash);
         assert_eq!(result["rows"][0]["value"], "销售额数据");
+        assert_eq!(result["truncated"], false);
+        cleanup_tenant(&state.connect_pool, tenant_id).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Postgres and the bibi_work schema"]
+    async fn secret_backed_read_sql_tool_executes_with_env_backed_password()
+    -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            std::env::set_var(
+                "BIBI_TEST_SQL_PASSWORD",
+                postgres_password_from_database_url(),
+            );
+        }
+
+        let state = test_state().await?;
+        let tenant_id = seed_tenant(&state.connect_pool).await?;
+        let actor = ActorRef {
+            user_id: Uuid::new_v4(),
+            device_id: None,
+            session_id: None,
+            roles: Vec::new(),
+        };
+        let connection_id = seed_secret_sql_connection(&state.connect_pool, tenant_id).await?;
+        let (sql_tool_id, query_hash) =
+            seed_sql_tool(&state.connect_pool, tenant_id, connection_id).await?;
+
+        let result = execute_sql_tool(
+            &state,
+            &SqlToolExecuteRequest {
+                tenant_id,
+                actor,
+                conversation_id: None,
+                run_id: None,
+                sql_tool_id: Some(sql_tool_id),
+                query_hash: Some(query_hash.clone()),
+                parameters: json!({"needle": "secret-backed-sql"}),
+            },
+        )
+        .await?;
+
+        assert_eq!(result["query_hash"], query_hash);
+        assert_eq!(result["rows"][0]["value"], "secret-backed-sql");
         assert_eq!(result["truncated"], false);
         cleanup_tenant(&state.connect_pool, tenant_id).await?;
         Ok(())
@@ -900,6 +1434,207 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    #[ignore = "requires local Postgres and the bibi_work schema"]
+    async fn stdio_mcp_tool_dispatches_to_the_actor_device_queue()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let state = test_state().await?;
+        let tenant_id = seed_tenant(&state.connect_pool).await?;
+        let (user_id, device_id) = seed_actor_device(&state.connect_pool, tenant_id).await?;
+        let (mcp_server_id, mcp_tool_id) =
+            seed_stdio_mcp_tool(&state.connect_pool, tenant_id).await?;
+        let pool = state.connect_pool.clone();
+
+        let simulator = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(row) = sqlx::query(
+                    r#"
+                    UPDATE local_exec_requests
+                    SET status = 'dispatching', updated_at = CURRENT_TIMESTAMP
+                    WHERE id = (
+                        SELECT id FROM local_exec_requests
+                        WHERE tenant_id = $1 AND device_id = $2 AND status = 'queued'
+                          AND command->>'kind' = 'mcp_stdio'
+                        ORDER BY created_at ASC LIMIT 1
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    RETURNING id, command
+                    "#,
+                )
+                .bind(tenant_id)
+                .bind(device_id)
+                .fetch_optional(&pool)
+                .await?
+                {
+                    let request_id: Uuid = row.try_get("id")?;
+                    let command: Value = row.try_get("command")?;
+                    assert_eq!(command["protocol"], "local_runtime.v1");
+                    assert_eq!(command["tool"]["name"], "stdio_fixture_health");
+                    assert_eq!(
+                        command["transport"]["env"]["API_TOKEN"],
+                        "env://MCP_TEST_TOKEN"
+                    );
+                    let mut tx = pool.begin().await?;
+                    sqlx::query(
+                        "UPDATE local_exec_requests SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+                    )
+                    .bind(request_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        r#"
+                        INSERT INTO local_exec_events
+                            (tenant_id, local_exec_request_id, type, payload)
+                        VALUES ($1, $2, 'local_exec.completed', $3)
+                        "#,
+                    )
+                    .bind(tenant_id)
+                    .bind(request_id)
+                    .bind(json!({
+                        "status": "completed",
+                        "result": {
+                            "content": [{"type": "text", "text": "stdio-ok"}],
+                            "structuredContent": {"status": "ok"},
+                            "isError": false
+                        }
+                    }))
+                    .execute(&mut *tx)
+                    .await?;
+                    tx.commit().await?;
+                    return Ok::<(), sqlx::Error>(());
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("stdio MCP work item was not queued");
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        });
+
+        let result = execute_mcp_tool(
+            &state,
+            &McpToolCallRequest {
+                tenant_id,
+                actor: ActorRef {
+                    user_id,
+                    device_id: Some(device_id),
+                    session_id: None,
+                    roles: Vec::new(),
+                },
+                conversation_id: None,
+                run_id: None,
+                mcp_server_id: Some(mcp_server_id),
+                mcp_tool_id: Some(mcp_tool_id),
+                tool_name: "stdio_fixture_health".to_string(),
+                arguments: json!({"probe": true}),
+            },
+        )
+        .await?;
+
+        simulator.await??;
+        assert_eq!(result["content"][0]["text"], "stdio-ok");
+        assert_eq!(result["mcp_server_id"], mcp_server_id.to_string());
+        assert_eq!(result["mcp_tool_id"], mcp_tool_id.to_string());
+        cleanup_tenant(&state.connect_pool, tenant_id).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Postgres and the bibi_work schema"]
+    async fn secret_backed_mcp_tool_executes_with_env_backed_auth_header()
+    -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            std::env::set_var("BIBI_TEST_MCP_EXEC_TOKEN", "mcp-exec-secret");
+        }
+
+        let state = test_state().await?;
+        let tenant_id = seed_tenant(&state.connect_pool).await?;
+        let (base_url, server) = spawn_secret_mcp_tool_server().await?;
+        let actor = ActorRef {
+            user_id: Uuid::new_v4(),
+            device_id: None,
+            session_id: None,
+            roles: Vec::new(),
+        };
+        let (mcp_server_id, mcp_tool_id) = seed_secret_mcp_tool(
+            &state.connect_pool,
+            tenant_id,
+            &format!("{base_url}/mcp-secret"),
+        )
+        .await?;
+
+        let mcp_result = execute_mcp_tool(
+            &state,
+            &McpToolCallRequest {
+                tenant_id,
+                actor,
+                conversation_id: None,
+                run_id: None,
+                mcp_server_id: Some(mcp_server_id),
+                mcp_tool_id: Some(mcp_tool_id),
+                tool_name: "secured_lookup".to_string(),
+                arguments: json!({"q": "sales"}),
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            mcp_result["result"]["content"][0]["text"],
+            "secret-mcp-result"
+        );
+
+        cleanup_tenant(&state.connect_pool, tenant_id).await?;
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Postgres and the bibi_work schema"]
+    async fn secret_backed_third_party_tool_executes_with_env_backed_auth_header()
+    -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            std::env::set_var("BIBI_TEST_HTTP_TOOL_TOKEN", "http-tool-secret");
+        }
+
+        let state = test_state().await?;
+        let tenant_id = seed_tenant(&state.connect_pool).await?;
+        let (base_url, server) = spawn_secret_third_party_tool_server().await?;
+        let actor = ActorRef {
+            user_id: Uuid::new_v4(),
+            device_id: None,
+            session_id: None,
+            roles: Vec::new(),
+        };
+        let (tool_id, tool_version_id) = seed_secret_third_party_tool(
+            &state.connect_pool,
+            tenant_id,
+            &format!("{base_url}/third-secret"),
+        )
+        .await?;
+
+        let third_party_result = execute_third_party_tool(
+            &state,
+            &ThirdPartyToolCallRequest {
+                tenant_id,
+                actor,
+                conversation_id: None,
+                run_id: None,
+                tool_id: Some(tool_id),
+                tool_version_id: Some(tool_version_id),
+                tool_name: None,
+                arguments: json!({"q": "sales"}),
+            },
+        )
+        .await?;
+
+        assert_eq!(third_party_result["status"], "ok");
+        assert_eq!(third_party_result["content"], "secret-third-party-result");
+
+        cleanup_tenant(&state.connect_pool, tenant_id).await?;
+        server.abort();
+        Ok(())
+    }
+
     async fn test_state() -> Result<AppState, Box<dyn std::error::Error>> {
         let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
             "postgresql://postgres:password@127.0.0.1:5433/bibi_work".to_string()
@@ -954,6 +1689,9 @@ mod tests {
                 worker_max_attempts: 1,
             })?,
             internal_shared_token: "test-internal-token".to_string(),
+            audit_partition_cleanup_enabled: false,
+            secret_resolver: secret_resolver::SecretResolver::env_only_for_tests(),
+            credential_rotation_worker_enabled: false,
         })
     }
 
@@ -976,6 +1714,39 @@ mod tests {
         .await
     }
 
+    async fn seed_actor_device(
+        pool: &PgPool,
+        tenant_id: Uuid,
+    ) -> Result<(Uuid, Uuid), sqlx::Error> {
+        let suffix = Uuid::new_v4();
+        let user_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO platform_users (tenant_id, ferriskey_subject, username)
+            VALUES ($1, $2, $3)
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(format!("stdio-user-{suffix}"))
+        .bind(format!("stdio-user-{suffix}"))
+        .fetch_one(pool)
+        .await?;
+        let device_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO devices
+                (tenant_id, user_id, device_fingerprint, device_name, platform)
+            VALUES ($1, $2, $3, 'stdio-test-device', 'test')
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(format!("stdio-device-{suffix}"))
+        .fetch_one(pool)
+        .await?;
+        Ok((user_id, device_id))
+    }
+
     async fn seed_sql_connection(pool: &PgPool, tenant_id: Uuid) -> Result<Uuid, sqlx::Error> {
         sqlx::query_scalar(
             r#"
@@ -989,6 +1760,29 @@ mod tests {
         )
         .bind(tenant_id)
         .bind(format!("local-postgres-{}", Uuid::new_v4()))
+        .fetch_one(pool)
+        .await
+    }
+
+    async fn seed_secret_sql_connection(
+        pool: &PgPool,
+        tenant_id: Uuid,
+    ) -> Result<Uuid, sqlx::Error> {
+        sqlx::query_scalar(
+            r#"
+            INSERT INTO sql_connections (
+                tenant_id, name, database_kind, host, port, database_name,
+                username_ref, password_secret_ref, max_rows, statement_timeout_ms, status
+            )
+            VALUES (
+                $1, $2, 'postgres', '127.0.0.1', 5433, 'bibi_work',
+                'postgres', 'env://BIBI_TEST_SQL_PASSWORD', 10, 1000, 'active'
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(format!("secret-local-postgres-{}", Uuid::new_v4()))
         .fetch_one(pool)
         .await
     }
@@ -1061,6 +1855,78 @@ mod tests {
         Ok((mcp_server_id, mcp_tool_id))
     }
 
+    async fn seed_stdio_mcp_tool(
+        pool: &PgPool,
+        tenant_id: Uuid,
+    ) -> Result<(Uuid, Uuid), sqlx::Error> {
+        let mcp_server_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO mcp_servers (tenant_id, name, transport, config, status)
+            VALUES ($1, $2, 'stdio', $3, 'active')
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(format!("stdio-mcp-server-{}", Uuid::new_v4()))
+        .bind(json!({
+            "command": "/usr/bin/node",
+            "args": ["fixture.mjs"],
+            "env": {"API_TOKEN": "env://MCP_TEST_TOKEN"},
+            "timeout_ms": 5_000
+        }))
+        .fetch_one(pool)
+        .await?;
+        let mcp_tool_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO mcp_tools (tenant_id, mcp_server_id, name, status)
+            VALUES ($1, $2, 'stdio_fixture_health', 'active')
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(mcp_server_id)
+        .fetch_one(pool)
+        .await?;
+        Ok((mcp_server_id, mcp_tool_id))
+    }
+
+    async fn seed_secret_mcp_tool(
+        pool: &PgPool,
+        tenant_id: Uuid,
+        endpoint: &str,
+    ) -> Result<(Uuid, Uuid), sqlx::Error> {
+        let mcp_server_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO mcp_servers (
+                tenant_id, name, transport, config, secret_ref, status
+            )
+            VALUES ($1, $2, 'http', $3, 'env://BIBI_TEST_MCP_EXEC_TOKEN', 'active')
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(format!("secret-mcp-server-{}", Uuid::new_v4()))
+        .bind(json!({
+            "endpoint": endpoint,
+            "auth_header": "Authorization",
+            "auth_scheme": "Bearer"
+        }))
+        .fetch_one(pool)
+        .await?;
+        let mcp_tool_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO mcp_tools (tenant_id, mcp_server_id, name, status)
+            VALUES ($1, $2, 'secured_lookup', 'active')
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(mcp_server_id)
+        .fetch_one(pool)
+        .await?;
+        Ok((mcp_server_id, mcp_tool_id))
+    }
+
     async fn seed_third_party_tool(
         pool: &PgPool,
         tenant_id: Uuid,
@@ -1094,6 +1960,48 @@ mod tests {
                 "type": "http",
                 "url": endpoint,
                 "method": "POST"
+            }
+        }))
+        .fetch_one(pool)
+        .await?;
+        Ok((tool_id, tool_version_id))
+    }
+
+    async fn seed_secret_third_party_tool(
+        pool: &PgPool,
+        tenant_id: Uuid,
+        endpoint: &str,
+    ) -> Result<(Uuid, Uuid), sqlx::Error> {
+        let suffix = Uuid::new_v4();
+        let tool_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO tools (tenant_id, name, tool_type, schema, status)
+            VALUES ($1, $2, 'third_party', '{}'::jsonb, 'active')
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(format!("secret-third-party-{suffix}"))
+        .fetch_one(pool)
+        .await?;
+        let tool_version_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO tool_versions (
+                tenant_id, tool_id, version_label, schema_snapshot, secret_ref, status
+            )
+            VALUES ($1, $2, 'v1', $3, 'env://BIBI_TEST_HTTP_TOOL_TOKEN', 'published')
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(tool_id)
+        .bind(json!({
+            "executor": {
+                "type": "http",
+                "url": endpoint,
+                "method": "POST",
+                "auth_header": "Authorization",
+                "auth_scheme": "Bearer"
             }
         }))
         .fetch_one(pool)
@@ -1135,5 +2043,68 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
         Ok((base_url, handle))
+    }
+
+    async fn spawn_secret_mcp_tool_server() -> Result<(String, JoinHandle<()>), std::io::Error> {
+        async fn mcp_secret(headers: HeaderMap, Json(_payload): Json<Value>) -> Json<Value> {
+            assert_eq!(
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer mcp-exec-secret")
+            );
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": "test",
+                "result": {
+                    "content": [{"type": "text", "text": "secret-mcp-result"}]
+                }
+            }))
+        }
+
+        let router = Router::new().route("/mcp-secret", post(mcp_secret));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        Ok((base_url, handle))
+    }
+
+    async fn spawn_secret_third_party_tool_server()
+    -> Result<(String, JoinHandle<()>), std::io::Error> {
+        async fn third_secret(headers: HeaderMap, Json(_payload): Json<Value>) -> Json<Value> {
+            assert_eq!(
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer http-tool-secret")
+            );
+            Json(json!({
+                "status": "ok",
+                "content": "secret-third-party-result"
+            }))
+        }
+
+        let router = Router::new().route("/third-secret", post(third_secret));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        Ok((base_url, handle))
+    }
+
+    fn postgres_password_from_database_url() -> String {
+        let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:password@127.0.0.1:5433/bibi_work".to_string()
+        });
+        database_url
+            .split('@')
+            .next()
+            .and_then(|auth| auth.rsplit_once(':').map(|(_, password)| password))
+            .filter(|password| !password.is_empty())
+            .unwrap_or("password")
+            .to_string()
     }
 }

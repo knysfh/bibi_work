@@ -1,0 +1,69 @@
+services:
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/bibi-work-alerts.yml:/etc/prometheus/rules/bibi-work-alerts.yml:ro
+      - ./prometheus/bibi-work-slos.yml:/etc/prometheus/rules/bibi-work-slos.yml:ro
+      - prometheus-data:/prometheus
+    secrets:
+      - bibi_internal_token
+    depends_on:
+      - alertmanager
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    ports:
+      - "9093:9093"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    secrets:
+      - bibi_alert_webhook_url
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.4.0
+    environment:
+      GF_SECURITY_ADMIN_USER: ${BIBI_GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/bibi_grafana_admin_password
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning/datasources/prometheus.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro
+      - ./grafana/provisioning/dashboards/default.yml:/etc/grafana/provisioning/dashboards/default.yml:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    secrets:
+      - bibi_grafana_admin_password
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+secrets:
+  bibi_internal_token:
+    file: ${BIBI_INTERNAL_TOKEN_FILE:?set BIBI_INTERNAL_TOKEN_FILE}
+  bibi_alert_webhook_url:
+    file: ${BIBI_ALERT_WEBHOOK_URL_FILE:?set BIBI_ALERT_WEBHOOK_URL_FILE}
+  bibi_grafana_admin_password:
+    file: ${BIBI_GRAFANA_ADMIN_PASSWORD_FILE:?set BIBI_GRAFANA_ADMIN_PASSWORD_FILE}
+
+volumes:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:

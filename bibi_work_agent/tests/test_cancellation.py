@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
 from bibi_work_agent.runtime.event_normalizer import AgentEventNormalizer
@@ -23,6 +24,36 @@ class FakeRust:
     def emit_events(self, **kwargs):
         self.emitted_batches.append(kwargs)
         return {}
+
+
+def valid_run_snapshot(
+    *,
+    tenant_id: str | None = None,
+    conversation_id: str | None = None,
+    run_id: str | None = None,
+    thread_id: str | None = None,
+) -> dict:
+    snapshot_run_id = run_id or str(uuid4())
+    return {
+        "runtime": {"kind": "deepagents"},
+        "tenant_id": tenant_id or str(uuid4()),
+        "conversation_id": conversation_id or str(uuid4()),
+        "run_id": snapshot_run_id,
+        "thread_id": thread_id or f"thread-{snapshot_run_id}",
+        "actor": {"user_id": str(uuid4())},
+        "agent": {
+            "id": str(uuid4()),
+            "model": {
+                "provider": "test",
+                "model_name": "fake-model",
+            },
+        },
+        "tools": [],
+        "skills": [],
+        "mcp_tools": [],
+        "workspace": {"workspace_id": str(uuid4()), "local_mounts": []},
+        "ui": {"client": "biwork"},
+    }
 
 
 def test_call_agent_stream_requests_message_and_value_modes() -> None:
@@ -66,6 +97,23 @@ def test_completed_message_payload_contains_frontend_content() -> None:
     }
 
 
+def test_message_events_include_non_secret_cron_context() -> None:
+    normalizer = AgentEventNormalizer(
+        run_id="run-1",
+        trace_id="trace",
+        message_context={"cron_job_id": "job-1", "cron_job_name": "Daily"},
+    )
+
+    delta = normalizer.normalize(("messages", [{"content": "hello"}]))[0]
+    completed = normalizer.pending_completed_message()
+
+    assert delta["payload"]["cron_job_id"] == "job-1"
+    assert delta["payload"]["cron_job_name"] == "Daily"
+    assert completed is not None
+    assert completed["payload"]["cron_job_id"] == "job-1"
+    assert completed["payload"]["content"] == "hello"
+
+
 def test_explicit_completed_message_payload_gets_content_from_result() -> None:
     normalizer = AgentEventNormalizer(run_id="run-1", trace_id="trace")
 
@@ -85,6 +133,27 @@ def test_explicit_completed_message_payload_gets_content_from_result() -> None:
 
     assert events[0]["payload"]["content"] == "助手回答"
     assert events[0]["payload"]["result"]["messages"][1]["content"] == "助手回答"
+
+
+def test_message_stream_delta_gets_pending_completed_event() -> None:
+    normalizer = AgentEventNormalizer(run_id="run-1", trace_id="trace")
+
+    events = normalizer.normalize(
+        (
+            "messages",
+            (
+                AIMessage(content="done"),
+                {"langgraph_node": "model"},
+            ),
+        )
+    )
+    completed = normalizer.pending_completed_message()
+
+    assert [event["type"] for event in events] == ["message.delta"]
+    assert completed is not None
+    assert completed["type"] == "message.completed"
+    assert completed["payload"]["content"] == "done"
+    assert normalizer.pending_completed_message() is None
 
 
 def test_values_stream_state_does_not_duplicate_messages() -> None:
@@ -129,6 +198,30 @@ def test_tool_message_stream_projects_tool_event_not_chat_delta() -> None:
         {"path": "/local/main/", "type": "directory"},
         {"path": "/local/main/readme.md", "type": "file"},
     ]
+
+
+def test_platform_tool_result_is_available_as_deterministic_message_fallback() -> None:
+    normalizer = AgentEventNormalizer(run_id="run-1", trace_id="trace")
+
+    events = normalizer.normalize(
+        (
+            "messages",
+            (
+                ToolMessage(
+                    content='{"status": "ok"}',
+                    name="tool_enterprise_health",
+                    tool_call_id="call-1",
+                ),
+                {"langgraph_node": "tools"},
+            ),
+        )
+    )
+    completed = normalizer.platform_tool_result_completed_message()
+
+    assert events == []
+    assert completed is not None
+    assert completed["payload"]["content"] == "{'status': 'ok'}"
+    assert completed["payload"]["result"] == {"status": "ok"}
 
 
 def test_deepagents_tool_call_start_and_nameless_result_are_joined() -> None:
@@ -188,6 +281,101 @@ def test_deepagents_tool_call_start_and_nameless_result_are_joined() -> None:
     assert payload["views"][0]["kind"] == "table"
     assert payload["views"][0]["rows_preview"] == [
         {"content": "检查内置工具渲染", "status": "in_progress"}
+    ]
+
+
+def test_file_tool_events_include_target_payload() -> None:
+    normalizer = AgentEventNormalizer(run_id="run-1", trace_id="trace")
+
+    started = normalizer.normalize(
+        (
+            "messages",
+            (
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call-read",
+                            "name": "read_file",
+                            "args": {"path": "/local/main/readme.md"},
+                        }
+                    ],
+                ),
+                {"langgraph_node": "model"},
+            ),
+        )
+    )
+    completed = normalizer.normalize(
+        (
+            "messages",
+            (
+                ToolMessage(
+                    content="     1\thello",
+                    tool_call_id="call-read",
+                ),
+                {"langgraph_node": "tools"},
+            ),
+        )
+    )
+
+    assert started[0]["payload"]["target"] == {
+        "kind": "local_file",
+        "path": "/local/main/readme.md",
+    }
+    assert completed[0]["payload"]["target"] == started[0]["payload"]["target"]
+    assert completed[0]["payload"]["file_effects"] == [
+        {
+            "operation": "read",
+            "source": "local_mount",
+            "path": "/local/main/readme.md",
+        }
+    ]
+
+
+def test_file_tool_alias_events_include_target_payload() -> None:
+    normalizer = AgentEventNormalizer(run_id="run-1", trace_id="trace")
+
+    normalizer.normalize(
+        (
+            "messages",
+            (
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call-write",
+                            "name": "file_write",
+                            "args": {"path": "/workspace/report.md"},
+                        }
+                    ],
+                ),
+                {"langgraph_node": "model"},
+            ),
+        )
+    )
+    completed = normalizer.normalize(
+        (
+            "messages",
+            (
+                ToolMessage(
+                    content="Updated file /workspace/report.md",
+                    tool_call_id="call-write",
+                ),
+                {"langgraph_node": "tools"},
+            ),
+        )
+    )
+
+    assert completed[0]["payload"]["target"] == {
+        "kind": "workspace_file",
+        "path": "/workspace/report.md",
+    }
+    assert completed[0]["payload"]["file_effects"] == [
+        {
+            "operation": "write",
+            "source": "workspace",
+            "path": "/workspace/report.md",
+        }
     ]
 
 
@@ -400,15 +588,21 @@ def test_execute_run_payload_emits_completed_memory_candidates(monkeypatch) -> N
     )
 
     run_id = str(uuid4())
+    tenant_id = str(uuid4())
+    conversation_id = str(uuid4())
     run_executor.execute_run_payload(
         "worker-task",
         {
-            "tenant_id": str(uuid4()),
-            "conversation_id": str(uuid4()),
+            "tenant_id": tenant_id,
+            "conversation_id": conversation_id,
             "run_id": run_id,
             "trace_id": "trace",
             "input": {},
-            "run_config_snapshot": {},
+            "run_config_snapshot": valid_run_snapshot(
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                run_id=run_id,
+            ),
         },
     )
 
@@ -417,6 +611,101 @@ def test_execute_run_payload_emits_completed_memory_candidates(monkeypatch) -> N
     assert completed["payload"]["memory_candidates"] == [
         {"content": "用户偏好先看销售额同比变化。", "visibility": "private"}
     ]
+
+
+def test_execute_run_payload_uses_snapshot_dispatch_context_for_fail_closed(
+    monkeypatch,
+) -> None:
+    fake_rust = FakeRust()
+    created_agent = False
+
+    def create_agent(_snapshot):
+        nonlocal created_agent
+        created_agent = True
+        raise AssertionError("invalid snapshot must not create Python agent")
+
+    monkeypatch.setattr(run_executor, "RustClient", lambda: fake_rust)
+    monkeypatch.setattr(run_executor, "is_run_cancelled", lambda _run_id: False)
+    monkeypatch.setattr(run_executor, "create_platform_agent", create_agent)
+
+    tenant_id = str(uuid4())
+    conversation_id = str(uuid4())
+    run_id = str(uuid4())
+
+    with pytest.raises(RuntimeError) as exc_info:
+        run_executor.execute_run_payload(
+            "worker-task",
+            {
+                "input": {},
+                "run_config_snapshot": {
+                    "runtime": {"kind": "deepagents"},
+                    "tenant_id": tenant_id,
+                    "conversation_id": conversation_id,
+                    "run_id": run_id,
+                    "trace_id": "trace",
+                    "tools": [],
+                    "skills": [],
+                    "mcp_tools": [],
+                    "workspace": {"local_mounts": []},
+                    "ui": {"client": "biwork"},
+                },
+            },
+        )
+
+    assert "run_config_snapshot.actor.user_id is required" in str(exc_info.value)
+    assert created_agent is False
+    event_types = [
+        event["type"]
+        for batch in fake_rust.emitted_batches
+        for event in batch["events"]
+    ]
+    assert event_types == ["run.failed"]
+    failed = fake_rust.emitted_batches[-1]["events"][0]
+    assert fake_rust.emitted_batches[-1]["tenant_id"] == tenant_id
+    assert fake_rust.emitted_batches[-1]["conversation_id"] == conversation_id
+    assert fake_rust.emitted_batches[-1]["run_id"] == run_id
+    assert failed["type"] == "run.failed"
+    assert failed["payload"]["run_id"] == run_id
+    assert "run_config_snapshot.actor.user_id is required" in failed["payload"]["error"]
+
+
+def test_execute_run_payload_rejects_desktop_runtime_before_started(
+    monkeypatch,
+) -> None:
+    fake_rust = FakeRust()
+    monkeypatch.setattr(run_executor, "RustClient", lambda: fake_rust)
+    monkeypatch.setattr(run_executor, "is_run_cancelled", lambda _run_id: False)
+    monkeypatch.setattr(
+        run_executor,
+        "create_platform_agent",
+        lambda _snapshot: (_ for _ in ()).throw(
+            AssertionError("desktop runtime must not create Python agent")
+        ),
+    )
+
+    run_id = str(uuid4())
+    with pytest.raises(RuntimeError, match="runtime.kind=biwork_cli"):
+        run_executor.execute_run_payload(
+            "worker-task",
+            {
+                "tenant_id": str(uuid4()),
+                "conversation_id": str(uuid4()),
+                "run_id": run_id,
+                "trace_id": "trace",
+                "input": {},
+                "run_config_snapshot": {"runtime": {"kind": "biwork_cli"}},
+            },
+        )
+
+    event_types = [
+        event["type"]
+        for batch in fake_rust.emitted_batches
+        for event in batch["events"]
+    ]
+    assert event_types == ["run.failed"]
+    failed = fake_rust.emitted_batches[-1]["events"][0]
+    assert failed["payload"]["run_id"] == run_id
+    assert "runtime.kind=biwork_cli" in failed["payload"]["error"]
 
 
 def test_execute_run_payload_waits_when_tool_requires_approval(monkeypatch) -> None:
@@ -433,15 +722,21 @@ def test_execute_run_payload_waits_when_tool_requires_approval(monkeypatch) -> N
     )
 
     run_id = str(uuid4())
+    tenant_id = str(uuid4())
+    conversation_id = str(uuid4())
     run_executor.execute_run_payload(
         "worker-task",
         {
-            "tenant_id": str(uuid4()),
-            "conversation_id": str(uuid4()),
+            "tenant_id": tenant_id,
+            "conversation_id": conversation_id,
             "run_id": run_id,
             "trace_id": "trace",
             "input": {},
-            "run_config_snapshot": {},
+            "run_config_snapshot": valid_run_snapshot(
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                run_id=run_id,
+            ),
         },
     )
 
@@ -457,3 +752,45 @@ def test_execute_run_payload_waits_when_tool_requires_approval(monkeypatch) -> N
     approval_event = fake_rust.emitted_batches[-1]["events"][0]
     assert approval_event["payload"]["approval_id"] == "approval-1"
     assert approval_event["payload"]["status"] == "waiting_approval"
+
+
+def test_execute_run_payload_treats_tool_cancel_as_cancelled(monkeypatch) -> None:
+    class FakeAgent:
+        def stream(self, _input):
+            raise run_executor.RunCancelled("run-1", "cancelled_before_tool")
+            yield  # pragma: no cover
+
+    fake_rust = FakeRust()
+    monkeypatch.setattr(run_executor, "RustClient", lambda: fake_rust)
+    monkeypatch.setattr(run_executor, "is_run_cancelled", lambda _run_id: False)
+    monkeypatch.setattr(
+        run_executor, "create_platform_agent", lambda _snapshot: FakeAgent()
+    )
+
+    run_id = str(uuid4())
+    tenant_id = str(uuid4())
+    conversation_id = str(uuid4())
+    run_executor.execute_run_payload(
+        "worker-task",
+        {
+            "tenant_id": tenant_id,
+            "conversation_id": conversation_id,
+            "run_id": run_id,
+            "trace_id": "trace",
+            "input": {},
+            "run_config_snapshot": valid_run_snapshot(
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                run_id=run_id,
+            ),
+        },
+    )
+
+    event_types = [
+        event["type"]
+        for batch in fake_rust.emitted_batches
+        for event in batch["events"]
+    ]
+    assert event_types == ["run.started", "run.cancelled"]
+    cancelled = fake_rust.emitted_batches[-1]["events"][0]
+    assert cancelled["payload"]["reason"] == "cancelled_before_tool"

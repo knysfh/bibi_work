@@ -11,6 +11,14 @@ from bibi_work_agent.api.schemas import (
     ToolAuthorizeRequest,
 )
 from bibi_work_agent.settings import settings
+from bibi_work_agent.telemetry import current_trace_headers
+
+
+class RustApiError(RuntimeError):
+    def __init__(self, message: str, *, status_code: int, code: str | None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
 
 
 class RustClient:
@@ -30,16 +38,19 @@ class RustClient:
         self._transport = transport
         self._headers = {"Authorization": f"Bearer {token}"}
 
+    def _request_headers(self) -> dict[str, str]:
+        return {**self._headers, **current_trace_headers()}
+
     def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         with httpx.Client(
             base_url=self._base_url,
-            headers=self._headers,
+            headers=self._request_headers(),
             timeout=self._timeout_sec,
             transport=self._transport,
             trust_env=False,
         ) as client:
             response = client.post(path, json=payload)
-            response.raise_for_status()
+            raise_for_status_with_detail(response)
             if not response.content:
                 return {}
             return response.json()
@@ -47,13 +58,13 @@ class RustClient:
     def get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         with httpx.Client(
             base_url=self._base_url,
-            headers=self._headers,
+            headers=self._request_headers(),
             timeout=self._timeout_sec,
             transport=self._transport,
             trust_env=False,
         ) as client:
             response = client.get(path, params=compact_params(params))
-            response.raise_for_status()
+            raise_for_status_with_detail(response)
             if not response.content:
                 return {}
             return response.json()
@@ -100,6 +111,33 @@ class RustClient:
     def local_exec_request(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.post("/internal/local-exec/requests", payload)
 
+    def local_exec_wait(
+        self,
+        *,
+        request_id: UUID | str,
+        tenant_id: UUID | str,
+        timeout_ms: int | None = None,
+    ) -> dict[str, Any]:
+        timeout_sec = max(
+            self._timeout_sec,
+            ((timeout_ms or 30_000) / 1_000) + 5,
+        )
+        with httpx.Client(
+            base_url=self._base_url,
+            headers=self._request_headers(),
+            timeout=timeout_sec,
+            transport=self._transport,
+            trust_env=False,
+        ) as client:
+            response = client.get(
+                f"/internal/local-exec/requests/{request_id}/wait",
+                params=compact_params(
+                    {"tenant_id": str(tenant_id), "timeout_ms": timeout_ms}
+                ),
+            )
+            raise_for_status_with_detail(response)
+            return response.json() if response.content else {}
+
     def mcp_tool_call(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.post("/internal/mcp-tools:call", payload)
 
@@ -120,6 +158,33 @@ class RustClient:
             f"/internal/runtime-credentials/{runtime_credential_id}",
             {"tenant_id": str(tenant_id), "run_id": str(run_id)},
         )
+
+
+def raise_for_status_with_detail(response: httpx.Response) -> None:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        code: str | None = None
+        message: str | None = None
+        try:
+            body = response.json()
+        except (ValueError, UnicodeDecodeError):
+            body = None
+        if isinstance(body, dict):
+            raw_code = body.get("code")
+            raw_message = body.get("error") or body.get("message")
+            code = raw_code if isinstance(raw_code, str) else None
+            message = raw_message if isinstance(raw_message, str) else None
+        summary = f"Rust API returned HTTP {response.status_code}"
+        if code:
+            summary = f"{summary} {code}"
+        if message:
+            summary = f"{summary}: {message[:1_000]}"
+        raise RustApiError(
+            summary,
+            status_code=response.status_code,
+            code=code,
+        ) from error
 
 
 def compact_params(params: dict[str, Any]) -> dict[str, Any]:

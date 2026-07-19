@@ -1,0 +1,116 @@
+import { isBackendHttpError } from '@/common/adapter/httpBridge';
+import type { ConversationCommandQueueRuntimeGate } from '@/renderer/pages/conversation/platforms/useConversationCommandQueue';
+import type { TeamRunViewState } from '../hooks/useTeamRunView';
+import type { TeamRunStatus } from '@/common/types/team/teamTypes';
+
+export type TeamSendBoxRuntime = {
+  runtimeGate: ConversationCommandQueueRuntimeGate;
+  loading: boolean;
+  onStop?: () => Promise<void>;
+};
+
+type BuildTeamSendRuntimeOptions = {
+  slot_id: string;
+  runView: TeamRunViewState;
+  onStop?: () => Promise<void>;
+};
+
+type PauseSlotWorkParams = {
+  team_id: string;
+  team_run_id: string;
+  slot_id: string;
+  reason: 'user_stop';
+};
+
+type BuildTeamStopHandlerOptions = {
+  team_id: string;
+  slot_id: string;
+  runView: TeamRunViewState;
+  pauseSlotWork: (params: PauseSlotWorkParams) => Promise<void>;
+  onStopFailed?: () => void;
+  onRunStateStale?: () => Promise<boolean>;
+};
+
+const isSlotWorkProcessing = (runView: TeamRunViewState, slot_id: string): boolean => {
+  const work = runView.slotWorkBySlot[slot_id];
+  if (work?.paused) return false;
+
+  const hasSlotWork =
+    Boolean(work?.active_turn_id) || (work?.pending_wake_count ?? 0) > 0 || (work?.starting_child_count ?? 0) > 0;
+  if (hasSlotWork) return true;
+
+  const childStatus = runView.childTurnsBySlot[slot_id]?.status;
+  return childStatus === 'accepted' || childStatus === 'running' || childStatus === 'cancelling';
+};
+
+export const resolveTeamRunStatusForSlot = (runView: TeamRunViewState, slot_id: string): TeamRunStatus | undefined => {
+  const run = runView.activeRun ?? runView.lastTerminalRun;
+  if (!run) return undefined;
+  if (!run.target_slot_id || run.target_slot_id === slot_id) return run.status;
+  if (run.slot_work?.some((work) => work.slot_id === slot_id)) return run.status;
+  if (runView.childTurnsBySlot[slot_id] || runView.slotWorkBySlot[slot_id]) return run.status;
+  if (runView.lastTerminalRun && run.status !== 'running') return run.status;
+  return undefined;
+};
+
+export const isStaleTeamRunPauseError = (error: unknown): boolean => {
+  return (
+    isBackendHttpError(error) &&
+    error.status === 400 &&
+    error.code === 'BAD_REQUEST' &&
+    error.backendMessage.includes('no active team run to pause')
+  );
+};
+
+export const buildTeamStopHandler = ({
+  team_id,
+  slot_id,
+  runView,
+  pauseSlotWork,
+  onStopFailed,
+  onRunStateStale,
+}: BuildTeamStopHandlerOptions): (() => Promise<void>) => {
+  return async () => {
+    const activeRun = runView.activeRun;
+    if (!activeRun) return;
+
+    const work = runView.slotWorkBySlot[slot_id];
+    const hasSlotWork =
+      Boolean(runView.childTurnsBySlot[slot_id]) ||
+      Boolean(work?.active_turn_id) ||
+      (work?.starting_child_count ?? 0) > 0 ||
+      (work?.pending_wake_count ?? 0) > 0 ||
+      (work?.suppressed_wake_count ?? 0) > 0;
+    if (!hasSlotWork) return;
+
+    try {
+      await pauseSlotWork({
+        team_id,
+        team_run_id: activeRun.team_run_id,
+        slot_id,
+        reason: 'user_stop',
+      });
+    } catch (error) {
+      console.warn('[TeamChatView] pause slot work failed', error);
+      if (isStaleTeamRunPauseError(error)) {
+        const reconciled = await onRunStateStale?.();
+        if (!reconciled) onStopFailed?.();
+        return;
+      }
+      onStopFailed?.();
+    }
+  };
+};
+
+export const buildTeamSendRuntime = ({ slot_id, runView, onStop }: BuildTeamSendRuntimeOptions): TeamSendBoxRuntime => {
+  const processing = isSlotWorkProcessing(runView, slot_id);
+  return {
+    loading: processing,
+    runtimeGate: {
+      hydrated: true,
+      canSendMessage: !processing,
+      isProcessing: processing,
+    },
+    onStop,
+  };
+};

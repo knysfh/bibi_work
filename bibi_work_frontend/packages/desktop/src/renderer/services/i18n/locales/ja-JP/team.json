@@ -1,0 +1,70 @@
+{
+  "sider": {
+    "title": "Teams",
+    "createTeam": "New Team",
+    "pin": "ピン留め",
+    "unpin": "ピン留め解除",
+    "rename": "名前変更",
+    "delete": "削除",
+    "renameTitle": "チーム名変更",
+    "renamePlaceholder": "チーム名",
+    "deleteConfirm": "このチームを削除しますか？",
+    "deleteConfirmContent": "この操作は元に戻せません。",
+    "deleteOk": "削除",
+    "deleteCancel": "キャンセル",
+    "renameOk": "保存",
+    "renameCancel": "キャンセル",
+    "renameSuccess": "チーム名を変更しました",
+    "deleteSuccess": "チームを削除しました"
+  },
+  "newAgent": "新しいアシスタント",
+  "noMessages": "No messages yet.",
+  "agentNotConfigured": "アシスタントはまだ設定されていません。",
+  "stopAgentFailed": "このアシスタントを停止できませんでした。もう一度お試しください。",
+  "sendBox": {
+    "placeholder": "チームリーダーアシスタントにメッセージを送信..."
+  },
+  "create": {
+    "title": "Create Team",
+    "namePlaceholder": "Team name",
+    "dispatchAgentPlaceholder": "チームリーダーを選択",
+    "subAgentsPlaceholder": "チームメンバーのアシスタントを選択",
+    "confirm": "Create Team",
+    "noSupportedAgents": "利用可能なアシスタントが見つかりません",
+    "supportedAgentsHint": "現在 Claude と BiWork runtime のアシスタントに対応しています。ほかのアシスタントも順次追加予定です。",
+    "leaderDesc": "目標を理解し、アシスタントを調整してタスクを完了します",
+    "searchPlaceholder": "アシスタントを検索...",
+    "noSearchResults": "結果が見つかりません",
+    "step": {
+      "dispatch": "チームリーダー",
+      "subAgents": "チームメンバー",
+      "workspace": "プロジェクト"
+    },
+    "nameRequired": "チーム名を入力してください",
+    "leaderRequired": "チームリーダーを選択してください",
+    "selectFolder": "フォルダを選択",
+    "recentLabel": "最近使用",
+    "chooseDifferentFolder": "別のフォルダを選択",
+    "error": "チームの作成に失敗しました"
+  },
+  "removeAgent": {
+    "confirmTitle": "チームメンバーを削除",
+    "confirmContent": "このメンバーは現在稼働中です。強制的に削除しますか？"
+  },
+  "runStatus": {
+    "accepted": "受け付け済み",
+    "running": "実行中",
+    "cancelling": "キャンセル中",
+    "completed": "完了",
+    "cancelled": "キャンセル済み",
+    "failed": "失敗"
+  },
+  "emptyState": {
+    "subtitle": "目標を教えてください。チームを調整してタスクを完了します",
+    "suggestions": {
+      "debate": "異なる立場をとるアシスタント同士でディベートを開催する",
+      "interview": "アシスタント同士による深掘りインタビューを企画する",
+      "expert_review": "複数の専門家が同じ問題を分析する"
+    }
+  }
+}

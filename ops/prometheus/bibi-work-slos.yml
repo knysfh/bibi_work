@@ -1,0 +1,18 @@
+groups:
+  - name: bibi-work-slos
+    interval: 30s
+    rules:
+      - record: bibi:slo_run_success_ratio_24h
+        expr: |
+          bibi_runs_completed_24h
+          / clamp_min(bibi_runs_completed_24h + bibi_runs_failed_24h, 1)
+
+      - record: bibi:slo_run_dispatch_within_10s_ratio_24h
+        expr: |
+          sum without (le) (bibi_run_dispatch_duration_seconds_24h_bucket{le="10"})
+          / clamp_min(bibi_run_dispatch_duration_seconds_24h_count, 1)
+
+      - record: bibi:slo_tool_execution_within_30s_ratio_24h
+        expr: |
+          sum without (le) (bibi_tool_execution_duration_seconds_24h_bucket{le="30"})
+          / clamp_min(bibi_tool_execution_duration_seconds_24h_count, 1)

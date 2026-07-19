@@ -1,10 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgRow};
-use tracing::warn;
+use tokio::time::MissedTickBehavior;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{features::core::errors::AppError, startup::AppState};
@@ -25,6 +29,11 @@ struct RunEventContext {
 const FILE_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 const BINARY_CONTENT_TYPE: &str = "application/octet-stream";
 const LARGE_FILE_THRESHOLD_BYTES: i64 = 1024 * 1024;
+const MAX_FILE_RANGE_BYTES: usize = 256 * 1024;
+const FILE_SEARCH_CHUNK_BYTES: usize = 64 * 1024;
+const FILE_SEARCH_MAX_INDEXED_BYTES: usize = 1024 * 1024;
+const FILE_SEARCH_BACKFILL_BATCH_SIZE: i64 = 16;
+const FILE_SEARCH_BACKFILL_INTERVAL: Duration = Duration::from_secs(60);
 
 struct ResolvedFileContent {
     bytes: Vec<u8>,
@@ -36,10 +45,191 @@ struct ResolvedFileContent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct FileSearchChunk {
+    chunk_index: i32,
+    byte_start: i64,
+    byte_end: i64,
+    content_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileSearchExtraction {
+    chunks: Vec<FileSearchChunk>,
+    source_size_bytes: i64,
+    indexed_bytes: i64,
+    is_truncated: bool,
+    strategy: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileSearchBackfillSummary {
+    pub candidates: usize,
+    pub indexed: usize,
+    pub skipped_binary: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum FileRevisionSelector {
     Latest,
     Revision(i64),
     VersionId(String),
+}
+
+pub fn spawn_file_search_backfill_worker(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(FILE_SEARCH_BACKFILL_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            match backfill_file_search_chunks(&state, FILE_SEARCH_BACKFILL_BATCH_SIZE).await {
+                Ok(summary) if summary.candidates > 0 => debug!(
+                    candidates = summary.candidates,
+                    indexed = summary.indexed,
+                    skipped_binary = summary.skipped_binary,
+                    failed = summary.failed,
+                    "file search index backfill batch completed"
+                ),
+                Ok(_) => {}
+                Err(err) => warn!("file search index backfill failed: {}", err),
+            }
+        }
+    });
+}
+
+pub async fn backfill_file_search_chunks(
+    state: &AppState,
+    limit: i64,
+) -> Result<FileSearchBackfillSummary, AppError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT fr.id, fr.tenant_id, fr.project_id, fr.path, fr.revision, fr.etag,
+               fr.content_hash, fr.object_key, fr.object_reference_id,
+               obj.bucket, obj.version_id, fr.inline_content, fr.size_bytes,
+               fr.reason, fr.run_id, fr.metadata, fr.created_at
+        FROM file_revisions fr
+        LEFT JOIN object_references obj ON obj.id = fr.object_reference_id
+        WHERE fr.metadata #>> '{search_index,status}' IS NULL
+           OR (
+                fr.metadata #>> '{search_index,status}' = 'indexed'
+                AND NOT EXISTS (
+                    SELECT 1 FROM file_search_chunks chunk
+                    WHERE chunk.file_revision_id = fr.id
+                )
+           )
+        ORDER BY fr.created_at, fr.id
+        LIMIT $1
+        "#,
+    )
+    .bind(limit.clamp(1, 256))
+    .fetch_all(&state.connect_pool)
+    .await?;
+
+    let mut summary = FileSearchBackfillSummary {
+        candidates: rows.len(),
+        ..FileSearchBackfillSummary::default()
+    };
+    for row in rows {
+        let revision = file_revision_from_row(row)?;
+        match backfill_file_search_revision(state, revision).await {
+            Ok(true) => summary.indexed += 1,
+            Ok(false) => summary.skipped_binary += 1,
+            Err(err) => {
+                summary.failed += 1;
+                warn!("failed to backfill file search revision: {}", err);
+            }
+        }
+    }
+    Ok(summary)
+}
+
+async fn backfill_file_search_revision(
+    state: &AppState,
+    mut revision: FileRevisionResponse,
+) -> Result<bool, AppError> {
+    let mut tx = state.connect_pool.begin().await?;
+    sqlx::query("SELECT id FROM file_revisions WHERE id = $1 FOR UPDATE")
+        .bind(revision.id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+    if revision.is_binary {
+        sqlx::query("DELETE FROM file_search_chunks WHERE file_revision_id = $1")
+            .bind(revision.id)
+            .execute(&mut *tx)
+            .await?;
+        let search_index = json!({
+            "status": "skipped",
+            "reason": "binary_content",
+            "source_size_bytes": revision.size_bytes,
+            "indexed_bytes": 0,
+            "is_truncated": false,
+            "chunk_count": 0
+        });
+        update_file_search_metadata_tx(&mut tx, revision.id, search_index).await?;
+        tx.commit().await?;
+        return Ok(false);
+    }
+    drop(tx);
+
+    hydrate_revision_content(state, &mut revision, false, None, None).await?;
+    let content_text = revision.inline_content.clone().ok_or_else(|| {
+        AppError::ObjectStore(format!(
+            "text content is unavailable for file revision {}",
+            revision.id
+        ))
+    })?;
+    let content = ResolvedFileContent {
+        bytes: content_text.as_bytes().to_vec(),
+        inline_text: Some(content_text),
+        content_type: revision.content_type.clone(),
+        is_binary: false,
+        is_large: revision.is_large,
+        object_extension: "txt",
+    };
+
+    let mut tx = state.connect_pool.begin().await?;
+    sqlx::query("SELECT id FROM file_revisions WHERE id = $1 FOR UPDATE")
+        .bind(revision.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let path_hash = sha256_hex(revision.path.as_bytes());
+    let search_index = replace_file_search_chunks_tx(
+        &mut tx,
+        FileSearchChunkSource {
+            tenant_id: revision.tenant_id,
+            project_id: revision.project_id,
+            path: &revision.path,
+            path_hash: &path_hash,
+            revision: revision.revision,
+            content_hash: &revision.content_hash,
+            file_revision_id: revision.id,
+            content: &content,
+        },
+    )
+    .await?;
+    update_file_search_metadata_tx(&mut tx, revision.id, search_index).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+async fn update_file_search_metadata_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    revision_id: Uuid,
+    search_index: serde_json::Value,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        UPDATE file_revisions
+        SET metadata = jsonb_set(metadata, '{search_index}', $2, TRUE)
+        WHERE id = $1
+        "#,
+    )
+    .bind(revision_id)
+    .bind(search_index)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 pub fn validate_virtual_path(path: &str) -> Result<(), AppError> {
@@ -126,8 +316,14 @@ pub async fn read_revision(
 
     let mut revision = file_revision_from_row(row)?;
     if payload.include_content.unwrap_or(true) {
-        hydrate_revision_content(state, &mut revision, payload.allow_binary.unwrap_or(false))
-            .await?;
+        hydrate_revision_content(
+            state,
+            &mut revision,
+            payload.allow_binary.unwrap_or(false),
+            payload.offset_bytes,
+            payload.limit_bytes,
+        )
+        .await?;
     }
     Ok(revision)
 }
@@ -223,7 +419,14 @@ pub async fn write_revision(
             "is_binary": resolved_content.is_binary,
             "is_large": resolved_content.is_large,
             "content_encoding": if resolved_content.is_binary { "base64" } else { "utf-8" },
-            "large_threshold_bytes": LARGE_FILE_THRESHOLD_BYTES
+            "large_threshold_bytes": LARGE_FILE_THRESHOLD_BYTES,
+            "tool_context": {
+                "tool_call_id": payload.tool_call_id.as_deref(),
+                "tool_name": payload.tool_name.as_deref(),
+                "args_hash": payload.args_hash.as_deref(),
+                "parent_tool_call_id": payload.parent_tool_call_id.as_deref(),
+                "operation": payload.operation.as_deref()
+            }
         });
 
         let revision_id: Uuid = sqlx::query_scalar(
@@ -255,17 +458,30 @@ pub async fn write_revision(
         .fetch_one(&mut *tx)
         .await?;
 
-        upsert_file_search_document_tx(
+        let search_index = replace_file_search_chunks_tx(
             &mut tx,
-            payload.tenant_id,
-            payload.project_id,
-            &payload.path,
-            &path_hash,
-            next_revision,
-            &content_hash,
-            revision_id,
-            &resolved_content,
+            FileSearchChunkSource {
+                tenant_id: payload.tenant_id,
+                project_id: payload.project_id,
+                path: &payload.path,
+                path_hash: &path_hash,
+                revision: next_revision,
+                content_hash: &content_hash,
+                file_revision_id: revision_id,
+                content: &resolved_content,
+            },
         )
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE file_revisions
+            SET metadata = jsonb_set(metadata, '{search_index}', $2, TRUE)
+            WHERE id = $1
+            "#,
+        )
+        .bind(revision_id)
+        .bind(search_index)
+        .execute(&mut *tx)
         .await?;
 
         let row = load_revision_row_by_id_tx(&mut tx, revision_id).await?;
@@ -424,51 +640,188 @@ fn stored_inline_content(
     }
 }
 
-async fn upsert_file_search_document_tx(
-    tx: &mut Transaction<'_, Postgres>,
+struct FileSearchChunkSource<'a> {
     tenant_id: Uuid,
     project_id: Uuid,
-    path: &str,
-    path_hash: &str,
+    path: &'a str,
+    path_hash: &'a str,
     revision: i64,
-    content_hash: &str,
+    content_hash: &'a str,
     file_revision_id: Uuid,
-    content: &ResolvedFileContent,
-) -> Result<(), AppError> {
-    if content.is_binary || content.is_large {
-        return Ok(());
+    content: &'a ResolvedFileContent,
+}
+
+async fn replace_file_search_chunks_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    source: FileSearchChunkSource<'_>,
+) -> Result<serde_json::Value, AppError> {
+    let FileSearchChunkSource {
+        tenant_id,
+        project_id,
+        path,
+        path_hash,
+        revision,
+        content_hash,
+        file_revision_id,
+        content,
+    } = source;
+    sqlx::query("DELETE FROM file_search_chunks WHERE file_revision_id = $1")
+        .bind(file_revision_id)
+        .execute(&mut **tx)
+        .await?;
+    if content.is_binary {
+        return Ok(json!({
+            "status": "skipped",
+            "reason": "binary_content",
+            "source_size_bytes": content.bytes.len(),
+            "indexed_bytes": 0,
+            "is_truncated": false,
+            "chunk_count": 0
+        }));
     }
     let Some(content_text) = content.inline_text.as_deref() else {
-        return Ok(());
+        return Ok(json!({
+            "status": "skipped",
+            "reason": "text_content_unavailable",
+            "source_size_bytes": content.bytes.len(),
+            "indexed_bytes": 0,
+            "is_truncated": false,
+            "chunk_count": 0
+        }));
+    };
+    let extraction = extract_file_search_chunks(content_text)?;
+    for chunk in &extraction.chunks {
+        sqlx::query(
+            r#"
+            INSERT INTO file_search_chunks (
+                file_revision_id, tenant_id, project_id, path, path_hash, revision,
+                content_hash, chunk_index, byte_start, byte_end, source_size_bytes,
+                indexed_bytes, is_truncated, extraction_strategy, content_text
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+            )
+            "#,
+        )
+        .bind(file_revision_id)
+        .bind(tenant_id)
+        .bind(project_id)
+        .bind(path)
+        .bind(path_hash)
+        .bind(revision)
+        .bind(content_hash)
+        .bind(chunk.chunk_index)
+        .bind(chunk.byte_start)
+        .bind(chunk.byte_end)
+        .bind(extraction.source_size_bytes)
+        .bind(extraction.indexed_bytes)
+        .bind(extraction.is_truncated)
+        .bind(extraction.strategy)
+        .bind(&chunk.content_text)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(json!({
+        "status": "indexed",
+        "strategy": extraction.strategy,
+        "source_size_bytes": extraction.source_size_bytes,
+        "indexed_bytes": extraction.indexed_bytes,
+        "is_truncated": extraction.is_truncated,
+        "chunk_count": extraction.chunks.len(),
+        "chunk_bytes": FILE_SEARCH_CHUNK_BYTES,
+        "max_indexed_bytes": FILE_SEARCH_MAX_INDEXED_BYTES
+    }))
+}
+
+fn extract_file_search_chunks(content: &str) -> Result<FileSearchExtraction, AppError> {
+    let source_size = content.len();
+    if source_size == 0 {
+        return Ok(FileSearchExtraction {
+            chunks: vec![FileSearchChunk {
+                chunk_index: 0,
+                byte_start: 0,
+                byte_end: 0,
+                content_text: String::new(),
+            }],
+            source_size_bytes: 0,
+            indexed_bytes: 0,
+            is_truncated: false,
+            strategy: "full_chunks",
+        });
+    }
+    let max_chunks = (FILE_SEARCH_MAX_INDEXED_BYTES / FILE_SEARCH_CHUNK_BYTES).max(1);
+    let is_truncated = source_size > FILE_SEARCH_MAX_INDEXED_BYTES;
+    let starts = if is_truncated {
+        let sample_chunks = if max_chunks > 2 && max_chunks.is_multiple_of(2) {
+            max_chunks - 1
+        } else {
+            max_chunks
+        };
+        let last_start = source_size.saturating_sub(FILE_SEARCH_CHUNK_BYTES);
+        (0..sample_chunks)
+            .map(|index| {
+                if sample_chunks == 1 {
+                    0
+                } else {
+                    index * last_start / (sample_chunks - 1)
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        (0..source_size)
+            .step_by(FILE_SEARCH_CHUNK_BYTES)
+            .collect::<Vec<_>>()
     };
 
-    sqlx::query(
-        r#"
-        INSERT INTO file_search_documents (
-            file_revision_id, tenant_id, project_id, path, path_hash, revision,
-            content_hash, content_text
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT (file_revision_id) DO UPDATE
-        SET path = EXCLUDED.path,
-            path_hash = EXCLUDED.path_hash,
-            revision = EXCLUDED.revision,
-            content_hash = EXCLUDED.content_hash,
-            content_text = EXCLUDED.content_text,
-            updated_at = CURRENT_TIMESTAMP
-        "#,
-    )
-    .bind(file_revision_id)
-    .bind(tenant_id)
-    .bind(project_id)
-    .bind(path)
-    .bind(path_hash)
-    .bind(revision)
-    .bind(content_hash)
-    .bind(content_text)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    let mut chunks = Vec::with_capacity(starts.len());
+    for raw_start in starts {
+        let start = next_char_boundary(content, raw_start);
+        let raw_end = start
+            .saturating_add(FILE_SEARCH_CHUNK_BYTES)
+            .min(source_size);
+        let end = previous_char_boundary(content, raw_end);
+        if end <= start {
+            continue;
+        }
+        chunks.push(FileSearchChunk {
+            chunk_index: i32::try_from(chunks.len())?,
+            byte_start: i64::try_from(start)?,
+            byte_end: i64::try_from(end)?,
+            content_text: content[start..end].to_string(),
+        });
+    }
+    let indexed_bytes = chunks.iter().try_fold(0_i64, |total, chunk| {
+        total
+            .checked_add(i64::try_from(chunk.content_text.len())?)
+            .ok_or_else(|| AppError::InvalidInput("indexed byte count is too large".to_string()))
+    })?;
+    Ok(FileSearchExtraction {
+        chunks,
+        source_size_bytes: i64::try_from(source_size)?,
+        indexed_bytes,
+        is_truncated,
+        strategy: if is_truncated {
+            "uniform_sample"
+        } else {
+            "full_chunks"
+        },
+    })
+}
+
+fn next_char_boundary(content: &str, mut offset: usize) -> usize {
+    offset = offset.min(content.len());
+    while offset < content.len() && !content.is_char_boundary(offset) {
+        offset += 1;
+    }
+    offset
+}
+
+fn previous_char_boundary(content: &str, mut offset: usize) -> usize {
+    offset = offset.min(content.len());
+    while offset > 0 && !content.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
 }
 
 fn populate_revision_content_from_bytes(
@@ -486,6 +839,141 @@ fn populate_revision_content_from_bytes(
     revision.inline_content = Some(content);
     revision.content_base64 = None;
     Ok(())
+}
+
+fn apply_revision_content_range(
+    revision: &mut FileRevisionResponse,
+    offset_bytes: Option<i64>,
+    limit_bytes: Option<i64>,
+) -> Result<(), AppError> {
+    if offset_bytes.is_none() && limit_bytes.is_none() {
+        return Ok(());
+    }
+    if revision.is_binary {
+        return Err(AppError::InvalidInput(
+            "range reads are only supported for text files".to_string(),
+        ));
+    }
+    let Some(content) = revision.inline_content.as_deref() else {
+        return Ok(());
+    };
+    let (slice, offset, limit, truncated) =
+        text_byte_range(content, offset_bytes.unwrap_or(0), limit_bytes)?;
+    revision.inline_content = Some(slice);
+    revision.content_offset_bytes = Some(offset);
+    revision.content_limit_bytes = Some(limit);
+    revision.content_truncated = Some(truncated);
+    Ok(())
+}
+
+fn normalized_file_range(
+    size_bytes: i64,
+    offset_bytes: Option<i64>,
+    limit_bytes: Option<i64>,
+) -> Result<Option<(i64, usize)>, AppError> {
+    let offset = offset_bytes.unwrap_or(0);
+    if offset < 0 {
+        return Err(AppError::InvalidInput(
+            "offset_bytes must be non-negative".to_string(),
+        ));
+    }
+    if matches!(limit_bytes, Some(limit) if limit < 0) {
+        return Err(AppError::InvalidInput(
+            "limit_bytes must be non-negative".to_string(),
+        ));
+    }
+    let size = size_bytes.max(0);
+    if offset >= size {
+        return Ok(None);
+    }
+    let requested_limit = limit_bytes
+        .and_then(|limit| usize::try_from(limit).ok())
+        .unwrap_or(MAX_FILE_RANGE_BYTES)
+        .min(MAX_FILE_RANGE_BYTES);
+    Ok(Some((offset, requested_limit)))
+}
+
+fn text_byte_range(
+    value: &str,
+    offset_bytes: i64,
+    limit_bytes: Option<i64>,
+) -> Result<(String, i64, i64, bool), AppError> {
+    if offset_bytes < 0 {
+        return Err(AppError::InvalidInput(
+            "offset_bytes must be non-negative".to_string(),
+        ));
+    }
+    if matches!(limit_bytes, Some(limit) if limit < 0) {
+        return Err(AppError::InvalidInput(
+            "limit_bytes must be non-negative".to_string(),
+        ));
+    }
+    let value_bytes = value.as_bytes();
+    let mut start = usize::try_from(offset_bytes)
+        .map_err(|_| AppError::InvalidInput("offset_bytes is invalid".to_string()))?
+        .min(value_bytes.len());
+    let requested_limit = limit_bytes
+        .and_then(|limit| usize::try_from(limit).ok())
+        .unwrap_or(MAX_FILE_RANGE_BYTES)
+        .min(MAX_FILE_RANGE_BYTES);
+    let mut end = start.saturating_add(requested_limit).min(value_bytes.len());
+    while start < value_bytes.len() && !value.is_char_boundary(start) {
+        start += 1;
+    }
+    while end > start && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let slice = value[start..end].to_string();
+    let limit = i64::try_from(slice.len())
+        .map_err(|_| AppError::InvalidInput("range length is invalid".to_string()))?;
+    Ok((
+        slice,
+        start as i64,
+        limit,
+        start > 0 || end < value_bytes.len(),
+    ))
+}
+
+fn text_byte_range_from_fetched_bytes(
+    bytes: &[u8],
+    fetch_start: i64,
+    requested_offset: i64,
+    requested_limit: usize,
+    total_size_bytes: i64,
+) -> Result<(String, i64, i64, bool), AppError> {
+    if bytes.is_empty() || requested_limit == 0 {
+        let actual_offset = requested_offset.min(total_size_bytes.max(0));
+        return Ok((String::new(), actual_offset, 0, actual_offset > 0));
+    }
+    let preferred_start =
+        usize::try_from(requested_offset.saturating_sub(fetch_start))?.min(bytes.len());
+    let mut start = preferred_start;
+    while start < bytes.len() && is_utf8_continuation_byte(bytes[start]) {
+        start += 1;
+    }
+    let mut end = preferred_start
+        .saturating_add(requested_limit)
+        .min(bytes.len());
+    if end < start {
+        end = start;
+    }
+    while end < bytes.len() && end > start && is_utf8_continuation_byte(bytes[end]) {
+        end -= 1;
+    }
+    while end > start && std::str::from_utf8(&bytes[start..end]).is_err() {
+        end -= 1;
+    }
+    let text = std::str::from_utf8(&bytes[start..end])
+        .map_err(|_| AppError::InvalidInput("file range is not valid UTF-8 text".to_string()))?
+        .to_string();
+    let actual_offset = fetch_start + i64::try_from(start)?;
+    let actual_limit = i64::try_from(text.len())?;
+    let truncated = actual_offset > 0 || actual_offset + actual_limit < total_size_bytes;
+    Ok((text, actual_offset, actual_limit, truncated))
+}
+
+fn is_utf8_continuation_byte(byte: u8) -> bool {
+    byte & 0b1100_0000 == 0b1000_0000
 }
 
 fn is_textual_content_type(content_type: &str) -> bool {
@@ -575,19 +1063,55 @@ pub async fn search_latest_revisions(
               AND fr.project_id = $2
               AND fr.path LIKE $3
             ORDER BY fr.path_hash, fr.revision DESC
+        ),
+        candidate_matches AS (
+            SELECT chunk.file_revision_id,
+                   chunk.content_text AS search_snippet,
+                   chunk.byte_start AS search_byte_start,
+                   chunk.byte_end AS search_byte_end,
+                   GREATEST(
+                       ts_rank_cd(chunk.search_vector, search_query.ts_query),
+                       CASE
+                           WHEN LOWER(chunk.content_text) LIKE '%' || search_query.needle || '%'
+                           THEN 0.1
+                           ELSE 0.0
+                       END,
+                       CASE
+                           WHEN LOWER(chunk.path) LIKE '%' || search_query.needle || '%'
+                           THEN 0.2
+                           ELSE 0.0
+                       END
+                   ) AS relevance
+            FROM file_search_chunks chunk
+            CROSS JOIN search_query
+            WHERE chunk.search_vector @@ search_query.ts_query
+               OR LOWER(chunk.content_text) LIKE '%' || search_query.needle || '%'
+               OR LOWER(chunk.path) LIKE '%' || search_query.needle || '%'
+            UNION ALL
+            SELECT latest.id AS file_revision_id,
+                   NULL::TEXT AS search_snippet,
+                   NULL::BIGINT AS search_byte_start,
+                   NULL::BIGINT AS search_byte_end,
+                   0.2::REAL AS relevance
+            FROM latest
+            CROSS JOIN search_query
+            WHERE LOWER(latest.path) LIKE '%' || search_query.needle || '%'
+        ),
+        matched AS (
+            SELECT DISTINCT ON (file_revision_id)
+                   file_revision_id, search_snippet, search_byte_start, search_byte_end,
+                   relevance
+            FROM candidate_matches
+            ORDER BY file_revision_id, relevance DESC, search_byte_start ASC NULLS LAST
         )
         SELECT latest.id, latest.tenant_id, latest.project_id, latest.path, latest.revision,
                latest.etag, latest.content_hash, latest.object_key, latest.object_reference_id,
                latest.bucket, latest.version_id, latest.inline_content, latest.size_bytes,
-               latest.reason, latest.run_id, latest.metadata, latest.created_at
+               latest.reason, latest.run_id, latest.metadata, latest.created_at,
+               matched.search_snippet, matched.search_byte_start, matched.search_byte_end
         FROM latest
-        JOIN file_search_documents doc ON doc.file_revision_id = latest.id
-        CROSS JOIN search_query
-        WHERE doc.search_vector @@ search_query.ts_query
-           OR LOWER(doc.content_text) LIKE '%' || search_query.needle || '%'
-           OR LOWER(doc.path) LIKE '%' || search_query.needle || '%'
-        ORDER BY ts_rank_cd(doc.search_vector, search_query.ts_query) DESC,
-                 latest.path ASC
+        JOIN matched ON matched.file_revision_id = latest.id
+        ORDER BY matched.relevance DESC, latest.path ASC
         LIMIT $5
         "#,
     )
@@ -601,8 +1125,22 @@ pub async fn search_latest_revisions(
 
     let mut matches = Vec::new();
     for row in rows {
+        let search_snippet: Option<String> = row.try_get("search_snippet")?;
+        let search_byte_start: Option<i64> = row.try_get("search_byte_start")?;
+        let search_byte_end: Option<i64> = row.try_get("search_byte_end")?;
         let mut revision = file_revision_from_row(row)?;
-        hydrate_revision_content(state, &mut revision, false).await?;
+        if revision.is_large && !revision.is_binary {
+            revision.inline_content = search_snippet;
+            revision.content_base64 = None;
+            revision.content_offset_bytes = search_byte_start;
+            revision.content_limit_bytes = match (search_byte_start, search_byte_end) {
+                (Some(start), Some(end)) => Some(end.saturating_sub(start)),
+                _ => None,
+            };
+            revision.content_truncated = Some(true);
+        } else {
+            hydrate_revision_content(state, &mut revision, false, None, None).await?;
+        }
         matches.push(revision);
     }
 
@@ -860,11 +1398,25 @@ async fn hydrate_revision_content(
     state: &AppState,
     revision: &mut FileRevisionResponse,
     allow_binary: bool,
+    offset_bytes: Option<i64>,
+    limit_bytes: Option<i64>,
 ) -> Result<(), AppError> {
+    let range_requested = offset_bytes.is_some() || limit_bytes.is_some();
+    if range_requested && revision.is_binary {
+        return Err(AppError::InvalidInput(
+            "range reads are only supported for text files".to_string(),
+        ));
+    }
     if revision.inline_content.is_some() || revision.content_base64.is_some() {
+        apply_revision_content_range(revision, offset_bytes, limit_bytes)?;
         return Ok(());
     }
     if revision.is_binary && !allow_binary {
+        return Ok(());
+    }
+    if range_requested
+        && hydrate_revision_content_range(state, revision, offset_bytes, limit_bytes).await?
+    {
         return Ok(());
     }
     let Some(content) = state
@@ -882,7 +1434,60 @@ async fn hydrate_revision_content(
         )));
     }
     populate_revision_content_from_bytes(revision, &content)?;
+    apply_revision_content_range(revision, offset_bytes, limit_bytes)?;
     Ok(())
+}
+
+async fn hydrate_revision_content_range(
+    state: &AppState,
+    revision: &mut FileRevisionResponse,
+    offset_bytes: Option<i64>,
+    limit_bytes: Option<i64>,
+) -> Result<bool, AppError> {
+    let Some((requested_offset, requested_limit)) =
+        normalized_file_range(revision.size_bytes, offset_bytes, limit_bytes)?
+    else {
+        let offset = offset_bytes.unwrap_or(0).min(revision.size_bytes.max(0));
+        revision.inline_content = Some(String::new());
+        revision.content_base64 = None;
+        revision.content_offset_bytes = Some(offset);
+        revision.content_limit_bytes = Some(0);
+        revision.content_truncated = Some(offset > 0);
+        return Ok(true);
+    };
+    let fetch_start = requested_offset.saturating_sub(3);
+    let prefix_bytes = usize::try_from(requested_offset - fetch_start)?;
+    let fetch_limit = requested_limit
+        .saturating_add(prefix_bytes)
+        .saturating_add(4)
+        .min(usize::try_from(
+            revision.size_bytes.saturating_sub(fetch_start),
+        )?);
+    let Some(content) = state
+        .rustfs_client
+        .get_file_object_range_version(
+            &revision.object_key,
+            revision.version_id.as_deref(),
+            u64::try_from(fetch_start)?,
+            fetch_limit,
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    let (slice, actual_offset, actual_limit, truncated) = text_byte_range_from_fetched_bytes(
+        &content,
+        fetch_start,
+        requested_offset,
+        requested_limit,
+        revision.size_bytes,
+    )?;
+    revision.inline_content = Some(slice);
+    revision.content_base64 = None;
+    revision.content_offset_bytes = Some(actual_offset);
+    revision.content_limit_bytes = Some(actual_limit);
+    revision.content_truncated = Some(truncated);
+    Ok(true)
 }
 
 async fn cleanup_orphan_file_object(state: &AppState, object_key: Option<&str>) {
@@ -983,6 +1588,14 @@ async fn insert_file_write_audit_tx(
         revision.content_type,
         object_reference_id
     );
+    let tool_call_id = payload
+        .tool_call_id
+        .as_deref()
+        .and_then(|value| Uuid::parse_str(value).ok());
+    let args_hash = payload
+        .args_hash
+        .as_deref()
+        .unwrap_or(&revision.content_hash);
     audit::insert_audit_log_tx(
         tx,
         NewAuditLog {
@@ -999,9 +1612,9 @@ async fn insert_file_write_audit_tx(
             run_id: payload.run_id,
             conversation_id: run_context.map(|run| run.conversation_id),
             workflow_run_id: None,
-            tool_call_id: None,
+            tool_call_id,
             approval_id: None,
-            args_hash: Some(&revision.content_hash),
+            args_hash: Some(args_hash),
             input_summary: Some(&payload.path),
             output_summary: Some(&output_summary),
             risk_level: Some(if revision.is_binary || revision.is_large {
@@ -1055,6 +1668,9 @@ fn file_revision_from_row(row: PgRow) -> Result<FileRevisionResponse, AppError> 
         version_id: row.try_get("version_id")?,
         inline_content,
         content_base64,
+        content_offset_bytes: None,
+        content_limit_bytes: None,
+        content_truncated: None,
         size_bytes,
         content_type,
         is_binary,
@@ -1239,6 +1855,32 @@ mod tests {
     }
 
     #[test]
+    fn text_byte_range_preserves_utf8_boundaries() {
+        let (slice, offset, limit, truncated) =
+            text_byte_range("abc公积金def", 4, Some(8)).expect("range");
+
+        assert_eq!(slice, "积金");
+        assert_eq!(offset, 6);
+        assert_eq!(limit, 6);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn fetched_text_byte_range_preserves_utf8_boundaries() {
+        let source = "abc公积金def".as_bytes();
+        let fetch_start = 1;
+        let fetched = &source[fetch_start as usize..source.len()];
+        let (slice, offset, limit, truncated) =
+            text_byte_range_from_fetched_bytes(fetched, fetch_start, 4, 8, source.len() as i64)
+                .expect("range");
+
+        assert_eq!(slice, "积金");
+        assert_eq!(offset, 6);
+        assert_eq!(limit, 6);
+        assert!(truncated);
+    }
+
+    #[test]
     fn validate_virtual_path_rejects_unsafe_patterns() {
         assert!(validate_virtual_path("/workspace/*.txt").is_ok());
         assert!(validate_virtual_path("/workspace/../*.txt").is_err());
@@ -1293,6 +1935,83 @@ mod tests {
         assert!(paths.contains(&("/workspace/docs/nested/b.txt", "file", 0)));
     }
 
+    #[test]
+    fn small_text_search_extraction_covers_all_content() {
+        let content = format!("{}{}", "a".repeat(FILE_SEARCH_CHUNK_BYTES), "尾部内容");
+
+        let extraction = extract_file_search_chunks(&content).expect("extraction");
+
+        assert_eq!(extraction.strategy, "full_chunks");
+        assert!(!extraction.is_truncated);
+        assert_eq!(extraction.source_size_bytes, content.len() as i64);
+        assert_eq!(extraction.indexed_bytes, content.len() as i64);
+        assert_eq!(
+            extraction
+                .chunks
+                .iter()
+                .map(|chunk| chunk.content_text.as_str())
+                .collect::<String>(),
+            content
+        );
+    }
+
+    #[test]
+    fn large_text_search_extraction_samples_head_middle_and_tail() {
+        let half = FILE_SEARCH_MAX_INDEXED_BYTES * 2;
+        let content = format!(
+            "HEAD_TOKEN{}MIDDLE_TOKEN{}TAIL_TOKEN",
+            "a".repeat(half),
+            "b".repeat(half)
+        );
+
+        let extraction = extract_file_search_chunks(&content).expect("extraction");
+
+        assert_eq!(extraction.strategy, "uniform_sample");
+        assert!(extraction.is_truncated);
+        assert_eq!(
+            extraction.chunks.len(),
+            FILE_SEARCH_MAX_INDEXED_BYTES / FILE_SEARCH_CHUNK_BYTES - 1
+        );
+        assert!(extraction.indexed_bytes <= FILE_SEARCH_MAX_INDEXED_BYTES as i64);
+        assert!(
+            extraction
+                .chunks
+                .first()
+                .unwrap()
+                .content_text
+                .contains("HEAD_TOKEN")
+        );
+        assert!(
+            extraction
+                .chunks
+                .iter()
+                .any(|chunk| chunk.content_text.contains("MIDDLE_TOKEN"))
+        );
+        assert!(
+            extraction
+                .chunks
+                .last()
+                .unwrap()
+                .content_text
+                .contains("TAIL_TOKEN")
+        );
+    }
+
+    #[test]
+    fn large_text_search_chunks_preserve_utf8_boundaries() {
+        let unit = "公积金检索";
+        let content = unit.repeat(FILE_SEARCH_MAX_INDEXED_BYTES * 2 / unit.len());
+
+        let extraction = extract_file_search_chunks(&content).expect("extraction");
+
+        assert!(extraction.is_truncated);
+        assert!(extraction.chunks.iter().all(|chunk| {
+            content.is_char_boundary(chunk.byte_start as usize)
+                && content.is_char_boundary(chunk.byte_end as usize)
+                && chunk.content_text.len() <= FILE_SEARCH_CHUNK_BYTES
+        }));
+    }
+
     #[tokio::test]
     #[ignore = "requires local Postgres and the bibi_work schema"]
     async fn writes_and_reads_historical_inline_revisions() -> Result<(), Box<dyn std::error::Error>>
@@ -1318,6 +2037,11 @@ mod tests {
                 reason: "initial write".to_string(),
                 run_id: None,
                 lock_token: None,
+                tool_call_id: None,
+                tool_name: None,
+                args_hash: None,
+                parent_tool_call_id: None,
+                operation: None,
             },
         )
         .await?;
@@ -1338,6 +2062,11 @@ mod tests {
                 reason: "update".to_string(),
                 run_id: None,
                 lock_token: None,
+                tool_call_id: None,
+                tool_name: None,
+                args_hash: None,
+                parent_tool_call_id: None,
+                operation: None,
             },
         )
         .await?;
@@ -1359,6 +2088,8 @@ mod tests {
                 run_id: None,
                 include_content: None,
                 allow_binary: None,
+                offset_bytes: None,
+                limit_bytes: None,
             },
         )
         .await?;
@@ -1379,6 +2110,8 @@ mod tests {
                 run_id: None,
                 include_content: None,
                 allow_binary: None,
+                offset_bytes: None,
+                limit_bytes: None,
             },
         )
         .await?;
@@ -1395,6 +2128,154 @@ mod tests {
             matches[0].inline_content.as_deref(),
             Some("second revision")
         );
+
+        cleanup_tenant(&state.connect_pool, tenant_id).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Postgres and the bibi_work schema"]
+    async fn backfills_missing_inline_file_search_index() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let state = test_state().await?;
+        let (tenant_id, user_id, project_id) = seed_file_context(&state.connect_pool).await?;
+        let path = "/workspace/backfill-report.txt".to_string();
+        let revision = write_revision(
+            &state,
+            FileWriteRequest {
+                tenant_id,
+                actor_user_id: user_id,
+                actor_device_id: None,
+                actor_session_id: None,
+                project_id,
+                path: path.clone(),
+                content_ref: None,
+                inline_content: Some("historical backfill token".to_string()),
+                content_base64: None,
+                content_type: None,
+                expected_revision: 0,
+                reason: "backfill fixture".to_string(),
+                run_id: None,
+                lock_token: None,
+                tool_call_id: None,
+                tool_name: None,
+                args_hash: None,
+                parent_tool_call_id: None,
+                operation: None,
+            },
+        )
+        .await?;
+        sqlx::query("DELETE FROM file_search_chunks WHERE file_revision_id = $1")
+            .bind(revision.id)
+            .execute(&state.connect_pool)
+            .await?;
+        sqlx::query("UPDATE file_revisions SET metadata = metadata - 'search_index' WHERE id = $1")
+            .bind(revision.id)
+            .execute(&state.connect_pool)
+            .await?;
+
+        let summary = backfill_file_search_chunks(&state, 256).await?;
+        assert!(summary.candidates >= 1);
+        let matches = search_latest_revisions(
+            &state,
+            tenant_id,
+            project_id,
+            "/workspace/",
+            "historical backfill token",
+            10,
+        )
+        .await?;
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].path, path);
+
+        cleanup_tenant(&state.connect_pool, tenant_id).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Postgres and the bibi_work schema"]
+    async fn large_text_revision_is_uniformly_chunk_indexed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let state = test_state().await?;
+        let (tenant_id, user_id, project_id) = seed_file_context(&state.connect_pool).await?;
+        let path = "/workspace/large-indexed-report.txt".to_string();
+        let half = FILE_SEARCH_MAX_INDEXED_BYTES * 2;
+        let content = format!(
+            "HEAD_INDEX_TOKEN{}MIDDLE_INDEX_TOKEN{}TAIL_INDEX_TOKEN",
+            "a".repeat(half),
+            "b".repeat(half)
+        );
+
+        let revision = write_revision(
+            &state,
+            FileWriteRequest {
+                tenant_id,
+                actor_user_id: user_id,
+                actor_device_id: None,
+                actor_session_id: None,
+                project_id,
+                path: path.clone(),
+                content_ref: None,
+                inline_content: Some(content),
+                content_base64: None,
+                content_type: None,
+                expected_revision: 0,
+                reason: "large indexed write".to_string(),
+                run_id: None,
+                lock_token: None,
+                tool_call_id: None,
+                tool_name: None,
+                args_hash: None,
+                parent_tool_call_id: None,
+                operation: None,
+            },
+        )
+        .await?;
+
+        assert!(revision.is_large);
+        assert_eq!(
+            revision.metadata.pointer("/search_index/status"),
+            Some(&json!("indexed"))
+        );
+        assert_eq!(
+            revision.metadata.pointer("/search_index/strategy"),
+            Some(&json!("uniform_sample"))
+        );
+        assert_eq!(
+            revision.metadata.pointer("/search_index/is_truncated"),
+            Some(&json!(true))
+        );
+        let chunk_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM file_search_chunks WHERE file_revision_id = $1",
+        )
+        .bind(revision.id)
+        .fetch_one(&state.connect_pool)
+        .await?;
+        assert_eq!(
+            chunk_count,
+            i64::try_from(FILE_SEARCH_MAX_INDEXED_BYTES / FILE_SEARCH_CHUNK_BYTES - 1)?
+        );
+
+        for token in ["HEAD_INDEX_TOKEN", "MIDDLE_INDEX_TOKEN", "TAIL_INDEX_TOKEN"] {
+            let matches =
+                search_latest_revisions(&state, tenant_id, project_id, "/workspace/", token, 10)
+                    .await?;
+            assert_eq!(matches.len(), 1, "missing indexed token {token}");
+            assert_eq!(matches[0].path, path);
+            assert!(matches[0].content_truncated.unwrap_or(false));
+            assert!(
+                matches[0]
+                    .inline_content
+                    .as_deref()
+                    .is_some_and(|snippet| snippet.contains(token))
+            );
+            assert!(
+                matches[0]
+                    .inline_content
+                    .as_ref()
+                    .is_some_and(|snippet| snippet.len() <= FILE_SEARCH_CHUNK_BYTES)
+            );
+        }
 
         cleanup_tenant(&state.connect_pool, tenant_id).await?;
         Ok(())
@@ -1425,6 +2306,11 @@ mod tests {
                 reason: "initial rustfs write".to_string(),
                 run_id: None,
                 lock_token: None,
+                tool_call_id: None,
+                tool_name: None,
+                args_hash: None,
+                parent_tool_call_id: None,
+                operation: None,
             },
         )
         .await?;
@@ -1446,6 +2332,11 @@ mod tests {
                 reason: "rustfs update".to_string(),
                 run_id: None,
                 lock_token: None,
+                tool_call_id: None,
+                tool_name: None,
+                args_hash: None,
+                parent_tool_call_id: None,
+                operation: None,
             },
         )
         .await?;
@@ -1467,6 +2358,8 @@ mod tests {
                 run_id: None,
                 include_content: None,
                 allow_binary: None,
+                offset_bytes: None,
+                limit_bytes: None,
             },
         )
         .await?;
@@ -1490,6 +2383,8 @@ mod tests {
                 run_id: None,
                 include_content: None,
                 allow_binary: None,
+                offset_bytes: None,
+                limit_bytes: None,
             },
         )
         .await?;
@@ -1514,6 +2409,8 @@ mod tests {
                     run_id: None,
                     include_content: None,
                     allow_binary: None,
+                    offset_bytes: None,
+                    limit_bytes: None,
                 },
             )
             .await?;
@@ -1549,6 +2446,8 @@ mod tests {
             run_id: None,
             include_content: None,
             allow_binary: None,
+            offset_bytes: None,
+            limit_bytes: None,
         }
     }
 
@@ -1597,6 +2496,11 @@ mod tests {
                 worker_max_attempts: 1,
             })?,
             internal_shared_token: "test-internal-token".to_string(),
+            audit_partition_cleanup_enabled: false,
+            secret_resolver:
+                crate::features::agent_platform::secret_resolver::SecretResolver::env_only_for_tests(
+                ),
+            credential_rotation_worker_enabled: false,
         })
     }
 
@@ -1700,6 +2604,9 @@ mod tests {
             version_id: None,
             inline_content: Some("content".to_string()),
             content_base64: None,
+            content_offset_bytes: None,
+            content_limit_bytes: None,
+            content_truncated: None,
             size_bytes,
             content_type: FILE_CONTENT_TYPE.to_string(),
             is_binary: false,

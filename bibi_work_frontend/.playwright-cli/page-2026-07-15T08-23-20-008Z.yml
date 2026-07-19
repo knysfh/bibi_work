@@ -1,0 +1,17 @@
+- generic [ref=e1]:
+  - generic [ref=e5]:
+    - generic [ref=e7]:
+      - generic [ref=e8]: 欢迎登录VPN
+      - generic [ref=e9]:
+        - generic [ref=e10]:
+          - textbox [ref=e11]
+          - textbox "用户名" [active] [ref=e12]: al
+          - text: X
+        - generic [ref=e13]:
+          - textbox [ref=e14]
+          - textbox "密码" [ref=e15]
+      - button "登录" [ref=e17] [cursor=pointer]
+      - link "忘记密码?" [ref=e20] [cursor=pointer]:
+        - /url: javascript:void(0)
+    - generic [ref=e21]:  
+  - generic [ref=e22]: 

@@ -1,0 +1,10 @@
+{
+  "name": "@biwork/desktop",
+  "version": "0.0.0",
+  "private": true,
+  "description": "BiWork desktop Electron application",
+  "main": "../../out/main/index.js",
+  "dependencies": {
+    "@biwork/web-host": "workspace:*"
+  }
+}

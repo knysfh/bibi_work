@@ -1,21 +1,35 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
-    "useDefineForClassFields": true,
-    "lib": ["DOM", "DOM.Iterable", "ES2022"],
-    "allowJs": false,
+    "target": "ES6",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "allowJs": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
     "skipLibCheck": true,
     "esModuleInterop": true,
-    "allowSyntheticDefaultImports": true,
-    "strict": true,
-    "forceConsistentCasingInFileNames": true,
-    "module": "ESNext",
-    "moduleResolution": "Bundler",
+    "noImplicitAny": true,
+    "sourceMap": true,
+    "outDir": "dist",
     "resolveJsonModule": true,
-    "isolatedModules": true,
+    "jsx": "react",
+    "allowImportingTsExtensions": true,
     "noEmit": true,
-    "jsx": "react-jsx",
-    "types": ["vitest/globals", "node"]
+    "paths": {
+      "@/*": ["./packages/desktop/src/*"],
+      "@process/*": ["./packages/desktop/src/process/*"],
+      "@renderer/*": ["./packages/desktop/src/renderer/*"],
+      "@worker/*": ["./packages/desktop/src/process/worker/*"]
+    }
   },
-  "include": ["src", "vite.config.ts", "eslint.config.js"]
+  "include": [
+    "packages/desktop/src/**/*",
+    "uno.config.ts",
+    "packages/desktop/electron.vite.config.ts",
+    "playwright.config.ts",
+    "packages/desktop/src/renderer/types.d.ts"
+  ],
+  "exclude": [
+    "packages/desktop/src/process/services/database/drivers/BunSqliteDriver.ts",
+    "packages/desktop/src/process/services/database/drivers/BunSqliteDriver.bun.test.ts"
+  ]
 }

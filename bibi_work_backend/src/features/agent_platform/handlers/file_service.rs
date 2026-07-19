@@ -1,7 +1,11 @@
 use axum::{
     Extension, Json,
+    body::Body,
     extract::{Path, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::Response,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::{Value, json};
 use sqlx::Row;
 use time::OffsetDateTime;
@@ -21,7 +25,20 @@ use super::support::*;
 
 const TOOL_RESULT_ARTIFACT_PAGE_SIZE: i64 = 50;
 const TOOL_RESULT_ARTIFACT_MAX_PAGE_SIZE: i64 = 500;
-const TOOL_RESULT_ARTIFACT_TEXT_PREVIEW_CHARS: usize = 64 * 1024;
+const TOOL_RESULT_ARTIFACT_MAX_TEXT_PAGE_CHARS: i64 = 20 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArtifactStreamRange {
+    start: u64,
+    end: u64,
+    partial: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactStreamRangeSelection {
+    Satisfiable(ArtifactStreamRange),
+    NotSatisfiable,
+}
 
 struct ToolResultArtifactRow {
     id: Uuid,
@@ -124,30 +141,24 @@ async fn authorize_file_edit(state: &AppState, payload: &FileEditRequest) -> Res
 
 async fn authorize_file_lock(
     state: &AppState,
-    tenant_id: uuid::Uuid,
-    actor_user_id: uuid::Uuid,
-    actor_device_id: Option<uuid::Uuid>,
-    actor_session_id: Option<uuid::Uuid>,
-    project_id: uuid::Uuid,
-    path: &str,
-    run_id: Option<uuid::Uuid>,
+    payload: &impl FileLockAuthorization,
 ) -> Result<(), AppError> {
-    let path_hash = file_store::path_hash(path)?;
+    let path_hash = file_store::path_hash(payload.path())?;
     require_ferriskey_allow_for_actor(
         state,
-        tenant_id,
+        payload.tenant_id(),
         ActorRef {
-            user_id: actor_user_id,
-            device_id: actor_device_id,
-            session_id: actor_session_id,
+            user_id: payload.actor_user_id(),
+            device_id: payload.actor_device_id(),
+            session_id: payload.actor_session_id(),
             roles: Vec::new(),
         },
         "write",
         "file",
-        format!("{}:{}", project_id, path_hash),
+        format!("{}:{}", payload.project_id(), path_hash),
         Some(AuthzContext {
-            project_id: Some(project_id),
-            run_id,
+            project_id: Some(payload.project_id()),
+            run_id: payload.run_id(),
             risk_level: Some("medium".to_string()),
             ..Default::default()
         }),
@@ -155,6 +166,47 @@ async fn authorize_file_lock(
     .await?;
     Ok(())
 }
+
+trait FileLockAuthorization {
+    fn tenant_id(&self) -> Uuid;
+    fn actor_user_id(&self) -> Uuid;
+    fn actor_device_id(&self) -> Option<Uuid>;
+    fn actor_session_id(&self) -> Option<Uuid>;
+    fn project_id(&self) -> Uuid;
+    fn path(&self) -> &str;
+    fn run_id(&self) -> Option<Uuid>;
+}
+
+macro_rules! impl_file_lock_authorization {
+    ($type:ty) => {
+        impl FileLockAuthorization for $type {
+            fn tenant_id(&self) -> Uuid {
+                self.tenant_id
+            }
+            fn actor_user_id(&self) -> Uuid {
+                self.actor_user_id
+            }
+            fn actor_device_id(&self) -> Option<Uuid> {
+                self.actor_device_id
+            }
+            fn actor_session_id(&self) -> Option<Uuid> {
+                self.actor_session_id
+            }
+            fn project_id(&self) -> Uuid {
+                self.project_id
+            }
+            fn path(&self) -> &str {
+                &self.path
+            }
+            fn run_id(&self) -> Option<Uuid> {
+                self.run_id
+            }
+        }
+    };
+}
+
+impl_file_lock_authorization!(FileLockRequest);
+impl_file_lock_authorization!(FileUnlockRequest);
 
 async fn authorize_project_file_listing(
     state: &AppState,
@@ -208,7 +260,7 @@ async fn authorize_project_file_search(
     Ok(())
 }
 
-async fn authorize_current_file_access(
+pub(super) async fn authorize_current_file_access(
     state: &AppState,
     ctx: &PlatformRequestContext,
     tenant_id: uuid::Uuid,
@@ -234,7 +286,7 @@ async fn authorize_current_file_access(
     Ok(())
 }
 
-async fn authorize_current_project_file_read(
+pub(super) async fn authorize_current_project_file_read(
     state: &AppState,
     ctx: &PlatformRequestContext,
     tenant_id: uuid::Uuid,
@@ -287,17 +339,7 @@ pub async fn file_lock_acquire(
     State(state): State<AppState>,
     Json(payload): Json<FileLockRequest>,
 ) -> Result<Json<FileLockResponse>, AppError> {
-    authorize_file_lock(
-        &state,
-        payload.tenant_id,
-        payload.actor_user_id,
-        payload.actor_device_id,
-        payload.actor_session_id,
-        payload.project_id,
-        &payload.path,
-        payload.run_id,
-    )
-    .await?;
+    authorize_file_lock(&state, &payload).await?;
     file_lock::acquire_lock(&state, payload).await.map(Json)
 }
 
@@ -305,17 +347,7 @@ pub async fn file_lock_release(
     State(state): State<AppState>,
     Json(payload): Json<FileUnlockRequest>,
 ) -> Result<Json<FileLockResponse>, AppError> {
-    authorize_file_lock(
-        &state,
-        payload.tenant_id,
-        payload.actor_user_id,
-        payload.actor_device_id,
-        payload.actor_session_id,
-        payload.project_id,
-        &payload.path,
-        payload.run_id,
-    )
-    .await?;
+    authorize_file_lock(&state, &payload).await?;
     file_lock::release_lock(&state, payload).await.map(Json)
 }
 
@@ -338,6 +370,8 @@ pub async fn file_edit(
             run_id: payload.run_id,
             include_content: None,
             allow_binary: None,
+            offset_bytes: None,
+            limit_bytes: None,
         },
     )
     .await?;
@@ -369,6 +403,11 @@ pub async fn file_edit(
             reason: payload.reason,
             run_id: payload.run_id,
             lock_token: None,
+            tool_call_id: None,
+            tool_name: None,
+            args_hash: None,
+            parent_tool_call_id: None,
+            operation: Some("edit_file".to_string()),
         },
     )
     .await?;
@@ -471,6 +510,8 @@ pub async fn public_file_read(
             run_id: query.run_id,
             include_content: query.include_content,
             allow_binary: query.allow_binary,
+            offset_bytes: query.offset_bytes,
+            limit_bytes: query.limit_bytes,
         },
     )
     .await
@@ -609,14 +650,20 @@ pub async fn public_tool_result_artifact_read(
             run_id: artifact.run_id,
             include_content: Some(true),
             allow_binary: Some(false),
+            offset_bytes: query.offset_bytes,
+            limit_bytes: query.limit_bytes,
         },
     )
     .await?;
-    let content = tool_result_artifact_content(
-        &revision,
-        query.offset.unwrap_or(0),
-        query.limit.unwrap_or(TOOL_RESULT_ARTIFACT_PAGE_SIZE),
-    )?;
+    let content = if query.offset_bytes.is_some() || query.limit_bytes.is_some() {
+        tool_result_artifact_byte_range_content(&revision)?
+    } else {
+        tool_result_artifact_content(
+            &revision,
+            query.offset.unwrap_or(0),
+            query.limit.unwrap_or(TOOL_RESULT_ARTIFACT_PAGE_SIZE),
+        )?
+    };
 
     Ok(Json(ToolResultArtifactReadResponse {
         id: artifact.id,
@@ -636,6 +683,80 @@ pub async fn public_tool_result_artifact_read(
         content,
         created_at: artifact.created_at,
     }))
+}
+
+pub async fn public_tool_result_artifact_stream(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<PlatformRequestContext>,
+    headers: HeaderMap,
+    Query(query): Query<ToolResultArtifactStreamQuery>,
+) -> Result<Response, AppError> {
+    ensure_tenant_member(&state.connect_pool, query.tenant_id, ctx.platform_user_id).await?;
+    let artifact =
+        load_tool_result_artifact(&state, query.tenant_id, query.object_reference_id).await?;
+    authorize_current_file_access(
+        &state,
+        &ctx,
+        query.tenant_id,
+        artifact.project_id,
+        &artifact.path,
+        artifact.run_id,
+    )
+    .await?;
+
+    let revision = file_store::read_revision(
+        &state,
+        FileReadRequest {
+            tenant_id: query.tenant_id,
+            actor_user_id: ctx.platform_user_id,
+            actor_device_id: Some(ctx.device_id),
+            actor_session_id: Some(ctx.session_id),
+            project_id: artifact.project_id,
+            path: artifact.path.clone(),
+            revision: Some(artifact.revision),
+            version_id: None,
+            run_id: artifact.run_id,
+            include_content: Some(false),
+            allow_binary: Some(true),
+            offset_bytes: None,
+            limit_bytes: None,
+        },
+    )
+    .await?;
+    let range = resolve_artifact_stream_range(
+        revision.size_bytes,
+        query.offset_bytes,
+        query.limit_bytes,
+        headers.get(header::RANGE),
+    )?;
+    let ArtifactStreamRangeSelection::Satisfiable(range) = range else {
+        return Ok(range_not_satisfiable_response(revision.size_bytes));
+    };
+    let body = if let Some(bytes) = inline_revision_bytes(&revision)? {
+        Body::from(slice_inline_bytes(bytes, range)?)
+    } else if range.start == range.end {
+        Body::empty()
+    } else if let Some(result) = state
+        .rustfs_client
+        .get_file_object_stream_version(
+            &revision.object_key,
+            revision.version_id.as_deref(),
+            if range.partial {
+                Some(range.start..range.end)
+            } else {
+                None
+            },
+        )
+        .await?
+    {
+        Body::from_stream(result.into_stream())
+    } else {
+        return Err(AppError::ObjectStore(
+            "file object is not available for streaming".to_string(),
+        ));
+    };
+
+    Ok(artifact_stream_response(&revision, range, body))
 }
 
 async fn load_tool_result_artifact(
@@ -691,8 +812,16 @@ fn tool_result_artifact_content(
     }
 
     let Some(text) = revision.inline_content.as_deref() else {
+        let offset = offset.max(0) as usize;
+        let limit: usize = limit
+            .clamp(1, TOOL_RESULT_ARTIFACT_MAX_TEXT_PAGE_CHARS)
+            .try_into()
+            .map_err(|_| AppError::InvalidInput("limit is invalid".to_string()))?;
         return Ok(json!({
             "kind": "text",
+            "offset": offset,
+            "limit": limit,
+            "total_chars": 0,
             "text": "",
             "truncated": false
         }));
@@ -727,15 +856,251 @@ fn tool_result_artifact_content(
         }));
     }
 
-    let preview = text
-        .chars()
-        .take(TOOL_RESULT_ARTIFACT_TEXT_PREVIEW_CHARS)
-        .collect::<String>();
+    let offset = offset.max(0) as usize;
+    let limit: usize = limit
+        .clamp(1, TOOL_RESULT_ARTIFACT_MAX_TEXT_PAGE_CHARS)
+        .try_into()
+        .map_err(|_| AppError::InvalidInput("limit is invalid".to_string()))?;
+    let total_chars = text.chars().count();
+    let page = text.chars().skip(offset).take(limit).collect::<String>();
+    let page_chars = page.chars().count();
     Ok(json!({
         "kind": "text",
-        "text": preview,
-        "truncated": text.chars().count() > TOOL_RESULT_ARTIFACT_TEXT_PREVIEW_CHARS
+        "offset": offset,
+        "limit": limit,
+        "total_chars": total_chars,
+        "text": page,
+        "truncated": offset < total_chars && offset + page_chars < total_chars
     }))
+}
+
+fn tool_result_artifact_byte_range_content(
+    revision: &FileRevisionResponse,
+) -> Result<Value, AppError> {
+    if revision.is_binary {
+        return Ok(json!({
+            "kind": "binary_metadata",
+            "content_type": revision.content_type,
+            "size_bytes": revision.size_bytes
+        }));
+    }
+    let text = revision.inline_content.as_deref().unwrap_or("");
+    Ok(json!({
+        "kind": "text_byte_range",
+        "offset_bytes": revision.content_offset_bytes.unwrap_or(0),
+        "limit_bytes": revision
+            .content_limit_bytes
+            .unwrap_or_else(|| i64::try_from(text.len()).unwrap_or(0)),
+        "total_bytes": revision.size_bytes,
+        "text": text,
+        "truncated": revision.content_truncated.unwrap_or(false)
+    }))
+}
+
+fn resolve_artifact_stream_range(
+    total_bytes: i64,
+    offset_bytes: Option<i64>,
+    limit_bytes: Option<i64>,
+    range_header: Option<&HeaderValue>,
+) -> Result<ArtifactStreamRangeSelection, AppError> {
+    if offset_bytes.is_some() || limit_bytes.is_some() {
+        if range_header.is_some() {
+            return Err(AppError::InvalidInput(
+                "Range header and offset_bytes/limit_bytes are mutually exclusive".to_string(),
+            ));
+        }
+        return query_artifact_stream_range(total_bytes, offset_bytes, limit_bytes);
+    }
+    let Some(range_header) = range_header else {
+        let total = u64::try_from(total_bytes.max(0))?;
+        return Ok(ArtifactStreamRangeSelection::Satisfiable(
+            ArtifactStreamRange {
+                start: 0,
+                end: total,
+                partial: false,
+            },
+        ));
+    };
+    header_artifact_stream_range(total_bytes, range_header)
+}
+
+fn query_artifact_stream_range(
+    total_bytes: i64,
+    offset_bytes: Option<i64>,
+    limit_bytes: Option<i64>,
+) -> Result<ArtifactStreamRangeSelection, AppError> {
+    let total = u64::try_from(total_bytes.max(0))?;
+    let offset = offset_bytes.unwrap_or(0);
+    if offset < 0 {
+        return Err(AppError::InvalidInput(
+            "offset_bytes must be non-negative".to_string(),
+        ));
+    }
+    if matches!(limit_bytes, Some(limit) if limit <= 0) {
+        return Err(AppError::InvalidInput(
+            "limit_bytes must be greater than zero for stream reads".to_string(),
+        ));
+    }
+    let start = u64::try_from(offset)?;
+    if start >= total {
+        return Ok(ArtifactStreamRangeSelection::NotSatisfiable);
+    }
+    let requested_limit = match limit_bytes {
+        Some(limit) => u64::try_from(limit)?,
+        None => total.saturating_sub(start),
+    };
+    let end = start.saturating_add(requested_limit).min(total);
+    Ok(ArtifactStreamRangeSelection::Satisfiable(
+        ArtifactStreamRange {
+            start,
+            end,
+            partial: start > 0 || end < total,
+        },
+    ))
+}
+
+fn header_artifact_stream_range(
+    total_bytes: i64,
+    range_header: &HeaderValue,
+) -> Result<ArtifactStreamRangeSelection, AppError> {
+    let total = u64::try_from(total_bytes.max(0))?;
+    let raw = range_header
+        .to_str()
+        .map_err(|_| AppError::InvalidInput("Range header is not valid ASCII".to_string()))?
+        .trim();
+    let Some(spec) = raw.strip_prefix("bytes=") else {
+        return Err(AppError::InvalidInput(
+            "Range header must use bytes unit".to_string(),
+        ));
+    };
+    if spec.contains(',') {
+        return Err(AppError::InvalidInput(
+            "multiple byte ranges are not supported".to_string(),
+        ));
+    }
+    if total == 0 {
+        return Ok(ArtifactStreamRangeSelection::NotSatisfiable);
+    }
+    let (start_raw, end_raw) = spec
+        .split_once('-')
+        .ok_or_else(|| AppError::InvalidInput("Range header is invalid".to_string()))?;
+    let (start, end) = if start_raw.is_empty() {
+        let suffix = end_raw
+            .parse::<u64>()
+            .map_err(|_| AppError::InvalidInput("Range suffix is invalid".to_string()))?;
+        if suffix == 0 {
+            return Ok(ArtifactStreamRangeSelection::NotSatisfiable);
+        }
+        let start = total.saturating_sub(suffix);
+        (start, total)
+    } else {
+        let start = start_raw
+            .parse::<u64>()
+            .map_err(|_| AppError::InvalidInput("Range start is invalid".to_string()))?;
+        if start >= total {
+            return Ok(ArtifactStreamRangeSelection::NotSatisfiable);
+        }
+        let end_inclusive = if end_raw.is_empty() {
+            total - 1
+        } else {
+            end_raw
+                .parse::<u64>()
+                .map_err(|_| AppError::InvalidInput("Range end is invalid".to_string()))?
+        };
+        if end_inclusive < start {
+            return Err(AppError::InvalidInput(
+                "Range end must be greater than or equal to start".to_string(),
+            ));
+        }
+        (start, end_inclusive.saturating_add(1).min(total))
+    };
+    Ok(ArtifactStreamRangeSelection::Satisfiable(
+        ArtifactStreamRange {
+            start,
+            end,
+            partial: true,
+        },
+    ))
+}
+
+fn inline_revision_bytes(revision: &FileRevisionResponse) -> Result<Option<Vec<u8>>, AppError> {
+    if let Some(text) = revision.inline_content.as_deref() {
+        return Ok(Some(text.as_bytes().to_vec()));
+    }
+    let Some(encoded) = revision.content_base64.as_deref() else {
+        return Ok(None);
+    };
+    BASE64_STANDARD
+        .decode(encoded)
+        .map(Some)
+        .map_err(|_| AppError::InvalidInput("stored content_base64 is invalid".to_string()))
+}
+
+fn slice_inline_bytes(bytes: Vec<u8>, range: ArtifactStreamRange) -> Result<Vec<u8>, AppError> {
+    let start = usize::try_from(range.start)?;
+    let end = usize::try_from(range.end)?;
+    if start > bytes.len() || end > bytes.len() || start > end {
+        return Err(AppError::InvalidInput(
+            "stream range is outside inline artifact content".to_string(),
+        ));
+    }
+    Ok(bytes[start..end].to_vec())
+}
+
+fn artifact_stream_response(
+    revision: &FileRevisionResponse,
+    range: ArtifactStreamRange,
+    body: Body,
+) -> Response {
+    let mut response = Response::new(body);
+    *response.status_mut() = if range.partial {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    let content_length = range.end.saturating_sub(range.start).to_string();
+    let headers = response.headers_mut();
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Ok(value) = HeaderValue::from_str(&content_length) {
+        headers.insert(header::CONTENT_LENGTH, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&revision.content_type) {
+        headers.insert(header::CONTENT_TYPE, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&revision.etag) {
+        headers.insert(header::ETAG, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&revision.content_hash) {
+        headers.insert("x-content-sha256", value);
+    }
+    if let Some(object_reference_id) = revision.object_reference_id
+        && let Ok(value) = HeaderValue::from_str(&object_reference_id.to_string())
+    {
+        headers.insert("x-object-reference-id", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&revision.revision.to_string()) {
+        headers.insert("x-file-revision", value);
+    }
+    if range.partial {
+        let total = revision.size_bytes.max(0);
+        let content_range = format!("bytes {}-{}/{}", range.start, range.end - 1, total);
+        if let Ok(value) = HeaderValue::from_str(&content_range) {
+            headers.insert(header::CONTENT_RANGE, value);
+        }
+    }
+    response
+}
+
+fn range_not_satisfiable_response(total_bytes: i64) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+    let headers = response.headers_mut();
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+    if let Ok(value) = HeaderValue::from_str(&format!("bytes */{}", total_bytes.max(0))) {
+        headers.insert(header::CONTENT_RANGE, value);
+    }
+    response
 }
 
 fn is_jsonl_artifact(revision: &FileRevisionResponse) -> bool {
@@ -781,6 +1146,7 @@ fn jsonl_artifact_content(text: &str, offset: i64, limit: i64) -> Result<Value, 
 
 #[cfg(test)]
 mod tests {
+    use axum::http::HeaderValue;
     use axum::middleware;
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use redis::Client as RedisClient;
@@ -801,6 +1167,7 @@ mod tests {
             internal_auth::internal_token_middleware, memory_vector::MemoryVectorClient,
             models::FileRevisionResponse, runtime::AgentRuntimeClient, rustfs::RustFsClient,
         },
+        features::core::errors::AppError,
         startup::AppState,
     };
 
@@ -822,6 +1189,9 @@ mod tests {
             version_id: None,
             inline_content: Some(r#"[{"n":1},{"n":2},{"n":3}]"#.to_string()),
             content_base64: None,
+            content_offset_bytes: None,
+            content_limit_bytes: None,
+            content_truncated: None,
             size_bytes: 25,
             content_type: "application/json".to_string(),
             is_binary: false,
@@ -856,6 +1226,9 @@ mod tests {
             version_id: None,
             inline_content: Some("{\"n\":1}\n{\"n\":2}\n{\"n\":3}".to_string()),
             content_base64: None,
+            content_offset_bytes: None,
+            content_limit_bytes: None,
+            content_truncated: None,
             size_bytes: 23,
             content_type: "application/x-ndjson".to_string(),
             is_binary: false,
@@ -872,6 +1245,180 @@ mod tests {
         assert_eq!(content["offset"], 1);
         assert_eq!(content["total_rows"], 3);
         assert_eq!(content["rows"], json!([{"n": 2}, {"n": 3}]));
+    }
+
+    #[test]
+    fn tool_result_artifact_content_pages_text_by_chars() {
+        let revision = FileRevisionResponse {
+            id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            path: "/artifacts/tool-results/page.txt".to_string(),
+            revision: 1,
+            etag: "etag".to_string(),
+            content_hash: "hash".to_string(),
+            object_key: "object".to_string(),
+            object_reference_id: Some(Uuid::new_v4()),
+            bucket: None,
+            version_id: None,
+            inline_content: Some("a中bc".to_string()),
+            content_base64: None,
+            content_offset_bytes: None,
+            content_limit_bytes: None,
+            content_truncated: None,
+            size_bytes: 6,
+            content_type: "text/plain".to_string(),
+            is_binary: false,
+            is_large: false,
+            reason: "test".to_string(),
+            run_id: None,
+            metadata: json!({}),
+            created_at: OffsetDateTime::now_utc(),
+        };
+
+        let content = super::tool_result_artifact_content(&revision, 1, 2).expect("content");
+
+        assert_eq!(content["kind"], "text");
+        assert_eq!(content["offset"], 1);
+        assert_eq!(content["limit"], 2);
+        assert_eq!(content["total_chars"], 4);
+        assert_eq!(content["text"], "中b");
+        assert_eq!(content["truncated"], true);
+    }
+
+    #[test]
+    fn tool_result_artifact_content_reports_text_byte_range() {
+        let revision = FileRevisionResponse {
+            id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            path: "/artifacts/tool-results/page.txt".to_string(),
+            revision: 1,
+            etag: "etag".to_string(),
+            content_hash: "hash".to_string(),
+            object_key: "object".to_string(),
+            object_reference_id: Some(Uuid::new_v4()),
+            bucket: None,
+            version_id: None,
+            inline_content: Some("中b".to_string()),
+            content_base64: None,
+            content_offset_bytes: Some(1),
+            content_limit_bytes: Some(4),
+            content_truncated: Some(true),
+            size_bytes: 6,
+            content_type: "text/plain".to_string(),
+            is_binary: false,
+            is_large: true,
+            reason: "test".to_string(),
+            run_id: None,
+            metadata: json!({}),
+            created_at: OffsetDateTime::now_utc(),
+        };
+
+        let content = super::tool_result_artifact_byte_range_content(&revision).expect("content");
+
+        assert_eq!(content["kind"], "text_byte_range");
+        assert_eq!(content["offset_bytes"], 1);
+        assert_eq!(content["limit_bytes"], 4);
+        assert_eq!(content["total_bytes"], 6);
+        assert_eq!(content["text"], "中b");
+        assert_eq!(content["truncated"], true);
+    }
+
+    #[test]
+    fn tool_result_artifact_stream_range_accepts_query_bytes() {
+        let selection =
+            super::resolve_artifact_stream_range(100, Some(10), Some(25), None).expect("range");
+
+        assert_eq!(
+            selection,
+            super::ArtifactStreamRangeSelection::Satisfiable(super::ArtifactStreamRange {
+                start: 10,
+                end: 35,
+                partial: true
+            })
+        );
+    }
+
+    #[test]
+    fn tool_result_artifact_stream_range_accepts_standard_range_header() {
+        let selection = super::resolve_artifact_stream_range(
+            100,
+            None,
+            None,
+            Some(&HeaderValue::from_static("bytes=10-19")),
+        )
+        .expect("range");
+
+        assert_eq!(
+            selection,
+            super::ArtifactStreamRangeSelection::Satisfiable(super::ArtifactStreamRange {
+                start: 10,
+                end: 20,
+                partial: true
+            })
+        );
+    }
+
+    #[test]
+    fn tool_result_artifact_stream_range_rejects_ambiguous_query_and_header() {
+        let err = super::resolve_artifact_stream_range(
+            100,
+            Some(10),
+            None,
+            Some(&HeaderValue::from_static("bytes=10-19")),
+        )
+        .expect_err("ambiguous range should be rejected");
+
+        assert!(matches!(err, AppError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn tool_result_artifact_stream_response_reports_partial_headers() {
+        let revision = FileRevisionResponse {
+            id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            path: "/artifacts/tool-results/page.txt".to_string(),
+            revision: 3,
+            etag: "etag-stream".to_string(),
+            content_hash: "hash-stream".to_string(),
+            object_key: "object".to_string(),
+            object_reference_id: Some(Uuid::new_v4()),
+            bucket: None,
+            version_id: None,
+            inline_content: Some("abcdef".to_string()),
+            content_base64: None,
+            content_offset_bytes: None,
+            content_limit_bytes: None,
+            content_truncated: None,
+            size_bytes: 6,
+            content_type: "text/plain".to_string(),
+            is_binary: false,
+            is_large: false,
+            reason: "test".to_string(),
+            run_id: None,
+            metadata: json!({}),
+            created_at: OffsetDateTime::now_utc(),
+        };
+        let range = super::ArtifactStreamRange {
+            start: 1,
+            end: 4,
+            partial: true,
+        };
+
+        let response = super::artifact_stream_response(&revision, range, super::Body::empty());
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get("content-range").unwrap(),
+            "bytes 1-3/6"
+        );
+        assert_eq!(response.headers().get("content-length").unwrap(), "3");
+        assert_eq!(
+            super::slice_inline_bytes(b"abcdef".to_vec(), range).expect("slice"),
+            b"bcd".to_vec()
+        );
     }
 
     #[tokio::test]
@@ -1208,7 +1755,7 @@ mod tests {
                 &large_path,
             )
             .await?;
-            let large_content = "x".repeat(1024 * 1024 + 1);
+            let large_content = format!("{}TAIL_HTTP_INDEX_TOKEN", "x".repeat(1024 * 1024 + 1));
             let large = post_json(
                 &http,
                 &format!("{base_url}/files/write"),
@@ -1218,7 +1765,7 @@ mod tests {
                     "actor_device_id": null,
                     "actor_session_id": null,
                     "project_id": project_id,
-                    "path": large_path,
+                    "path": large_path.clone(),
                     "content_ref": null,
                     "inline_content": large_content,
                     "expected_revision": 0,
@@ -1229,9 +1776,44 @@ mod tests {
             .await?;
             assert_eq!(large["is_large"].as_bool(), Some(true));
             assert_eq!(large["is_binary"].as_bool(), Some(false));
+            assert_eq!(
+                large.pointer("/metadata/search_index/strategy"),
+                Some(&json!("uniform_sample"))
+            );
             if let Some(object_key) = large["object_key"].as_str() {
                 written_object_keys.push(object_key.to_string());
             }
+
+            let large_search = post_json(
+                &http,
+                &format!("{base_url}/files/search"),
+                json!({
+                    "tenant_id": tenant_id,
+                    "actor_user_id": user_id,
+                    "actor_device_id": null,
+                    "actor_session_id": null,
+                    "project_id": project_id,
+                    "query": "TAIL_HTTP_INDEX_TOKEN",
+                    "run_id": null,
+                    "prefix": "/workspace/",
+                    "limit": 10
+                }),
+            )
+            .await?;
+            assert_eq!(large_search["files"].as_array().map(Vec::len), Some(1));
+            assert_eq!(
+                large_search["files"][0]["path"].as_str(),
+                Some(large_path.as_str())
+            );
+            assert_eq!(
+                large_search["files"][0]["content_truncated"].as_bool(),
+                Some(true)
+            );
+            assert!(
+                large_search["files"][0]["inline_content"]
+                    .as_str()
+                    .is_some_and(|snippet| snippet.contains("TAIL_HTTP_INDEX_TOKEN"))
+            );
 
             let object_reference_count: i64 = sqlx::query(
                 r#"
@@ -1349,6 +1931,11 @@ mod tests {
                 worker_max_attempts: 1,
             })?,
             internal_shared_token: INTERNAL_TOKEN.to_string(),
+            audit_partition_cleanup_enabled: false,
+            secret_resolver:
+                crate::features::agent_platform::secret_resolver::SecretResolver::env_only_for_tests(
+                ),
+            credential_rotation_worker_enabled: false,
         })
     }
 

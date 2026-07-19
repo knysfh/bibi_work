@@ -7,6 +7,7 @@ use sqlx::postgres::{PgConnectOptions, PgSslMode};
 #[derive(Deserialize)]
 pub struct Settings {
     pub application: ApplicationSettings,
+    pub telemetry: TelemetrySettings,
     pub database: DatabaseSettings,
     pub redis: RedisSettings,
     pub ferriskey: FerrisKeySettings,
@@ -15,6 +16,50 @@ pub struct Settings {
     pub object_store: ObjectStoreSettings,
     pub memory_vector: MemoryVectorSettings,
     pub audit_hash_chain: AuditHashChainSettings,
+    pub audit_archive: AuditArchiveSettings,
+    pub audit_partition: AuditPartitionSettings,
+    pub secret_resolver: SecretResolverSettings,
+    pub credential_rotation: CredentialRotationSettings,
+    pub mcp_health: McpHealthSettings,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct TelemetrySettings {
+    pub otlp_enabled: bool,
+    pub otlp_endpoint: Option<String>,
+    pub service_name: String,
+    pub trace_sample_ratio: f64,
+    pub timeout_milliseconds: u64,
+}
+
+impl TelemetrySettings {
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.trace_sample_ratio),
+            "telemetry.trace_sample_ratio must be between 0 and 1"
+        );
+        anyhow::ensure!(
+            !self.service_name.trim().is_empty(),
+            "telemetry.service_name must not be empty"
+        );
+        anyhow::ensure!(
+            self.timeout_milliseconds > 0,
+            "telemetry.timeout_milliseconds must be greater than zero"
+        );
+        if self.otlp_enabled {
+            anyhow::ensure!(
+                self.otlp_endpoint
+                    .as_deref()
+                    .is_some_and(|endpoint| !endpoint.trim().is_empty()),
+                "telemetry.otlp_endpoint is required when OTLP is enabled"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.timeout_milliseconds)
+    }
 }
 
 #[derive(Deserialize)]
@@ -93,6 +138,23 @@ pub struct AgentRuntimeSettings {
 }
 
 #[derive(Deserialize, Clone)]
+pub struct McpHealthSettings {
+    pub worker_enabled: bool,
+    pub interval_seconds: u64,
+    pub batch_size: i64,
+}
+
+impl McpHealthSettings {
+    pub fn interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.interval_seconds.clamp(10, 86_400))
+    }
+
+    pub fn batch_size(&self) -> i64 {
+        self.batch_size.clamp(1, 500)
+    }
+}
+
+#[derive(Deserialize, Clone)]
 pub struct ObjectStoreSettings {
     pub enabled: bool,
     pub endpoint: String,
@@ -136,6 +198,99 @@ impl AuditHashChainSettings {
 
     pub fn segment_max_rows(&self) -> i64 {
         self.segment_max_rows.clamp(1, 10_000)
+    }
+}
+
+#[derive(Deserialize, Clone)]
+pub struct AuditArchiveSettings {
+    pub enabled: bool,
+    pub worker_interval_milliseconds: u64,
+    pub segment_batch_size: i64,
+    pub minimum_age_days: i64,
+    pub retention_days: i64,
+    pub max_attempts: i32,
+}
+
+impl AuditArchiveSettings {
+    pub fn worker_interval_milliseconds(&self) -> u64 {
+        self.worker_interval_milliseconds.max(1_000)
+    }
+
+    pub fn segment_batch_size(&self) -> i64 {
+        self.segment_batch_size.clamp(1, 1_000)
+    }
+
+    pub fn minimum_age_days(&self) -> i64 {
+        self.minimum_age_days.clamp(0, 36_500)
+    }
+
+    pub fn retention_days(&self) -> i64 {
+        self.retention_days.clamp(1, 36_500)
+    }
+
+    pub fn max_attempts(&self) -> i32 {
+        self.max_attempts.clamp(1, 100)
+    }
+}
+
+#[derive(Deserialize, Clone)]
+pub struct AuditPartitionSettings {
+    pub maintenance_enabled: bool,
+    pub worker_interval_milliseconds: u64,
+    pub months_ahead: i32,
+    pub cleanup_enabled: bool,
+}
+
+impl AuditPartitionSettings {
+    pub fn worker_interval_milliseconds(&self) -> u64 {
+        self.worker_interval_milliseconds.max(60_000)
+    }
+
+    pub fn months_ahead(&self) -> i32 {
+        self.months_ahead.clamp(1, 24)
+    }
+}
+
+#[derive(Deserialize, Clone)]
+pub struct SecretResolverSettings {
+    pub timeout_milliseconds: u64,
+    pub vault_enabled: bool,
+    pub vault_base_url: Option<String>,
+    pub vault_token_ref: Option<String>,
+    pub vault_namespace: Option<String>,
+    pub kms_enabled: bool,
+    pub kms_base_url: Option<String>,
+    pub kms_auth_token_ref: Option<String>,
+    pub rotation_gateway_enabled: bool,
+    pub rotation_gateway_base_url: Option<String>,
+    pub rotation_gateway_auth_token_ref: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct CredentialRotationSettings {
+    pub worker_enabled: bool,
+    pub worker_interval_milliseconds: u64,
+    pub batch_size: i64,
+    pub stale_claim_seconds: i64,
+}
+
+impl CredentialRotationSettings {
+    pub fn worker_interval_milliseconds(&self) -> u64 {
+        self.worker_interval_milliseconds.max(1_000)
+    }
+
+    pub fn batch_size(&self) -> i64 {
+        self.batch_size.clamp(1, 100)
+    }
+
+    pub fn stale_claim_seconds(&self) -> i64 {
+        self.stale_claim_seconds.clamp(60, 3_600)
+    }
+}
+
+impl SecretResolverSettings {
+    pub fn timeout_milliseconds(&self) -> u64 {
+        self.timeout_milliseconds.clamp(100, 30_000)
     }
 }
 

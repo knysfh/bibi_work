@@ -1,0 +1,108 @@
+- generic [ref=e3]:
+  - generic:
+    - generic [ref=e6]:
+      - link "新闻" [ref=e7] [cursor=pointer]:
+        - /url: http://news.baidu.com
+      - link "hao123" [ref=e8] [cursor=pointer]:
+        - /url: https://www.hao123.com?src=from_pc
+      - link "地图" [ref=e9] [cursor=pointer]:
+        - /url: http://map.baidu.com
+      - link "贴吧" [ref=e10] [cursor=pointer]:
+        - /url: http://tieba.baidu.com/
+      - link "视频" [ref=e11] [cursor=pointer]:
+        - /url: https://haokan.baidu.com/?sfrom=baidu-top
+      - link "图片" [ref=e12] [cursor=pointer]:
+        - /url: http://image.baidu.com/
+      - link "网盘" [ref=e13] [cursor=pointer]:
+        - /url: https://pan.baidu.com?from=1026962h
+      - link "文库" [ref=e14] [cursor=pointer]:
+        - /url: https://wenku.baidu.com/?fr=bdpcindex
+      - link "文心" [ref=e15] [cursor=pointer]:
+        - /url: https://chat.baidu.com/search?isShowHello=1&pd=csaitab&setype=csaitab&extParamsJson=%7B%22enter_type%22%3A%22home_tab%22%7D
+      - link "搭子DuMate" [ref=e16] [cursor=pointer]:
+        - /url: https://dumate.cn?track=bdsy
+      - link "更多" [ref=e18] [cursor=pointer]:
+        - /url: http://www.baidu.com/more/
+    - generic [ref=e19]:
+      - generic [ref=e20] [cursor=pointer]: 设置
+      - link "登录" [ref=e21] [cursor=pointer]:
+        - /url: https://passport.baidu.com/v2/?login&tpl=mn&u=http%3A%2F%2Fwww.baidu.com%2F&sms=5
+  - generic [ref=e24]:
+    - generic [ref=e25]:
+      - generic:
+        - link "点击一下，了解更多":
+          - /url: //www.baidu.com/s?wd=%E7%99%BE%E5%BA%A6%E7%83%AD%E6%90%9C&sa=ire_dl_gh_logo_texing&rsv_dl=igh_logo_pcs
+    - generic [ref=e31]:
+      - generic [ref=e34]:
+        - textbox "广东交通职院交通梦想摇篮" [active] [ref=e36]
+        - button "百度一下" [ref=e63] [cursor=pointer]
+      - link "复杂问题就找文心助手，深入思考回答更优 " [ref=e67] [cursor=pointer]:
+        - /url: https://chat.baidu.com/search?extParams=%7B%22enter_type%22%3A%22home_operate%22%7D&isShowHello=1
+        - generic [ref=e69]:
+          - generic [ref=e70]: 复杂问题就找文心助手，深入思考回答更优
+          - generic [ref=e71]: 
+    - generic [ref=e74]:
+      - generic [ref=e75]:
+        - link "百度热搜":
+          - /url: https://top.baidu.com/board?platform=pc&sa=pcindex_entry
+          - generic "百度热搜" [ref=e76] [cursor=pointer]: 
+        - generic [ref=e77] [cursor=pointer]:
+          - generic [ref=e78]: 
+          - text: 换一换
+      - list:
+        - listitem [ref=e79]:
+          - link " 总书记心中的“人民城市”" [ref=e80] [cursor=pointer]:
+            - /url: https://www.baidu.com/s?wd=%E6%80%BB%E4%B9%A6%E8%AE%B0%E5%BF%83%E4%B8%AD%E7%9A%84%E2%80%9C%E4%BA%BA%E6%B0%91%E5%9F%8E%E5%B8%82%E2%80%9D&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+            - generic [ref=e81]: 
+            - text: 总书记心中的“人民城市”
+        - listitem [ref=e83]:
+          - link "5 西班牙2比0法国晋级世界杯决赛" [ref=e84] [cursor=pointer]:
+            - /url: https://www.baidu.com/s?wd=%E8%A5%BF%E7%8F%AD%E7%89%992%E6%AF%940%E6%B3%95%E5%9B%BD%E6%99%8B%E7%BA%A7%E4%B8%96%E7%95%8C%E6%9D%AF%E5%86%B3%E8%B5%9B&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+            - generic [ref=e85]: "5"
+            - text: 西班牙2比0法国晋级世界杯决赛
+          - generic [ref=e86]: 热
+        - listitem [ref=e87]:
+          - link "1 法国队淘汰 马克龙发声" [ref=e88] [cursor=pointer]:
+            - /url: https://www.baidu.com/s?wd=%E6%B3%95%E5%9B%BD%E9%98%9F%E6%B7%98%E6%B1%B0+%E9%A9%AC%E5%85%8B%E9%BE%99%E5%8F%91%E5%A3%B0&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+            - generic [ref=e89]: "1"
+            - text: 法国队淘汰 马克龙发声
+          - generic [ref=e90]: 新
+        - listitem [ref=e91]:
+          - link "6 守护公民个人身份信息安全" [ref=e92] [cursor=pointer]:
+            - /url: https://www.baidu.com/s?wd=%E5%AE%88%E6%8A%A4%E5%85%AC%E6%B0%91%E4%B8%AA%E4%BA%BA%E8%BA%AB%E4%BB%BD%E4%BF%A1%E6%81%AF%E5%AE%89%E5%85%A8&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+            - generic [ref=e93]: "6"
+            - text: 守护公民个人身份信息安全
+        - listitem [ref=e95]:
+          - link "2 姆巴佩：我担全责" [ref=e96] [cursor=pointer]:
+            - /url: https://www.baidu.com/s?wd=%E5%A7%86%E5%B7%B4%E4%BD%A9%EF%BC%9A%E6%88%91%E6%8B%85%E5%85%A8%E8%B4%A3&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+            - generic [ref=e97]: "2"
+            - text: 姆巴佩：我担全责
+          - generic [ref=e98]: 热
+        - listitem [ref=e99]:
+          - link "7 姆巴佩心态崩了 肘击门将吃黄牌" [ref=e100] [cursor=pointer]:
+            - /url: https://www.baidu.com/s?wd=%E5%A7%86%E5%B7%B4%E4%BD%A9%E5%BF%83%E6%80%81%E5%B4%A9%E4%BA%86+%E8%82%98%E5%87%BB%E9%97%A8%E5%B0%86%E5%90%83%E9%BB%84%E7%89%8C&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+            - generic [ref=e101]: "7"
+            - text: 姆巴佩心态崩了 肘击门将吃黄牌
+        - listitem [ref=e103]:
+          - link "3 未来5年消费“路线图”来了" [ref=e104] [cursor=pointer]:
+            - /url: https://www.baidu.com/s?wd=%E6%9C%AA%E6%9D%A55%E5%B9%B4%E6%B6%88%E8%B4%B9%E2%80%9C%E8%B7%AF%E7%BA%BF%E5%9B%BE%E2%80%9D%E6%9D%A5%E4%BA%86&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+            - generic [ref=e105]: "3"
+            - text: 未来5年消费“路线图”来了
+        - listitem [ref=e107]:
+          - link "8 “明珠七号”邮轮侧翻 造价过亿" [ref=e108] [cursor=pointer]:
+            - /url: https://www.baidu.com/s?wd=%E2%80%9C%E6%98%8E%E7%8F%A0%E4%B8%83%E5%8F%B7%E2%80%9D%E9%82%AE%E8%BD%AE%E4%BE%A7%E7%BF%BB+%E9%80%A0%E4%BB%B7%E8%BF%87%E4%BA%BF&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+            - generic [ref=e109]: "8"
+            - text: “明珠七号”邮轮侧翻 造价过亿
+          - generic [ref=e110]: 新
+        - listitem [ref=e111]:
+          - link "4 法国1.5亿巨星灾难表现遭法媒怒批" [ref=e112] [cursor=pointer]:
+            - /url: https://www.baidu.com/s?wd=%E6%B3%95%E5%9B%BD1.5%E4%BA%BF%E5%B7%A8%E6%98%9F%E7%81%BE%E9%9A%BE%E8%A1%A8%E7%8E%B0%E9%81%AD%E6%B3%95%E5%AA%92%E6%80%92%E6%89%B9&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+            - generic [ref=e113]: "4"
+            - text: 法国1.5亿巨星灾难表现遭法媒怒批
+          - generic [ref=e114]: 新
+        - listitem [ref=e115]:
+          - link "9 今日入伏！今年“三伏”40天" [ref=e116] [cursor=pointer]:
+            - /url: https://www.baidu.com/s?wd=%E4%BB%8A%E6%97%A5%E5%85%A5%E4%BC%8F%EF%BC%81%E4%BB%8A%E5%B9%B4%E2%80%9C%E4%B8%89%E4%BC%8F%E2%80%9D40%E5%A4%A9&sa=fyb_n_homepage&rsv_dl=fyb_n_homepage&from=super&cl=3&tn=baidutop10&fr=top1000&rsv_idx=2&hisfilter=1
+            - generic [ref=e117]: "9"
+            - text: 今日入伏！今年“三伏”40天
+          - generic [ref=e118]: 新

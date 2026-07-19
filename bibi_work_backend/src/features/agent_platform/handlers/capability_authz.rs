@@ -117,6 +117,37 @@ async fn load_agent_version_capability_requirements(
         });
     }
 
+    let sql_tool_rows = sqlx::query(
+        r#"
+        SELECT stv.sql_tool_id
+        FROM agent_version_sql_tool_bindings b
+        JOIN sql_tool_versions stv ON stv.id = b.sql_tool_version_id
+        JOIN sql_tools st ON st.id = stv.sql_tool_id
+        JOIN sql_connections sc ON sc.id = stv.connection_id
+        WHERE b.agent_version_id = $1
+          AND stv.tenant_id = $2
+          AND stv.status = 'published'
+          AND st.tenant_id = $2
+          AND st.status = 'active'
+          AND sc.tenant_id = $2
+          AND sc.status = 'active'
+        ORDER BY b.created_at ASC, stv.sql_tool_id ASC
+        "#,
+    )
+    .bind(agent_version_id)
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await?;
+    for row in sql_tool_rows {
+        requirements.push(CapabilityAuthzRequirement {
+            resource_type: "sql_tool",
+            resource_id: row.try_get("sql_tool_id")?,
+            action: "use",
+            tool_id: None,
+            mcp_server_id: None,
+        });
+    }
+
     let mcp_rows = sqlx::query(
         r#"
         SELECT mt.id AS mcp_tool_id, mt.mcp_server_id
@@ -215,6 +246,9 @@ mod tests {
         let second_skill_version_id = Uuid::new_v4();
         let tool_id = Uuid::new_v4();
         let tool_version_id = Uuid::new_v4();
+        let sql_connection_id = Uuid::new_v4();
+        let sql_tool_id = Uuid::new_v4();
+        let sql_tool_version_id = Uuid::new_v4();
         let mcp_server_id = Uuid::new_v4();
         let mcp_tool_id = Uuid::new_v4();
 
@@ -263,20 +297,21 @@ mod tests {
         .execute(&pool)
         .await?;
 
-        for (skill_version_id, version_label) in [
-            (first_skill_version_id, "v1"),
-            (second_skill_version_id, "v2"),
+        for (skill_version_id, version_label, status) in [
+            (first_skill_version_id, "v1", "published"),
+            (second_skill_version_id, "v2", "disabled"),
         ] {
             sqlx::query(
                 r#"
                 INSERT INTO skill_versions (id, tenant_id, skill_id, version_label, status)
-                VALUES ($1, $2, $3, $4, 'published')
+                VALUES ($1, $2, $3, $4, $5)
                 "#,
             )
             .bind(skill_version_id)
             .bind(tenant_id)
             .bind(skill_id)
             .bind(version_label)
+            .bind(status)
             .execute(&pool)
             .await?;
             sqlx::query(
@@ -326,6 +361,58 @@ mod tests {
 
         sqlx::query(
             r#"
+            INSERT INTO sql_connections (
+                id, tenant_id, name, database_kind, host, port, database_name, status
+            )
+            VALUES ($1, $2, 'capability-sql-conn', 'postgres', '127.0.0.1', 5433, 'bibi_work', 'active')
+            "#,
+        )
+        .bind(sql_connection_id)
+        .bind(tenant_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO sql_tools (id, tenant_id, name, status)
+            VALUES ($1, $2, 'capability-sql-tool', 'active')
+            "#,
+        )
+        .bind(sql_tool_id)
+        .bind(tenant_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO sql_tool_versions (
+                id, tenant_id, sql_tool_id, connection_id, version_label,
+                operation, sql_template, query_hash, status
+            )
+            VALUES (
+                $1, $2, $3, $4, 'v1', 'read', 'SELECT 1', 'sha256:capability-sql', 'published'
+            )
+            "#,
+        )
+        .bind(sql_tool_version_id)
+        .bind(tenant_id)
+        .bind(sql_tool_id)
+        .bind(sql_connection_id)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO agent_version_sql_tool_bindings (
+                agent_version_id, sql_tool_version_id
+            )
+            VALUES ($1, $2)
+            "#,
+        )
+        .bind(agent_version_id)
+        .bind(sql_tool_version_id)
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            r#"
             INSERT INTO mcp_servers (id, tenant_id, name, status)
             VALUES ($1, $2, 'capability-mcp', 'active')
             "#,
@@ -359,7 +446,7 @@ mod tests {
         let requirements =
             load_agent_version_capability_requirements(&pool, tenant_id, agent_version_id).await?;
 
-        assert_eq!(requirements.len(), 3);
+        assert_eq!(requirements.len(), 4);
         assert!(requirements.iter().any(|requirement| {
             requirement.resource_type == "skill"
                 && requirement.resource_id == skill_id
@@ -378,6 +465,13 @@ mod tests {
                 && requirement.resource_id == mcp_tool_id
                 && requirement.action == "use"
                 && requirement.mcp_server_id == Some(mcp_server_id)
+        }));
+        assert!(requirements.iter().any(|requirement| {
+            requirement.resource_type == "sql_tool"
+                && requirement.resource_id == sql_tool_id
+                && requirement.action == "use"
+                && requirement.tool_id.is_none()
+                && requirement.mcp_server_id.is_none()
         }));
 
         cleanup_tenant(&pool, tenant_id).await?;

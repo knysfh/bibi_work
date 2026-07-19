@@ -1,10 +1,15 @@
 use std::time::Duration;
 
-use reqwest::Client;
+use opentelemetry::{global, propagation::Injector};
+use reqwest::{
+    Client,
+    header::{HeaderMap, HeaderName, HeaderValue},
+};
 use secrecy::ExposeSecret;
 use serde::Serialize;
 use serde_json::Value;
 use tracing::warn;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use crate::{configuration::AgentRuntimeSettings, features::core::errors::AppError};
@@ -72,6 +77,7 @@ impl AgentRuntimeClient {
         self.http
             .post(format!("{base_url}/internal/agent-runs"))
             .bearer_auth(&self.shared_token)
+            .headers(current_trace_headers())
             .json(payload)
             .send()
             .await
@@ -106,6 +112,7 @@ impl AgentRuntimeClient {
         self.http
             .post(format!("{base_url}/internal/agent-runs/{run_id}/resume"))
             .bearer_auth(&self.shared_token)
+            .headers(current_trace_headers())
             .json(payload)
             .send()
             .await
@@ -138,6 +145,7 @@ impl AgentRuntimeClient {
         self.http
             .post(format!("{base_url}/internal/agent-runs/{run_id}/cancel"))
             .bearer_auth(&self.shared_token)
+            .headers(current_trace_headers())
             .json(payload)
             .send()
             .await
@@ -153,6 +161,29 @@ impl AgentRuntimeClient {
 
         Ok(())
     }
+}
+
+struct HeaderInjector<'a>(&'a mut HeaderMap);
+
+impl Injector for HeaderInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        let Ok(name) = HeaderName::from_bytes(key.as_bytes()) else {
+            return;
+        };
+        let Ok(value) = HeaderValue::from_str(&value) else {
+            return;
+        };
+        self.0.insert(name, value);
+    }
+}
+
+fn current_trace_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let context = tracing::Span::current().context();
+    global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&context, &mut HeaderInjector(&mut headers));
+    });
+    headers
 }
 
 fn trim_trailing_slash(mut input: String) -> String {

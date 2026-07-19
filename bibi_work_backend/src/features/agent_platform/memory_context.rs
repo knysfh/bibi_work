@@ -42,7 +42,8 @@ pub fn memory_context_from_item(
 
 pub fn redact_sensitive_text(input: &str) -> String {
     let redacted = redact_authorization_bearer(input);
-    redact_key_values(&redacted)
+    let redacted = redact_key_values(&redacted);
+    redact_bearer_tokens(&redacted)
 }
 
 pub fn truncate_text(input: &str, max_chars: usize) -> String {
@@ -140,6 +141,31 @@ fn redact_key_values(input: &str) -> String {
     output
 }
 
+fn redact_bearer_tokens(input: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0_usize;
+
+    while let Some(relative_idx) = lower[cursor..].find("bearer") {
+        let bearer_start = cursor + relative_idx;
+        let bearer_end = bearer_start + "bearer".len();
+        let token_start = skip_ascii_spaces(input, bearer_end);
+        if token_start == bearer_end {
+            output.push_str(&input[cursor..bearer_end]);
+            cursor = bearer_end;
+            continue;
+        }
+        let token_end = value_end(input, token_start);
+
+        output.push_str(&input[cursor..token_start]);
+        output.push_str("[REDACTED]");
+        cursor = token_end;
+    }
+
+    output.push_str(&input[cursor..]);
+    output
+}
+
 fn find_next_sensitive_key(lower: &str, start: usize) -> Option<(usize, usize)> {
     SENSITIVE_KEYS
         .iter()
@@ -222,7 +248,7 @@ mod tests {
             memory(
                 "approved",
                 "normal",
-                "sales token=plain-secret authorization: Bearer raw-secret",
+                "sales token=plain-secret authorization: Bearer raw-secret Bearer standalone-secret",
             ),
             Some(0.93),
             "memory_vector_search",
@@ -236,6 +262,7 @@ mod tests {
         assert!(context.content.contains("Bearer [REDACTED]"));
         assert!(!context.content.contains("plain-secret"));
         assert!(!context.content.contains("raw-secret"));
+        assert!(!context.content.contains("standalone-secret"));
     }
 
     #[test]

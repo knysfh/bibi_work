@@ -385,6 +385,12 @@ pub async fn get_agent_version_effective_capabilities(
             agent_version_id,
         )
         .await?,
+        sql_tools: load_agent_version_sql_tool_capabilities(
+            &state.connect_pool,
+            query.tenant_id,
+            agent_version_id,
+        )
+        .await?,
         mcp_tools: load_agent_version_mcp_capabilities(
             &state.connect_pool,
             query.tenant_id,
@@ -526,18 +532,43 @@ pub async fn bind_agent_version(
         }
     }
 
-    if let Some(mcp_tool_ids) = payload.mcp_tool_ids {
-        for mcp_tool_id in mcp_tool_ids {
-            ensure_mcp_tool_bindable(&mut tx, payload.tenant_id, mcp_tool_id).await?;
+    if let Some(sql_tool_version_ids) = payload.sql_tool_version_ids {
+        for sql_tool_version_id in sql_tool_version_ids {
+            ensure_sql_tool_version_bindable(&mut tx, payload.tenant_id, sql_tool_version_id)
+                .await?;
             sqlx::query(
                 r#"
-                INSERT INTO agent_version_mcp_bindings (agent_version_id, mcp_tool_id)
+                INSERT INTO agent_version_sql_tool_bindings (
+                    agent_version_id, sql_tool_version_id
+                )
                 VALUES ($1, $2)
                 ON CONFLICT DO NOTHING
                 "#,
             )
             .bind(agent_version_id)
+            .bind(sql_tool_version_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
+    if let Some(mcp_tool_ids) = payload.mcp_tool_ids {
+        for mcp_tool_id in mcp_tool_ids {
+            ensure_mcp_tool_bindable(&mut tx, payload.tenant_id, mcp_tool_id).await?;
+            sqlx::query(
+                r#"
+                INSERT INTO agent_version_mcp_bindings (
+                    agent_version_id, mcp_tool_id, schema_hash_at_publish, binding_mode
+                )
+                SELECT $1, mt.id, mt.schema_hash, 'optional'
+                FROM mcp_tools mt
+                WHERE mt.id = $2 AND mt.tenant_id = $3
+                ON CONFLICT DO NOTHING
+                "#,
+            )
+            .bind(agent_version_id)
             .bind(mcp_tool_id)
+            .bind(payload.tenant_id)
             .execute(&mut *tx)
             .await?;
         }
@@ -638,6 +669,37 @@ async fn load_agent_version_mcp_capabilities(
         .collect()
 }
 
+async fn load_agent_version_sql_tool_capabilities(
+    pool: &sqlx::PgPool,
+    tenant_id: Uuid,
+    agent_version_id: Uuid,
+) -> Result<Vec<CapabilityResourceResponse>, AppError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT st.id AS resource_id, stv.id AS version_id, stv.sql_tool_id AS parent_id,
+               st.name, st.description, stv.status, stv.parameter_schema AS snapshot,
+               stv.query_hash AS schema_hash, NULL::text AS content_hash,
+               NULL::text AS source_uri
+        FROM agent_version_sql_tool_bindings b
+        JOIN sql_tool_versions stv ON stv.id = b.sql_tool_version_id
+        JOIN sql_tools st ON st.id = stv.sql_tool_id
+        JOIN sql_connections sc ON sc.id = stv.connection_id
+        WHERE b.agent_version_id = $1
+          AND stv.tenant_id = $2
+          AND st.tenant_id = $2
+          AND sc.tenant_id = $2
+        ORDER BY b.created_at ASC, st.name ASC
+        "#,
+    )
+    .bind(agent_version_id)
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| capability_resource_from_row(row, "sql_tool"))
+        .collect()
+}
+
 fn capability_resource_from_row(
     row: sqlx::postgres::PgRow,
     resource_type: &str,
@@ -693,6 +755,23 @@ async fn capability_integrity_issue_count(
             WHERE b.agent_version_id = $1
               AND (tv.id IS NULL OR t.id IS NULL)
             UNION ALL
+            SELECT stv.id
+            FROM agent_version_sql_tool_bindings b
+            LEFT JOIN sql_tool_versions stv
+              ON stv.id = b.sql_tool_version_id
+             AND stv.tenant_id = $2
+             AND stv.status = 'published'
+            LEFT JOIN sql_tools st
+              ON st.id = stv.sql_tool_id
+             AND st.tenant_id = $2
+             AND st.status = 'active'
+            LEFT JOIN sql_connections sc
+              ON sc.id = stv.connection_id
+             AND sc.tenant_id = $2
+             AND sc.status = 'active'
+            WHERE b.agent_version_id = $1
+              AND (stv.id IS NULL OR st.id IS NULL OR sc.id IS NULL)
+            UNION ALL
             SELECT mt.id
             FROM agent_version_mcp_bindings b
             LEFT JOIN mcp_tools mt
@@ -705,7 +784,12 @@ async fn capability_integrity_issue_count(
              AND ms.status = 'active'
              AND ms.deleted_at IS NULL
             WHERE b.agent_version_id = $1
-              AND (mt.id IS NULL OR ms.id IS NULL)
+              AND (
+                  mt.id IS NULL
+                  OR ms.id IS NULL
+                  OR b.schema_hash_at_publish IS NULL
+                  OR b.schema_hash_at_publish IS DISTINCT FROM mt.schema_hash
+              )
         )
         SELECT COUNT(*) FROM issues
         "#,
@@ -842,6 +926,35 @@ async fn ensure_mcp_tool_bindable(
     .await
 }
 
+async fn ensure_sql_tool_version_bindable(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    sql_tool_version_id: Uuid,
+) -> Result<(), AppError> {
+    ensure_bindable_resource(
+        tx,
+        tenant_id,
+        sql_tool_version_id,
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM sql_tool_versions stv
+            JOIN sql_tools st ON st.id = stv.sql_tool_id
+            JOIN sql_connections sc ON sc.id = stv.connection_id
+            WHERE stv.id = $1
+              AND stv.tenant_id = $2
+              AND st.tenant_id = $2
+              AND sc.tenant_id = $2
+              AND stv.status = 'published'
+              AND st.status = 'active'
+              AND sc.status = 'active'
+        )
+        "#,
+        "SQL tool version is not published in tenant",
+    )
+    .await
+}
+
 async fn ensure_bindable_resource(
     tx: &mut Transaction<'_, Postgres>,
     tenant_id: Uuid,
@@ -859,4 +972,30 @@ async fn ensure_bindable_resource(
     } else {
         Err(AppError::InvalidInput(error.to_string()))
     }
+}
+
+pub(super) async fn latest_published_agent_version_id(
+    pool: &sqlx::PgPool,
+    tenant_id: Uuid,
+    agent_id: Option<Uuid>,
+) -> Result<Option<Uuid>, AppError> {
+    let Some(agent_id) = agent_id else {
+        return Ok(None);
+    };
+    sqlx::query_scalar(
+        r#"
+        SELECT id
+        FROM agent_versions
+        WHERE tenant_id = $1
+          AND agent_id = $2
+          AND status = 'published'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(agent_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::from)
 }

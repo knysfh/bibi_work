@@ -1,2 +1,6 @@
 logs
 run
+
+# Local integration credentials and service endpoints.
+docs/local-service-config.local.md
+*artifacts

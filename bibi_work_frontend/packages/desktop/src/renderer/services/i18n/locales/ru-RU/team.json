@@ -1,0 +1,70 @@
+{
+  "sider": {
+    "title": "Команды",
+    "createTeam": "Новая команда",
+    "pin": "Закрепить",
+    "unpin": "Открепить",
+    "rename": "Переименовать",
+    "delete": "Удалить",
+    "renameTitle": "Переименовать команду",
+    "renamePlaceholder": "Название команды",
+    "deleteConfirm": "Удалить эту команду?",
+    "deleteConfirmContent": "Это действие нельзя отменить.",
+    "deleteOk": "Удалить",
+    "deleteCancel": "Отмена",
+    "renameOk": "Сохранить",
+    "renameCancel": "Отмена",
+    "renameSuccess": "Команда переименована",
+    "deleteSuccess": "Команда удалена"
+  },
+  "newAgent": "Новый ассистент",
+  "noMessages": "Пока нет сообщений.",
+  "agentNotConfigured": "Ассистент ещё не настроен.",
+  "stopAgentFailed": "Не удалось остановить этого ассистента. Повторите попытку.",
+  "sendBox": {
+    "placeholder": "Сообщение ассистенту-лидеру команды..."
+  },
+  "create": {
+    "title": "Создать команду",
+    "namePlaceholder": "Название команды",
+    "dispatchAgentPlaceholder": "Выбрать лидера команды",
+    "subAgentsPlaceholder": "Выбрать ассистентов команды",
+    "confirm": "Создать команду",
+    "noSupportedAgents": "Нет доступных поддерживаемых ассистентов",
+    "supportedAgentsHint": "Сейчас поддерживаются ассистенты Claude и BiWork runtime. Другие ассистенты появятся позже.",
+    "leaderDesc": "Понимает ваши цели и координирует ассистентов для выполнения задач",
+    "searchPlaceholder": "Поиск ассистентов...",
+    "noSearchResults": "Ничего не найдено",
+    "step": {
+      "dispatch": "Лидер команды",
+      "subAgents": "Участники команды",
+      "workspace": "Проект"
+    },
+    "nameRequired": "Введите название команды",
+    "leaderRequired": "Выберите лидера команды",
+    "selectFolder": "Выбрать папку",
+    "recentLabel": "Недавние",
+    "chooseDifferentFolder": "Выбрать другую папку",
+    "error": "Не удалось создать команду"
+  },
+  "removeAgent": {
+    "confirmTitle": "Удалить участника команды",
+    "confirmContent": "Этот участник сейчас активен. Принудительно удалить?"
+  },
+  "runStatus": {
+    "accepted": "Принято",
+    "running": "Выполняется",
+    "cancelling": "Отменяется",
+    "completed": "Завершено",
+    "cancelled": "Отменено",
+    "failed": "Ошибка"
+  },
+  "emptyState": {
+    "subtitle": "Расскажите о своей цели — я скоординирую команду для её достижения",
+    "suggestions": {
+      "debate": "Организовать дебаты между ассистентами с разными позициями",
+      "interview": "Спланировать глубокое интервью между ассистентами",
+      "expert_review": "Несколько экспертов анализируют одну проблему"
+    }
+  }
+}

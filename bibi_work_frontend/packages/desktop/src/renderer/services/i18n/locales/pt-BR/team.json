@@ -1,0 +1,70 @@
+{
+  "sider": {
+    "title": "Equipes",
+    "createTeam": "Nova Equipe",
+    "pin": "Fixar",
+    "unpin": "Desafixar",
+    "rename": "Renomear",
+    "delete": "Excluir",
+    "renameTitle": "Renomear Equipe",
+    "renamePlaceholder": "Nome da equipe",
+    "deleteConfirm": "Excluir esta equipe?",
+    "deleteConfirmContent": "Esta ação não pode ser desfeita.",
+    "deleteOk": "Excluir",
+    "deleteCancel": "Cancelar",
+    "renameOk": "Salvar",
+    "renameCancel": "Cancelar",
+    "renameSuccess": "Equipe renomeada",
+    "deleteSuccess": "Equipe excluída"
+  },
+  "newAgent": "Novo Assistente",
+  "noMessages": "Nenhuma mensagem ainda.",
+  "agentNotConfigured": "Assistente ainda não configurado.",
+  "stopAgentFailed": "Falha ao parar este assistente. Tente novamente.",
+  "sendBox": {
+    "placeholder": "Enviar mensagem ao assistente líder da equipe..."
+  },
+  "create": {
+    "title": "Criar Equipe",
+    "namePlaceholder": "Nome da equipe",
+    "dispatchAgentPlaceholder": "Selecione o líder da equipe",
+    "subAgentsPlaceholder": "Selecione os assistentes da equipe",
+    "confirm": "Criar Equipe",
+    "noSupportedAgents": "Nenhum assistente compatível disponível",
+    "supportedAgentsHint": "Atualmente oferece suporte a assistentes Claude e BiWork runtime. Mais assistentes em breve.",
+    "leaderDesc": "Entende seus objetivos e coordena assistentes para concluir tarefas",
+    "searchPlaceholder": "Buscar assistentes...",
+    "noSearchResults": "Nenhum resultado encontrado",
+    "step": {
+      "dispatch": "Líder da Equipe",
+      "subAgents": "Membros da equipe",
+      "workspace": "Projeto"
+    },
+    "nameRequired": "Por favor, insira o nome da equipe",
+    "leaderRequired": "Por favor, selecione um líder para a equipe",
+    "selectFolder": "Selecionar pasta",
+    "recentLabel": "Recente",
+    "chooseDifferentFolder": "Escolher uma pasta diferente",
+    "error": "Falha ao criar equipe"
+  },
+  "removeAgent": {
+    "confirmTitle": "Remover Membro da Equipe",
+    "confirmContent": "Este membro está ativo no momento. Forçar remoção?"
+  },
+  "runStatus": {
+    "accepted": "Aceito",
+    "running": "Em execução",
+    "cancelling": "Cancelando",
+    "completed": "Concluído",
+    "cancelled": "Cancelado",
+    "failed": "Falhou"
+  },
+  "emptyState": {
+    "subtitle": "Descreva seu objetivo e farei a equipe trabalhar nisso",
+    "suggestions": {
+      "debate": "Organizar um debate com assistentes defendendo lados diferentes",
+      "interview": "Planejar uma entrevista aprofundada entre assistentes",
+      "expert_review": "Ter vários especialistas analisando o mesmo problema"
+    }
+  }
+}

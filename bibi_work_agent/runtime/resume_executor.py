@@ -8,11 +8,15 @@ from langgraph.types import Command
 
 from bibi_work_agent.clients.rust_client import RustClient
 from bibi_work_agent.runtime.agent_factory import create_platform_agent
-from bibi_work_agent.runtime.cancellation import is_run_cancelled
+from bibi_work_agent.runtime.cancellation import RunCancelled, is_run_cancelled
 from bibi_work_agent.runtime.event_emitter import EventEmitter
 from bibi_work_agent.runtime.event_normalizer import AgentEventNormalizer
 from bibi_work_agent.runtime.memory_candidates import MemoryCandidateCollector
 from bibi_work_agent.runtime.resume_idempotency import ResumeIdempotencyStore
+from bibi_work_agent.runtime.snapshot_contract import (
+    safe_error_message,
+    validate_run_config_snapshot,
+)
 from bibi_work_agent.runtime.run_executor import (
     WAITING_EVENT_TYPES,
     call_agent_invoke,
@@ -20,7 +24,9 @@ from bibi_work_agent.runtime.run_executor import (
     emit_approval_requested,
     emit_cancelled,
     graph_config_for_payload,
+    message_context_from_snapshot,
     prepare_agent_payload,
+    capture_completion_results,
 )
 from bibi_work_agent.tools.wrapper import ToolRequiresApproval
 
@@ -58,6 +64,8 @@ def resume_run_payload(
             idempotency.mark_completed(approval_id)
             return
 
+        validate_run_config_snapshot(payload.get("run_config_snapshot"))
+
         emitter.emit(
             [
                 {
@@ -75,11 +83,22 @@ def resume_run_payload(
         )
 
         memory_candidates = MemoryCandidateCollector()
+        completion_results: list[Any] = []
         waiting_or_cancelled = resume_deepagent(
             payload,
             emitter,
             memory_candidates=memory_candidates,
+            completion_results=completion_results,
         )
+    except RunCancelled as exc:
+        emit_cancelled(
+            run_id=run_id,
+            trace_id=payload.get("trace_id"),
+            emitter=emitter,
+            reason=exc.reason,
+        )
+        idempotency.mark_completed(approval_id)
+        return
     except ToolRequiresApproval as exc:
         emit_approval_requested(
             run_id=run_id,
@@ -91,6 +110,7 @@ def resume_run_payload(
         idempotency.mark_completed(approval_id)
         return
     except Exception as exc:  # noqa: BLE001
+        error = safe_error_message(exc)
         emitter.emit(
             [
                 {
@@ -101,14 +121,14 @@ def resume_run_payload(
                         "approval_id": approval_id,
                         "worker_task_id": worker_task_id,
                         "error_type": exc.__class__.__name__,
-                        "error": str(exc),
+                        "error": error,
                     },
                     "trace_id": payload.get("trace_id"),
                 }
             ]
         )
         idempotency.mark_failed(approval_id)
-        raise
+        raise RuntimeError(error) from None
 
     idempotency.mark_completed(approval_id)
     if waiting_or_cancelled:
@@ -119,6 +139,8 @@ def resume_run_payload(
         "approval_id": approval_id,
         "duration_ms": int(time.time() * 1000) - started,
     }
+    if completion_results:
+        completion_payload["result"] = completion_results[-1]
     candidates = memory_candidates.candidates()
     if candidates:
         completion_payload["memory_candidates"] = candidates
@@ -140,6 +162,7 @@ def resume_deepagent(
     emitter: EventEmitter,
     *,
     memory_candidates: MemoryCandidateCollector | None = None,
+    completion_results: list[Any] | None = None,
 ) -> bool:
     payload = prepare_agent_payload(payload)
     run_id = payload["run_id"]
@@ -150,8 +173,13 @@ def resume_deepagent(
         )
         return True
 
-    agent = create_platform_agent(payload.get("run_config_snapshot", {}))
-    normalizer = AgentEventNormalizer(run_id=run_id, trace_id=trace_id)
+    snapshot = payload.get("run_config_snapshot", {})
+    agent = create_platform_agent(snapshot)
+    normalizer = AgentEventNormalizer(
+        run_id=run_id,
+        trace_id=trace_id,
+        message_context=message_context_from_snapshot(snapshot),
+    )
     graph_config = graph_config_for_payload(payload)
     command = Command(resume=resume_value_for_payload(payload))
 
@@ -169,6 +197,7 @@ def resume_deepagent(
                 )
                 return True
             events = normalizer.normalize(raw_event)
+            capture_completion_results(events, completion_results)
             if memory_candidates is not None:
                 for event in events:
                     memory_candidates.observe(event)
@@ -188,20 +217,29 @@ def resume_deepagent(
             return True
         emitted_any = True
         completed_event = normalizer.completed_message(result)
+        capture_completion_results([completed_event], completion_results)
+        if memory_candidates is not None:
+            memory_candidates.observe(completed_event)
+        emitter.emit([completed_event])
+
+    completed_event = normalizer.pending_completed_message()
+    if completed_event is not None:
+        emitted_any = True
+        capture_completion_results([completed_event], completion_results)
         if memory_candidates is not None:
             memory_candidates.observe(completed_event)
         emitter.emit([completed_event])
 
     if not emitted_any:
-        emitter.emit(
-            [
-                normalizer.completed_message(
-                    {
-                        "message": "agent resume finished without streamable platform events"
-                    }
-                )
-            ]
+        completed_event = (
+            normalizer.platform_tool_result_completed_message()
+            or normalizer.completed_message(
+                {"message": "Run completed without an assistant response."}
+            )
         )
+    if not emitted_any and completed_event is not None:
+        capture_completion_results([completed_event], completion_results)
+        emitter.emit([completed_event])
     return False
 
 

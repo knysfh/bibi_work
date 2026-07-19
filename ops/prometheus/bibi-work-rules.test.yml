@@ -1,0 +1,71 @@
+rule_files:
+  - bibi-work-slos.yml
+  - bibi-work-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: bibi_runs_completed_24h
+        values: 18x20
+      - series: bibi_runs_failed_24h
+        values: 2x20
+      - series: 'bibi_run_dispatch_duration_seconds_24h_bucket{le="10"}'
+        values: 18x20
+      - series: bibi_run_dispatch_duration_seconds_24h_count
+        values: 20x20
+      - series: 'bibi_tool_execution_duration_seconds_24h_bucket{le="30"}'
+        values: 18x20
+      - series: bibi_tool_execution_duration_seconds_24h_count
+        values: 20x20
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: BibiRunSuccessSloViolation
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              slo: run-success
+            exp_annotations:
+              summary: The 24-hour run success SLO is below 99 percent
+      - eval_time: 16m
+        alertname: BibiRunDispatchSloViolation
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              slo: run-dispatch
+            exp_annotations:
+              summary: Fewer than 99 percent of runs dispatch within ten seconds
+      - eval_time: 16m
+        alertname: BibiToolExecutionSloViolation
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              slo: tool-execution
+            exp_annotations:
+              summary: Fewer than 99 percent of tool calls finish within thirty seconds
+
+  - interval: 1m
+    input_series:
+      - series: bibi_runs_completed_24h
+        values: 8x20
+      - series: bibi_runs_failed_24h
+        values: 1x20
+      - series: 'bibi_run_dispatch_duration_seconds_24h_bucket{le="10"}'
+        values: 8x20
+      - series: bibi_run_dispatch_duration_seconds_24h_count
+        values: 9x20
+      - series: 'bibi_tool_execution_duration_seconds_24h_bucket{le="30"}'
+        values: 8x20
+      - series: bibi_tool_execution_duration_seconds_24h_count
+        values: 9x20
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: BibiRunSuccessSloViolation
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: BibiRunDispatchSloViolation
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: BibiToolExecutionSloViolation
+        exp_alerts: []

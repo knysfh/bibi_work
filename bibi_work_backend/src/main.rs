@@ -5,9 +5,8 @@ use bibi_work_backend::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _guard = init_subscriber();
-
     let configuration = get_configuration().expect("Failed to read configuration.");
+    let _guard = init_subscriber(&configuration.telemetry)?;
     let application = Application::build(configuration).await?;
 
     tracing::info!("Starting application server");

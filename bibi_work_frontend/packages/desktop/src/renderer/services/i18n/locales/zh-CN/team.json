@@ -1,0 +1,70 @@
+{
+  "sider": {
+    "title": "团队",
+    "createTeam": "新建团队",
+    "pin": "置顶",
+    "unpin": "取消置顶",
+    "rename": "重命名",
+    "delete": "删除",
+    "renameTitle": "重命名团队",
+    "renamePlaceholder": "团队名称",
+    "deleteConfirm": "删除此团队？",
+    "deleteConfirmContent": "此操作不可撤销。",
+    "deleteOk": "删除",
+    "deleteCancel": "取消",
+    "renameOk": "保存",
+    "renameCancel": "取消",
+    "renameSuccess": "团队已重命名",
+    "deleteSuccess": "团队已删除"
+  },
+  "newAgent": "新助手",
+  "noMessages": "暂无消息。",
+  "agentNotConfigured": "助手尚未配置。",
+  "stopAgentFailed": "停止该成员失败，请稍后重试",
+  "sendBox": {
+    "placeholder": "向团队 Leader 助手发消息..."
+  },
+  "create": {
+    "title": "创建团队",
+    "namePlaceholder": "团队名称",
+    "dispatchAgentPlaceholder": "选择团队 Leader 助手",
+    "subAgentsPlaceholder": "选择协作助手",
+    "confirm": "创建团队",
+    "noSupportedAgents": "未检测到可用的助手",
+    "supportedAgentsHint": "目前支持 Claude 和 BiWork runtime 助手，更多助手适配中",
+    "leaderDesc": "接收你的指令，拆解任务并分配给团队中的助手",
+    "searchPlaceholder": "搜索助手...",
+    "noSearchResults": "未找到结果",
+    "step": {
+      "dispatch": "团队 Leader",
+      "subAgents": "团队成员",
+      "workspace": "项目"
+    },
+    "nameRequired": "请输入团队名称",
+    "leaderRequired": "请选择团队 Leader",
+    "selectFolder": "选择项目文件夹",
+    "recentLabel": "最近使用",
+    "chooseDifferentFolder": "选择其他目录",
+    "error": "创建团队失败"
+  },
+  "removeAgent": {
+    "confirmTitle": "移除团队成员",
+    "confirmContent": "该成员正在工作中，确定要强制移除吗？"
+  },
+  "runStatus": {
+    "accepted": "已接受",
+    "running": "运行中",
+    "cancelling": "正在取消",
+    "completed": "已完成",
+    "cancelled": "已取消",
+    "failed": "失败"
+  },
+  "emptyState": {
+    "subtitle": "描述你的目标，我来协调团队搞定它",
+    "suggestions": {
+      "debate": "组织一场辩论赛，让不同助手各持立场",
+      "interview": "策划一场深度访谈",
+      "expert_review": "多位专家会诊同一个问题"
+    }
+  }
+}

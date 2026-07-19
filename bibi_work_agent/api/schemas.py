@@ -60,6 +60,7 @@ class ToolAuthorizeRequest(BaseModel):
     actor: ActorRef
     conversation_id: UUID | None = None
     run_id: UUID | None = None
+    trace_id: str | None = None
     tool_id: UUID | None = None
     tool_name: str
     resource: dict[str, Any] | None = None

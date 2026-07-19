@@ -35,6 +35,8 @@ pub struct LlmProfileTestResponse {
     pub http_status: Option<u16>,
     pub latency_ms: u128,
     pub message: String,
+    pub model_available: Option<bool>,
+    pub checked_model_count: Option<usize>,
 }
 
 struct LlmProfileTestTarget {
@@ -256,6 +258,7 @@ pub async fn create_llm_credential(
     ensure_tenant_member(&state.connect_pool, payload.tenant_id, ctx.platform_user_id).await?;
     require_tenant_action(&state, &ctx, payload.tenant_id, "create", "llm_credential").await?;
     ensure_llm_provider_available(&state, payload.tenant_id, payload.provider_id).await?;
+    let secret_ref = normalize_secret_ref(payload.secret_ref)?;
     let row = sqlx::query(
         r#"
         WITH inserted AS (
@@ -279,10 +282,18 @@ pub async fn create_llm_credential(
                  'has_secret_ref', c.secret_ref IS NOT NULL,
                  'has_secret_hash', c.secret_hash IS NOT NULL,
                  'expires_at', c.expires_at,
+                 'last_rotated_at', c.last_rotated_at,
                  'revoked_at', c.revoked_at,
-                 'created_by_user_id', c.created_by_user_id
+                 'created_by_user_id', c.created_by_user_id,
+                 'rotated_by_user_id', c.rotated_by_user_id,
+                 'auto_rotation_enabled', c.auto_rotation_enabled,
+                 'rotation_interval_seconds', c.rotation_interval_seconds,
+                 'rotate_before_seconds', c.rotate_before_seconds,
+                 'next_rotation_at', c.next_rotation_at,
+                 'rotation_attempts', c.rotation_attempts,
+                 'rotation_error', c.rotation_error
                ) AS metadata,
-               c.created_at, c.revoked_at AS updated_at
+               c.created_at, c.updated_at
         FROM inserted c
         JOIN llm_providers p ON p.id = c.provider_id
         "#,
@@ -291,7 +302,7 @@ pub async fn create_llm_credential(
     .bind(payload.provider_id)
     .bind(payload.owner_scope.unwrap_or_else(|| "tenant".to_string()))
     .bind(payload.owner_resource_id)
-    .bind(payload.secret_ref)
+    .bind(secret_ref)
     .bind(payload.secret_hash)
     .bind(payload.expires_at)
     .bind(ctx.platform_user_id)
@@ -325,10 +336,18 @@ pub async fn list_llm_credentials(
                  'has_secret_ref', c.secret_ref IS NOT NULL,
                  'has_secret_hash', c.secret_hash IS NOT NULL,
                  'expires_at', c.expires_at,
+                 'last_rotated_at', c.last_rotated_at,
                  'revoked_at', c.revoked_at,
-                 'created_by_user_id', c.created_by_user_id
+                 'created_by_user_id', c.created_by_user_id,
+                 'rotated_by_user_id', c.rotated_by_user_id,
+                 'auto_rotation_enabled', c.auto_rotation_enabled,
+                 'rotation_interval_seconds', c.rotation_interval_seconds,
+                 'rotate_before_seconds', c.rotate_before_seconds,
+                 'next_rotation_at', c.next_rotation_at,
+                 'rotation_attempts', c.rotation_attempts,
+                 'rotation_error', c.rotation_error
                ) AS metadata,
-               c.created_at, c.revoked_at AS updated_at
+               c.created_at, c.updated_at
         FROM llm_credentials c
         JOIN llm_providers p ON p.id = c.provider_id
         WHERE c.tenant_id = $1
@@ -355,6 +374,94 @@ pub async fn list_llm_credentials(
     Ok(Json(credentials))
 }
 
+pub async fn rotate_llm_credential(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<PlatformRequestContext>,
+    Path(credential_id): Path<Uuid>,
+    Json(payload): Json<RotateLlmCredentialRequest>,
+) -> Result<Json<ResourceResponse>, AppError> {
+    ensure_tenant_member(&state.connect_pool, payload.tenant_id, ctx.platform_user_id).await?;
+    require_ferriskey_allow(
+        &state,
+        &ctx,
+        payload.tenant_id,
+        "rotate",
+        "llm_credential",
+        credential_id.to_string(),
+        None,
+    )
+    .await?;
+    secret_resolver::revoke_runtime_credentials_for_credential(&state, credential_id).await?;
+    let secret_ref = normalize_secret_ref(payload.secret_ref)?;
+    let row = sqlx::query(
+        r#"
+        WITH updated AS (
+          UPDATE llm_credentials
+          SET secret_ref = $3,
+              secret_hash = $4,
+              expires_at = $5,
+              rotation_status = 'active',
+              last_rotated_at = CURRENT_TIMESTAMP,
+              rotated_by_user_id = $6,
+              rotation_started_at = NULL,
+              rotation_claim_id = NULL,
+              rotation_attempts = 0,
+              rotation_error = NULL,
+              next_rotation_at = CASE
+                  WHEN auto_rotation_enabled THEN CURRENT_TIMESTAMP
+                      + rotation_interval_seconds * INTERVAL '1 second'
+                  ELSE NULL
+              END,
+              updated_at = CURRENT_TIMESTAMP
+          WHERE id = $1
+            AND tenant_id = $2
+            AND revoked_at IS NULL
+          RETURNING *
+        )
+        SELECT c.id, c.tenant_id,
+               concat('credential ', left(c.id::text, 8)) AS name,
+               p.display_name AS description,
+               c.rotation_status AS status,
+               jsonb_build_object(
+                 'provider_id', c.provider_id,
+                 'provider_key', p.provider_key,
+                 'provider_name', p.display_name,
+                 'owner_scope', c.owner_scope,
+                 'owner_resource_id', c.owner_resource_id,
+                 'has_secret_ref', c.secret_ref IS NOT NULL,
+                 'has_secret_hash', c.secret_hash IS NOT NULL,
+                 'expires_at', c.expires_at,
+                 'last_rotated_at', c.last_rotated_at,
+                 'revoked_at', c.revoked_at,
+                 'created_by_user_id', c.created_by_user_id,
+                 'rotated_by_user_id', c.rotated_by_user_id,
+                 'auto_rotation_enabled', c.auto_rotation_enabled,
+                 'rotation_interval_seconds', c.rotation_interval_seconds,
+                 'rotate_before_seconds', c.rotate_before_seconds,
+                 'next_rotation_at', c.next_rotation_at,
+                 'rotation_attempts', c.rotation_attempts,
+                 'rotation_error', c.rotation_error
+               ) AS metadata,
+               c.created_at, c.updated_at
+        FROM updated c
+        JOIN llm_providers p ON p.id = c.provider_id
+        "#,
+    )
+    .bind(credential_id)
+    .bind(payload.tenant_id)
+    .bind(secret_ref)
+    .bind(payload.secret_hash)
+    .bind(payload.expires_at)
+    .bind(ctx.platform_user_id)
+    .fetch_optional(&state.connect_pool)
+    .await?
+    .ok_or_else(|| {
+        AppError::NotFound("active llm credential not found for rotation".to_string())
+    })?;
+
+    Ok(Json(resource_from_row(row)?))
+}
+
 pub async fn revoke_llm_credential(
     State(state): State<AppState>,
     Extension(ctx): Extension<PlatformRequestContext>,
@@ -372,12 +479,19 @@ pub async fn revoke_llm_credential(
         None,
     )
     .await?;
+    secret_resolver::revoke_runtime_credentials_for_credential(&state, credential_id).await?;
     let row = sqlx::query(
         r#"
         WITH updated AS (
           UPDATE llm_credentials
           SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP),
-              rotation_status = 'revoked'
+              rotation_status = 'revoked',
+              auto_rotation_enabled = FALSE,
+              rotation_interval_seconds = NULL,
+              next_rotation_at = NULL,
+              rotation_started_at = NULL,
+              rotation_claim_id = NULL,
+              updated_at = CURRENT_TIMESTAMP
           WHERE id = $1 AND tenant_id = $2
           RETURNING *
         )
@@ -394,10 +508,18 @@ pub async fn revoke_llm_credential(
                  'has_secret_ref', c.secret_ref IS NOT NULL,
                  'has_secret_hash', c.secret_hash IS NOT NULL,
                  'expires_at', c.expires_at,
+                 'last_rotated_at', c.last_rotated_at,
                  'revoked_at', c.revoked_at,
-                 'created_by_user_id', c.created_by_user_id
+                 'created_by_user_id', c.created_by_user_id,
+                 'rotated_by_user_id', c.rotated_by_user_id,
+                 'auto_rotation_enabled', c.auto_rotation_enabled,
+                 'rotation_interval_seconds', c.rotation_interval_seconds,
+                 'rotate_before_seconds', c.rotate_before_seconds,
+                 'next_rotation_at', c.next_rotation_at,
+                 'rotation_attempts', c.rotation_attempts,
+                 'rotation_error', c.rotation_error
                ) AS metadata,
-               c.created_at, c.revoked_at AS updated_at
+               c.created_at, c.updated_at
         FROM updated c
         JOIN llm_providers p ON p.id = c.provider_id
         "#,
@@ -409,6 +531,185 @@ pub async fn revoke_llm_credential(
     .ok_or_else(|| AppError::NotFound("llm credential not found".to_string()))?;
 
     Ok(Json(resource_from_row(row)?))
+}
+
+pub async fn update_llm_credential_rotation_policy(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<PlatformRequestContext>,
+    Path(credential_id): Path<Uuid>,
+    Json(payload): Json<UpdateLlmCredentialRotationPolicyRequest>,
+) -> Result<Json<ResourceResponse>, AppError> {
+    ensure_tenant_member(&state.connect_pool, payload.tenant_id, ctx.platform_user_id).await?;
+    require_ferriskey_allow(
+        &state,
+        &ctx,
+        payload.tenant_id,
+        "configure_rotation",
+        "llm_credential",
+        credential_id.to_string(),
+        None,
+    )
+    .await?;
+    let interval_seconds = if payload.enabled {
+        if !state.credential_rotation_worker_enabled
+            || !state.secret_resolver.rotation_gateway_configured()
+        {
+            return Err(AppError::Conflict(
+                "automatic credential rotation is not configured on this server".to_string(),
+            ));
+        }
+        Some(
+            payload
+                .interval_seconds
+                .filter(|value| (300..=31_536_000).contains(value))
+                .ok_or_else(|| {
+                    AppError::InvalidInput(
+                        "enabled rotation policy requires interval_seconds between 300 and 31536000"
+                            .to_string(),
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    let rotate_before_seconds = payload.rotate_before_seconds.unwrap_or(86_400);
+    if !(0..=2_592_000).contains(&rotate_before_seconds) {
+        return Err(AppError::InvalidInput(
+            "rotate_before_seconds must be between 0 and 2592000".to_string(),
+        ));
+    }
+    let row = sqlx::query(
+        r#"
+        WITH updated AS (
+          UPDATE llm_credentials
+          SET auto_rotation_enabled = $3,
+              rotation_interval_seconds = $4,
+              rotate_before_seconds = $5,
+              next_rotation_at = CASE
+                  WHEN $3 THEN CURRENT_TIMESTAMP + $4 * INTERVAL '1 second'
+                  ELSE NULL
+              END,
+              rotation_started_at = NULL,
+              rotation_claim_id = NULL,
+              rotation_attempts = 0,
+              rotation_error = NULL,
+              updated_at = CURRENT_TIMESTAMP
+          WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL
+          RETURNING *
+        )
+        SELECT c.id, c.tenant_id,
+               concat('credential ', left(c.id::text, 8)) AS name,
+               p.display_name AS description,
+               c.rotation_status AS status,
+               jsonb_build_object(
+                 'provider_id', c.provider_id,
+                 'provider_key', p.provider_key,
+                 'provider_name', p.display_name,
+                 'owner_scope', c.owner_scope,
+                 'owner_resource_id', c.owner_resource_id,
+                 'has_secret_ref', TRUE,
+                 'has_secret_hash', c.secret_hash IS NOT NULL,
+                 'expires_at', c.expires_at,
+                 'last_rotated_at', c.last_rotated_at,
+                 'revoked_at', c.revoked_at,
+                 'created_by_user_id', c.created_by_user_id,
+                 'rotated_by_user_id', c.rotated_by_user_id,
+                 'auto_rotation_enabled', c.auto_rotation_enabled,
+                 'rotation_interval_seconds', c.rotation_interval_seconds,
+                 'rotate_before_seconds', c.rotate_before_seconds,
+                 'next_rotation_at', c.next_rotation_at,
+                 'rotation_attempts', c.rotation_attempts,
+                 'rotation_error', c.rotation_error
+               ) AS metadata,
+               c.created_at, c.updated_at
+        FROM updated c JOIN llm_providers p ON p.id = c.provider_id
+        "#,
+    )
+    .bind(credential_id)
+    .bind(payload.tenant_id)
+    .bind(payload.enabled)
+    .bind(interval_seconds)
+    .bind(rotate_before_seconds)
+    .fetch_optional(&state.connect_pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("active llm credential not found".to_string()))?;
+    Ok(Json(resource_from_row(row)?))
+}
+
+pub async fn get_llm_credential_rotation_health(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<PlatformRequestContext>,
+    Query(query): Query<LlmCredentialRotationHealthQuery>,
+) -> Result<Json<Value>, AppError> {
+    ensure_tenant_member(&state.connect_pool, query.tenant_id, ctx.platform_user_id).await?;
+    require_tenant_action(&state, &ctx, query.tenant_id, "read", "llm_credential").await?;
+    let row = sqlx::query(
+        r#"
+        SELECT COUNT(*) FILTER (WHERE auto_rotation_enabled AND revoked_at IS NULL) AS enabled,
+               COUNT(*) FILTER (
+                   WHERE auto_rotation_enabled AND revoked_at IS NULL
+                     AND next_rotation_at <= CURRENT_TIMESTAMP
+               ) AS due,
+               COUNT(*) FILTER (WHERE rotation_started_at IS NOT NULL) AS running,
+               COUNT(*) FILTER (WHERE rotation_error IS NOT NULL) AS credentials_with_errors,
+               (SELECT COUNT(*) FROM llm_credential_rotation_attempts attempt
+                WHERE attempt.tenant_id = $1 AND attempt.status = 'failed'
+                  AND attempt.started_at > CURRENT_TIMESTAMP - INTERVAL '24 hours') AS failed_24h
+        FROM llm_credentials WHERE tenant_id = $1
+        "#,
+    )
+    .bind(query.tenant_id)
+    .fetch_one(&state.connect_pool)
+    .await?;
+    Ok(Json(json!({
+        "tenant_id": query.tenant_id,
+        "worker_enabled": state.credential_rotation_worker_enabled,
+        "gateway_configured": state.secret_resolver.rotation_gateway_configured(),
+        "enabled_credentials": row.try_get::<i64, _>("enabled")?,
+        "due_credentials": row.try_get::<i64, _>("due")?,
+        "running_rotations": row.try_get::<i64, _>("running")?,
+        "credentials_with_errors": row.try_get::<i64, _>("credentials_with_errors")?,
+        "failed_attempts_24h": row.try_get::<i64, _>("failed_24h")?,
+        "healthy": row.try_get::<i64, _>("credentials_with_errors")? == 0
+            && (row.try_get::<i64, _>("enabled")? == 0
+                || (state.credential_rotation_worker_enabled
+                    && state.secret_resolver.rotation_gateway_configured()))
+    })))
+}
+
+pub async fn list_llm_credential_rotation_attempts(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<PlatformRequestContext>,
+    Query(query): Query<LlmCredentialRotationAttemptQuery>,
+) -> Result<Json<Vec<Value>>, AppError> {
+    ensure_tenant_member(&state.connect_pool, query.tenant_id, ctx.platform_user_id).await?;
+    require_tenant_action(&state, &ctx, query.tenant_id, "read", "llm_credential").await?;
+    let status = query.status.as_deref().map(str::trim);
+    if status.is_some_and(|value| !matches!(value, "running" | "succeeded" | "failed")) {
+        return Err(AppError::InvalidInput(
+            "rotation attempt status must be running, succeeded, or failed".to_string(),
+        ));
+    }
+    let rows = sqlx::query_scalar::<_, Value>(
+        r#"
+        SELECT jsonb_build_object(
+            'id', id, 'tenant_id', tenant_id, 'credential_id', credential_id,
+            'status', status, 'resolver_scheme', resolver_scheme,
+            'previous_ref_hash', previous_ref_hash, 'new_ref_hash', new_ref_hash,
+            'error_summary', error_summary, 'started_at', started_at,
+            'completed_at', completed_at
+        )
+        FROM llm_credential_rotation_attempts
+        WHERE tenant_id = $1 AND ($2::TEXT IS NULL OR status = $2)
+        ORDER BY started_at DESC, id DESC LIMIT $3
+        "#,
+    )
+    .bind(query.tenant_id)
+    .bind(status)
+    .bind(query.limit.unwrap_or(100).clamp(1, 500))
+    .fetch_all(&state.connect_pool)
+    .await?;
+    Ok(Json(rows))
 }
 
 pub async fn list_llm_model_profiles(
@@ -516,7 +817,17 @@ pub async fn test_llm_model_profile(
         None,
     )
     .await?;
-    let target = load_llm_profile_test_target(&state, payload.tenant_id, profile_id).await?;
+    Ok(Json(
+        test_llm_model_profile_for_tenant(&state, payload.tenant_id, profile_id).await?,
+    ))
+}
+
+pub(super) async fn test_llm_model_profile_for_tenant(
+    state: &AppState,
+    tenant_id: Uuid,
+    profile_id: Uuid,
+) -> Result<LlmProfileTestResponse, AppError> {
+    let target = load_llm_profile_test_target(state, tenant_id, profile_id).await?;
     let url = llm_models_url(&target.base_url)?;
     let timeout_ms =
         json_u64(&target.default_headers_template, "test_timeout_ms").unwrap_or(10_000);
@@ -525,7 +836,7 @@ pub async fn test_llm_model_profile(
         .build()
         .map_err(|err| AppError::InvalidInput(format!("failed to build LLM test client: {err}")))?;
     let mut request = http.get(url);
-    request = apply_llm_test_auth(request, &target)?;
+    request = apply_llm_test_auth(&state.secret_resolver, request, &target).await?;
 
     let started = Instant::now();
     let response = request.send().await;
@@ -533,17 +844,55 @@ pub async fn test_llm_model_profile(
     let result = match response {
         Ok(response) => {
             let status = response.status();
-            LlmProfileTestResponse {
-                success: status.is_success(),
-                provider_key: target.provider_key,
-                model_name: target.model_name,
-                http_status: Some(status.as_u16()),
-                latency_ms,
-                message: if status.is_success() {
-                    "LLM provider connection succeeded".to_string()
-                } else {
-                    format!("LLM provider returned HTTP {}", status.as_u16())
-                },
+            let http_status = Some(status.as_u16());
+            if !status.is_success() {
+                LlmProfileTestResponse {
+                    success: false,
+                    provider_key: target.provider_key,
+                    model_name: target.model_name,
+                    http_status,
+                    latency_ms,
+                    message: format!("LLM provider returned HTTP {}", status.as_u16()),
+                    model_available: None,
+                    checked_model_count: None,
+                }
+            } else {
+                match response.json::<Value>().await {
+                    Ok(body) => {
+                        let model_ids = extract_llm_model_ids(&body);
+                        let model_available = model_ids
+                            .iter()
+                            .any(|candidate| llm_model_id_matches(candidate, &target.model_name));
+                        LlmProfileTestResponse {
+                            success: model_available,
+                            provider_key: target.provider_key,
+                            model_name: target.model_name.clone(),
+                            http_status,
+                            latency_ms,
+                            message: if model_available {
+                                "LLM provider connection succeeded and target model is available"
+                                    .to_string()
+                            } else {
+                                format!(
+                                    "LLM provider responded, but model '{}' was not found",
+                                    target.model_name
+                                )
+                            },
+                            model_available: Some(model_available),
+                            checked_model_count: Some(model_ids.len()),
+                        }
+                    }
+                    Err(err) => LlmProfileTestResponse {
+                        success: false,
+                        provider_key: target.provider_key,
+                        model_name: target.model_name,
+                        http_status,
+                        latency_ms,
+                        message: format!("LLM provider response did not contain valid JSON: {err}"),
+                        model_available: None,
+                        checked_model_count: None,
+                    },
+                }
             }
         }
         Err(err) => LlmProfileTestResponse {
@@ -553,9 +902,11 @@ pub async fn test_llm_model_profile(
             http_status: None,
             latency_ms,
             message: format!("LLM provider request failed: {err}"),
+            model_available: None,
+            checked_model_count: None,
         },
     };
-    Ok(Json(result))
+    Ok(result)
 }
 
 pub async fn update_llm_model_profile(
@@ -839,14 +1190,67 @@ fn llm_models_url(base_url: &str) -> Result<String, AppError> {
     }
 }
 
-fn apply_llm_test_auth(
+fn normalize_secret_ref(secret_ref: String) -> Result<String, AppError> {
+    let trimmed = secret_ref.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::InvalidInput(
+            "llm credential secret_ref is required".to_string(),
+        ));
+    }
+    secret_resolver::validate_secret_ref(trimmed)?;
+    Ok(trimmed.to_string())
+}
+
+fn extract_llm_model_ids(body: &Value) -> Vec<String> {
+    let Some(models) = body
+        .get("data")
+        .or_else(|| body.get("models"))
+        .and_then(Value::as_array)
+        .or_else(|| body.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut model_ids = Vec::new();
+    for model in models {
+        if let Some(id) = model.as_str().map(str::trim).filter(|id| !id.is_empty()) {
+            model_ids.push(id.to_string());
+            continue;
+        }
+        let Some(object) = model.as_object() else {
+            continue;
+        };
+        for field in ["id", "name", "model"] {
+            if let Some(id) = object
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                model_ids.push(id.to_string());
+                break;
+            }
+        }
+    }
+    model_ids
+}
+
+fn llm_model_id_matches(candidate: &str, target: &str) -> bool {
+    let normalize = |value: &str| value.trim().trim_start_matches("models/").to_string();
+    let candidate = normalize(candidate);
+    let target = normalize(target);
+    candidate == target
+}
+
+async fn apply_llm_test_auth(
+    secret_resolver: &secret_resolver::SecretResolver,
     request: reqwest::RequestBuilder,
     target: &LlmProfileTestTarget,
 ) -> Result<reqwest::RequestBuilder, AppError> {
     let Some(secret_ref) = target.secret_ref.as_deref() else {
         return Ok(request);
     };
-    let secret = secret_resolver::resolve_secret_ref(secret_ref)?;
+    let secret = secret_resolver.resolve(secret_ref).await?;
     match target.auth_scheme.as_str() {
         "bearer" => Ok(request.bearer_auth(secret)),
         "api_key_header" => {
@@ -935,5 +1339,67 @@ async fn ensure_llm_credential_matches_provider(
         Err(AppError::InvalidInput(
             "llm credential must be active and belong to the selected provider".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        extract_llm_model_ids, llm_model_id_matches, llm_models_url, normalize_secret_ref,
+    };
+
+    #[test]
+    fn llm_models_url_appends_models_endpoint_once() {
+        assert_eq!(
+            llm_models_url("https://llm.example.test/v1").unwrap(),
+            "https://llm.example.test/v1/models"
+        );
+        assert_eq!(
+            llm_models_url("https://llm.example.test/v1/models").unwrap(),
+            "https://llm.example.test/v1/models"
+        );
+    }
+
+    #[test]
+    fn normalizes_llm_credential_secret_ref() {
+        assert_eq!(
+            normalize_secret_ref(" env://OPENAI_API_KEY ".to_string()).unwrap(),
+            "env://OPENAI_API_KEY"
+        );
+        assert!(normalize_secret_ref("   ".to_string()).is_err());
+    }
+
+    #[test]
+    fn extracts_openai_and_gemini_model_ids() {
+        let openai = json!({
+            "data": [
+                {"id": "gpt-5"},
+                {"id": "gpt-5-mini"}
+            ]
+        });
+        assert_eq!(extract_llm_model_ids(&openai), vec!["gpt-5", "gpt-5-mini"]);
+
+        let gemini = json!({
+            "models": [
+                {"name": "models/gemini-2.5-pro"},
+                {"name": "models/gemini-2.5-flash"}
+            ]
+        });
+        assert_eq!(
+            extract_llm_model_ids(&gemini),
+            vec!["models/gemini-2.5-pro", "models/gemini-2.5-flash"]
+        );
+    }
+
+    #[test]
+    fn model_id_match_accepts_gemini_models_prefix_only() {
+        assert!(llm_model_id_matches(
+            "models/gemini-2.5-pro",
+            "gemini-2.5-pro"
+        ));
+        assert!(llm_model_id_matches("gpt-5", "gpt-5"));
+        assert!(!llm_model_id_matches("gpt-5-mini", "gpt-5"));
     }
 }

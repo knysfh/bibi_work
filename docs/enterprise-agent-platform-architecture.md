@@ -1,10 +1,20 @@
-# 企业级智能体运行平台架构评估与 v1 方案
+# 企业级智能体运行平台架构
 
-更新日期：2026-06-18
+更新日期：2026-07-14
+
+本文档只记录长期稳定的架构原则和系统边界。仓库中的文档职责如下：
+
+- `enterprise-agent-platform-architecture.md`：架构决策与安全边界。
+- `biwork-enterprise-agent-platform-execution-plan.md`：迁移步骤、完成状态与剩余工作。
+- `biwork-api-contract.md`：renderer、Rust、Python 和桌面本地能力之间的接口合同。
+- `local-service-config.md`：本地配置结构，不保存真实值。
+- `local-testing-guide.md`：本地冒烟、E2E 与回归测试入口。
+
+实现细节应进入代码、测试和上述对应主文档，不再为单个阶段、专项审计或局部 UI 策略新增平行文档。
 
 ## 1. 评估结论
 
-现有 `enterprise-agent-platform-architecture.md` 的总体方向是正确的，能够支撑目标系统的核心轮廓：Rust 后端作为唯一可信入口，FerrisKey 作为身份认证、realm、client、user、role、scope 和 token 中角色声明的事实源，Rust 后端作为资源级授权 PEP/PDP 适配层，Python deepagents 作为受控运行态，Redis Stream 作为实时流通道，Postgres 作为业务、事件和审计事实源，RustFS 负责远程项目文件、市场资源、运行产物、记忆文件和审计证据，Tauri + React 负责桌面端与本地执行入口。
+本方案能够支撑目标系统的核心轮廓：Rust 后端作为唯一可信入口，FerrisKey 作为身份认证、realm、client、user、role、scope 和 token 中角色声明的事实源，Rust 后端作为资源级授权 PEP/PDP 适配层，Python deepagents 作为受控运行态，Redis Stream 作为实时流通道，Postgres 作为业务、事件和审计事实源，RustFS 负责远程项目文件、市场资源、运行产物、记忆文件和审计证据，Electron + React 负责桌面端与本地能力入口。
 
 但它目前仍偏“原则性架构说明”，距离企业级智能体运行平台的生产级设计还缺少几个关键闭环：
 
@@ -21,16 +31,9 @@
 
 因此，结论是：当前设计在方向上符合最佳实践，但还不能直接作为生产级详细设计。v1 方案应把平台拆成控制面、运行面、事件面、文件面、本地执行面和治理面，并把 FerrisKey 定位为身份与角色事实源，把 Rust 后端定位为企业资源级授权执行点，把 DeepAgents 当作受控 agent harness，而不是平台安全边界。
 
-### 1.1 当前本地基础设施事实
+### 1.1 本地联调边界
 
-本地已经具备以下基础设施，详细端口、凭据和目录层级见 `docs/local-service-config.md`：
-
-- FerrisKey Web 端运行在 `http://localhost:5555`，API/OIDC 端运行在 `http://localhost:3333`。
-- FerrisKey 已创建 realm：`bibi-work`。
-- `bibi-work` realm 的 OIDC discovery 地址为 `http://localhost:3333/realms/bibi-work/.well-known/openid-configuration`。
-- 当前可确认 FerrisKey 提供 OIDC、client、user、role、scope、token 等能力；尚未确认其本地 API 直接提供项目代码中配置的 `/api/v1/authz/check` 和 `/api/v1/authz/batch-check` 资源级 PDP 端点。
-- RustFS 当前使用 `RUSTFS_ENDPOINT=http://localhost:9004`，并已初始化 `bibi-work-marketplace`、`bibi-work-files`、`bibi-work-runs`、`bibi-work-memory`、`bibi-work-audit` 五个 bucket。
-- RustFS 上述 bucket 均已启用 versioning，并已写入目录占位对象和 `tenants/bibi-work/_manifest.json`。
+本地联调依赖 FerrisKey、Postgres、Redis、RustFS、Rust 后端、Python Agent API/Celery 和 Electron。架构文档不记录本机端口、账号、密码、密钥或初始化状态；人工核对真实值读取 `docs/local-service-config.local.md`，测试进程只读取各服务的 `.env` 与 `.env.local`。具体启动和验证流程见 `docs/local-testing-guide.md`。
 
 ## 2. 需求支撑度判断
 
@@ -44,7 +47,7 @@
 | Python deepagents 运行态 | 中 | 增加 custom backend、HITL resume、checkpointer、event projection、Celery 幂等 |
 | Celery 后台运行 | 低中 | 增加任务状态机、重试语义、重复事件去重、worker 隔离 |
 | Redis 写入流式输出 | 中 | 增加事务 outbox、seq 分配、Redis 非事实源约束 |
-| Tauri + React 桌面端 | 中 | 增加本地 executor 协议、设备绑定、最小权限和安全升级 |
+| Electron + React 桌面端 | 中 | 增加本地 executor 协议、设备绑定、最小权限和安全升级 |
 | 多端登录 | 低中 | 调整 `user_token` 唯一键，增加 devices/sessions/session_jti |
 | Agent/Tool/Skill/MCP 管理 | 中 | 增加版本化、密钥 vault、配置快照、灰度/禁用 |
 | 二次工具授权 | 中高 | 增加所有工具统一 wrapper、MCP wrapper、local exec wrapper、失败关闭 |
@@ -69,7 +72,7 @@
 ## 4. 推荐总体架构
 
 ```text
-Tauri + React Desktop
+Electron + React Desktop
   - 当前发起端 SSE
   - 其他端 WebSocket subscribe conversation_id
   - local executor device bridge
@@ -191,7 +194,7 @@ POST /internal/files/search
 
 本地文件：
 
-- Tauri local executor 只接收 Rust 后端下发的短期操作令牌。
+- Electron main process 的 local executor 只接收 Rust 后端下发的短期操作令牌。
 - 本地路径不直接暴露给 Python。Python 只看到虚拟路径，例如 `/workspace/src/main.rs`。
 - Rust 按 project mount 把虚拟路径映射到远程 RustFS 或设备本地路径。
 - 本地读写前仍调用 Rust 资源级授权：`file:{project_id}:{path_hash}#read/write`，授权输入包含 FerrisKey token roles。
@@ -246,7 +249,7 @@ Rust Backend:
 bibi-work-desktop
   - public client
   - Authorization Code + PKCE
-  - Tauri desktop 登录
+  - Electron desktop 登录
 
 bibi-work-web
   - public client
@@ -268,7 +271,7 @@ Token 建议：
 scope: openid profile email roles
 roles claim: realm_access.roles 或独立 roles claim
 audience: bibi-work-backend
-issuer: http://localhost:3333/realms/bibi-work
+issuer: https://id.example.com/realms/<realm>
 ```
 
 Rust 后端必须校验：
@@ -628,6 +631,8 @@ type ArtifactRef = {
 - 图表只允许声明式 spec，v1 推荐 `vega_lite`；地图只允许 GeoJSON artifact，并可携带小型 `data_preview` 供前端 MapLibre 直接预览；禁止可执行脚本、任意 iframe 和运行时动态组件。
 - 每个工具版本可以在 `tool_version.snapshot.output_schema` 与 `ui_hints` 中声明期望输出和默认渲染方式；运行时仍以 Rust 校验后的 `views` 和 `tool_result_artifacts` 绑定为准。
 
+展示层必须与执行事实和模型上下文分离：Rust/Python 保留稳定、可审计的原始结构，LLM 获取保留真实语义的结果，Renderer 只消费脱敏后的展示投影。工具卡优先展示受控 `ToolResultView`，其次展示人类可读的请求字段和确定性结果摘要，原始 JSON 仅放在用户主动展开的技术详情中。`summary` 是审计与折叠体验字段，不是工具执行或模型推理的必填字段，也不应为了生成摘要额外调用一次 LLM。`api_key`、`authorization`、`password`、`secret`、`token`、`credential`、`cookie` 等敏感字段不得进入友好展示。
+
 ### 6.4 审批恢复
 
 DeepAgents HITL 需要 durable checkpointer。平台应使用 Postgres/Redis-backed checkpointer 或可恢复的 LangGraph checkpointer，不应在生产使用内存 checkpointer。
@@ -850,16 +855,9 @@ WebSocket：
 
 ## 9. RustFS 与本地执行
 
-### 9.1 RustFS 当前配置与职责
+### 9.1 RustFS 配置与职责
 
-当前本地 RustFS 已完成初始化：
-
-```text
-RUSTFS_ENDPOINT=http://localhost:9004
-bucket versioning: enabled
-```
-
-已创建 bucket：
+RustFS endpoint、凭据和本机初始化状态属于部署配置，不写入架构文档。平台要求相关业务 bucket 启用 versioning，并通过 Rust File/Object Service 统一访问。逻辑 bucket 规划如下：
 
 | bucket | 职责 |
 | --- | --- |
@@ -987,6 +985,15 @@ last_writer_user_id
 source_run_id
 ```
 
+文本搜索不把任意大对象直接写入单个 `tsvector`。Rust File Service 在写 revision 时生成 `file_search_chunks`：
+
+- 不超过 1 MiB 的文本按 64 KiB UTF-8 安全边界全量分块。
+- 超过 1 MiB 的文本在文件头、中心、尾部及其间位置均匀采样最多 1 MiB，避免只索引前缀。
+- 每个 chunk 记录 byte range、源大小、实际索引字节、截断状态和 `full_chunks | uniform_sample` 策略。
+- `file_revisions.metadata.search_index` 保存相同抽取摘要，便于审计和前端解释搜索结果。
+- 大文本搜索只返回最佳命中 chunk 作为截断 preview；完整内容继续通过 File Service byte range 或 raw stream 读取。
+- 二进制正文不进入全文索引，但仍可按虚拟路径检索，不会因此读取或返回二进制内容。
+
 ### 9.4 本地执行协议
 
 Python 不直接执行本地命令。流程：
@@ -1062,6 +1069,10 @@ MCP：
 
 - MCP server 配置密钥进入 Vault/KMS，不进普通 Postgres 明文。
 - discover 结果写 `mcp_tools` 和 schema hash。
+- MCP `tools/list` 是工具目录的权威快照：每次成功发现先停用旧工具，再按 `(mcp_server_id, name)` 恢复本次返回项，服务端已删除的工具不会继续参与 capability snapshot。`mcp_servers` 使用结构化 health 列记录 healthy/unhealthy/unsupported、检查时间、最近成功发现、连续失败次数和有界错误；BiWork 的连接检查与 public catalog discover 共用这一生命周期事实。
+- 后台 MCP health worker 只探测 active 的 `http/json-rpc/streamable-http` 服务；按最久未检查优先取有界批次，最多 8 路并发，missed tick 直接跳过，不让慢服务形成无限积压。stdio 仍由 actor device 的 Electron runtime 负责，服务端不伪造本地进程可达性。
+- stdio MCP 使用 BiWork desktop gateway 与 Rust catalog 的 `FACADE` 边界：Electron 主进程通过官方 MCP SDK、无 shell `spawn` 完成 initialize/tools-list，只把规范化工具观测结果回写 Rust；Rust 再做 tenant/authz、transport 校验、schema hash、权威目录同步和 health 持久化。工具执行时 Rust 从 `mcp_tools` 事实加载真实 server/tool/schema，按 `readOnlyHint/destructiveHint` 判定风险并完成资源授权，然后把不含明文 secret 的 `mcp_stdio` work item 定向到 actor device；Electron main 只领取同设备同 kind 请求，用官方 SDK 执行并回报。stdio `env` 只允许 `env://NAME`，由 Electron 进程环境解析，明文值不能进入 Rust `config`、renderer、queue 或 discovery report。
+- streamable HTTP MCP 由 Rust transport 统一完成 initialize、`notifications/initialized`、`Mcp-Session-Id`/protocol header、JSON/SSE response 解码、15 分钟 session 复用、失效重建和一次重试；session slot 与响应大小有硬上限。legacy SSE transport 在完成 GET message-endpoint negotiation 前明确 fail closed，不与 streamable HTTP 混用。
 - 每次调用前由 Rust 资源级授权检查 `mcp_tool:{server_id}:{tool_name}#use`。
 - stdio MCP 只能运行在受控 runtime 或本地 executor，不允许任意用户配置任意命令后由服务器直接执行。
 - OAuth token 需要 scope、过期、撤销和审计。
@@ -1219,7 +1230,7 @@ audit_logs
 - Rust resource authz policy version。
 - local executor device id。
 
-建议对审计表做分区、WORM 归档和链式 hash，防止被无声篡改。
+审计表采用 UTC 月度 range partition、WORM 归档和链式 hash，防止被无声篡改。`audit_log_identities` 独立保留全局 UUID 身份，使叶子分区可 detach，同时维持 segment 首尾记录的引用完整性。当前 Rust 实现采用 seal/archive 两阶段：seal 固化连续 hash-chain manifest，archive worker 对 RustFS evidence 做 content hash 与 manifest 双重校验、记录归档状态和 retention deadline，并用 `FOR UPDATE SKIP LOCKED` 支持多实例安全 claim；legal hold 支持 tenant、segment、resource scope。到期资格按整个叶子分区 fail closed：任意未验证、未到期、受 hold 保护或未被合格 segment 覆盖的记录都会阻止清理。partition maintenance worker 会预创建当前与未来月份分区，默认分区有冲突数据时拒绝建分区。cleanup API 默认 dry-run、要求 `platform_admin` 且服务端执行开关默认关闭；执行时持有全局 advisory lock 和父表 `ACCESS EXCLUSIVE` lock，二次校验后才 detach/drop。
 
 ### 13.2 可观测性
 
@@ -1299,7 +1310,7 @@ local_exec_events
 
 - FerrisKey `bibi-work` realm 已创建。
 - RustFS 五个业务 bucket 已创建并启用 versioning。
-- 本地服务配置已记录在 `docs/local-service-config.md`。
+- 本地服务配置结构见 `docs/local-service-config.md`，真实值只保存在本机忽略文件和 `.env.local`。
 
 下一步：
 
@@ -1339,7 +1350,7 @@ local_exec_events
 1. 接入已初始化的 RustFS buckets：marketplace/files/runs/memory/audit。
 2. 实现 RustFS remote project mount 和 object_references。
 3. 实现 file revision/etag/version_id/conflict。
-4. Tauri local executor 设备绑定。
+4. Electron local executor 设备绑定。
 5. 本地执行 WS 通道、短期令牌、路径守卫、取消、超时、输出限流。
 6. 本地文件变更同步和审计。
 
@@ -1374,6 +1385,9 @@ v1 必须补齐后才算生产级最佳实践：
 - 工具结果结构化视图协议、对象引用和前端白名单 renderer。
 - local executor 零信任协议。
 - Vault/KMS 管理 MCP 和模型密钥。
+- Rust `SecretResolver` 统一解析 `env://NAME`、`vault://path#field`、`kms://key-id#ciphertext`；Vault/KMS 控制凭证仅来自进程环境，业务 secret 不进入 Postgres 明文、runtime snapshot、BiWork renderer 或日志。KMS 通过受控 decrypt gateway 返回 `plaintext_base64`，便于在云厂商 KMS、HSM 或企业密钥服务前保持稳定内部契约。
+- SQL `tls_config_ref` 也走相同 resolver，只接受 require/verify-ca/verify-full 和有界 PEM；LLM runtime credential 仅存 Redis 10 分钟，并在 credential rotate/revoke 时主动删除。
+- 自动轮换使用固定 rotation gateway，不接受数据库中的任意 endpoint。Rust worker 通过 `FOR UPDATE SKIP LOCKED` claim 到期 credential，以 attempt UUID 作为 gateway 幂等键；进程在 gateway 成功后、数据库提交前崩溃时，陈旧 claim 会复用原 attempt UUID，避免重复生成外部密钥。轮换期间阻止新 runtime credential 签发并先撤销旧凭证。成功后原子更新 opaque ref 与 hash-chain 审计；失败保留旧 active credential、指数退避，并通过 health/attempt API 暴露告警，不记录原始引用。
 - 审计不可篡改和脱敏。
 - OpenTelemetry 全链路追踪。
 - 容量、灾备、测试和安全威胁建模。

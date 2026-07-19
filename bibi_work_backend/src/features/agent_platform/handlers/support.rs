@@ -50,6 +50,7 @@ pub(super) fn normalize_request_actor(
     request.actor.device_id = Some(ctx.device_id);
     request.actor.session_id = Some(ctx.session_id);
     request.actor.roles = ctx.roles.clone();
+    request.context = authz_context_with_trace_id(request.context.take(), &ctx.trace_id);
 }
 
 pub(super) async fn require_ferriskey_allow(
@@ -73,9 +74,20 @@ pub(super) async fn require_ferriskey_allow(
         action,
         resource_type,
         resource_id,
-        context,
+        authz_context_with_trace_id(context, &ctx.trace_id),
     )
     .await
+}
+
+fn authz_context_with_trace_id(
+    context: Option<AuthzContext>,
+    trace_id: &str,
+) -> Option<AuthzContext> {
+    let mut context = context.unwrap_or_default();
+    if context.trace_id.is_none() {
+        context.trace_id = Some(trace_id.to_string());
+    }
+    Some(context)
 }
 
 pub(super) async fn require_ferriskey_allow_for_actor(
@@ -214,7 +226,7 @@ pub(super) async fn write_authz_audit_tx(
             risk_level: context.risk_level.as_deref(),
             ip: context.source_ip.as_deref(),
             user_agent: context.user_agent.as_deref(),
-            trace_id: None,
+            trace_id: context.trace_id.as_deref(),
         },
     )
     .await?;
@@ -548,6 +560,7 @@ pub(super) fn version_from_row(row: PgRow) -> Result<VersionResponse, AppError> 
         version_label: row.try_get("version_label")?,
         snapshot: row.try_get("snapshot")?,
         policy_version: row.try_get("policy_version")?,
+        has_secret_ref: row.try_get("has_secret_ref").ok(),
         status: row.try_get("status")?,
         created_at: row.try_get("created_at")?,
     })
@@ -678,4 +691,77 @@ pub(super) fn memory_from_row(row: PgRow) -> Result<MemoryItemResponse, AppError
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authz_context_with_trace_id_adds_missing_trace_id() {
+        let context = authz_context_with_trace_id(None, "trace-1").expect("context");
+
+        assert_eq!(context.trace_id.as_deref(), Some("trace-1"));
+    }
+
+    #[test]
+    fn authz_context_with_trace_id_preserves_explicit_trace_id() {
+        let context = authz_context_with_trace_id(
+            Some(AuthzContext {
+                trace_id: Some("explicit-trace".to_string()),
+                ..Default::default()
+            }),
+            "request-trace",
+        )
+        .expect("context");
+
+        assert_eq!(context.trace_id.as_deref(), Some("explicit-trace"));
+    }
+
+    #[test]
+    fn normalize_request_actor_attaches_request_trace_id() {
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let device_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let mut request = AuthzCheckRequest {
+            tenant_id,
+            actor: ActorRef {
+                user_id,
+                device_id: None,
+                session_id: None,
+                roles: Vec::new(),
+            },
+            action: "read".to_string(),
+            resource: ResourceRef {
+                resource_type: "project".to_string(),
+                id: Uuid::new_v4().to_string(),
+                path: None,
+            },
+            context: None,
+        };
+        let ctx = PlatformRequestContext {
+            tenant_id,
+            platform_user_id: user_id,
+            ferriskey_subject: "subject".to_string(),
+            preferred_username: Some("user".to_string()),
+            email: None,
+            roles: vec!["tenant_member".to_string()],
+            session_id,
+            device_id,
+            trace_id: "request-trace".to_string(),
+            token_jti: None,
+            token_exp: time::OffsetDateTime::now_utc(),
+        };
+
+        normalize_request_actor(&mut request, &ctx);
+
+        assert_eq!(request.actor.device_id, Some(device_id));
+        assert_eq!(request.actor.session_id, Some(session_id));
+        assert_eq!(request.actor.roles, vec!["tenant_member".to_string()]);
+        assert_eq!(
+            request.context.and_then(|context| context.trace_id),
+            Some("request-trace".to_string())
+        );
+    }
 }

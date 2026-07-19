@@ -1,13 +1,9 @@
-use std::time::Duration;
-
-use reqwest::{Client, RequestBuilder};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
-use crate::features::{agent_platform::secret_resolver, core::errors::AppError};
+use crate::features::{agent_platform::secret_resolver::SecretResolver, core::errors::AppError};
 
-const DEFAULT_MCP_HTTP_TIMEOUT_MS: u64 = 30_000;
+use super::mcp_http;
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredMcpTool {
@@ -18,36 +14,29 @@ pub struct DiscoveredMcpTool {
 }
 
 pub async fn discover_mcp_tools(
+    secret_resolver: &SecretResolver,
     transport: &str,
     config: &Value,
     secret_ref: Option<&str>,
 ) -> Result<Vec<DiscoveredMcpTool>, AppError> {
-    if !matches!(transport, "http" | "streamable-http" | "sse" | "json-rpc") {
+    if !matches!(
+        transport,
+        "http" | "streamable-http" | "streamable_http" | "sse" | "json-rpc"
+    ) {
         return Err(AppError::InvalidInput(format!(
             "unsupported MCP transport for discovery: {transport}"
         )));
     }
 
-    let endpoint = mcp_endpoint(config)?;
-    let timeout_ms = json_u64(config, "timeout_ms").unwrap_or(DEFAULT_MCP_HTTP_TIMEOUT_MS);
-    let http = Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
-        .build()
-        .map_err(|err| AppError::InvalidInput(format!("failed to build MCP client: {err}")))?;
-    let request_id = Uuid::new_v4().to_string();
-    let request_body = json!({
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "method": "tools/list",
-        "params": {}
-    });
-
-    let request = apply_secret_auth(http.post(endpoint), config, secret_ref)?.json(&request_body);
-    let response = request
-        .send()
-        .await
-        .map_err(|err| AppError::InvalidInput(format!("MCP tools/list failed: {err}")))?;
-    let value = response_json(response).await?;
+    let value = mcp_http::request(
+        secret_resolver,
+        transport,
+        config,
+        secret_ref,
+        "tools/list",
+        json!({}),
+    )
+    .await?;
     parse_tools_list_response(value)
 }
 
@@ -70,26 +59,6 @@ pub fn parse_tools_list_response(value: Value) -> Result<Vec<DiscoveredMcpTool>,
         .iter()
         .map(discovered_tool_from_value)
         .collect::<Result<Vec<_>, AppError>>()
-}
-
-pub fn mcp_endpoint(config: &Value) -> Result<String, AppError> {
-    if let Some(url) = json_string(config, "tools_list_url")
-        .or_else(|| json_string(config, "discovery_url"))
-        .or_else(|| json_string(config, "tool_call_url"))
-        .or_else(|| json_string(config, "endpoint"))
-        .or_else(|| json_string(config, "url"))
-    {
-        return Ok(url);
-    }
-    let base_url = json_string(config, "base_url").ok_or_else(|| {
-        AppError::InvalidInput("MCP server endpoint/base_url is required".to_string())
-    })?;
-    let path = json_string(config, "path").unwrap_or_else(|| "/".to_string());
-    Ok(format!(
-        "{}/{}",
-        base_url.trim_end_matches('/'),
-        path.trim_start_matches('/')
-    ))
 }
 
 fn discovered_tool_from_value(value: &Value) -> Result<DiscoveredMcpTool, AppError> {
@@ -143,22 +112,6 @@ fn default_input_schema() -> Value {
     })
 }
 
-async fn response_json(response: reqwest::Response) -> Result<Value, AppError> {
-    let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|err| AppError::InvalidInput(format!("MCP response read failed: {err}")))?;
-    if !status.is_success() {
-        return Err(AppError::InvalidInput(format!(
-            "MCP tools/list returned HTTP {}",
-            status.as_u16()
-        )));
-    }
-    serde_json::from_slice(&bytes)
-        .map_err(|err| AppError::InvalidInput(format!("MCP tools/list JSON parse failed: {err}")))
-}
-
 fn schema_hash(schema: &Value) -> Result<String, AppError> {
     let bytes = serde_json::to_vec(schema)
         .map_err(|err| AppError::InvalidInput(format!("failed to encode MCP schema: {err}")))?;
@@ -167,53 +120,14 @@ fn schema_hash(schema: &Value) -> Result<String, AppError> {
     Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
-fn json_string(value: &Value, field: &str) -> Option<String> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
-}
-
-fn json_u64(value: &Value, field: &str) -> Option<u64> {
-    value.get(field).and_then(Value::as_u64)
-}
-
-fn apply_secret_auth(
-    request: RequestBuilder,
-    config: &Value,
-    secret_ref: Option<&str>,
-) -> Result<RequestBuilder, AppError> {
-    let Some(secret_ref) = secret_ref else {
-        return Ok(request);
-    };
-    let secret = secret_resolver::resolve_secret_ref(secret_ref)?;
-    let header_name = json_string(config, "auth_header")
-        .or_else(|| json_string(config, "secret_header"))
-        .unwrap_or_else(|| "Authorization".to_string());
-    if header_name.trim().is_empty()
-        || header_name
-            .bytes()
-            .any(|byte| byte <= 31 || byte == 127 || byte == b':')
-    {
-        return Err(AppError::InvalidInput(
-            "MCP auth header name is invalid".to_string(),
-        ));
-    }
-    let scheme = json_string(config, "auth_scheme")
-        .or_else(|| json_string(config, "secret_scheme"))
-        .unwrap_or_else(|| "Bearer".to_string());
-    let header_value = if scheme.eq_ignore_ascii_case("none") {
-        secret
-    } else {
-        format!("{} {}", scheme.trim(), secret)
-    };
-    Ok(request.header(header_name, header_value))
-}
-
 #[cfg(test)]
 mod tests {
-    use axum::{Json, Router, http::HeaderMap, routing::post};
+    use axum::{
+        Json, Router,
+        extract::Path,
+        http::HeaderMap,
+        routing::{get, post},
+    };
     use serde_json::json;
     use tokio::net::TcpListener;
 
@@ -290,7 +204,9 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
 
-        let tools = discover_mcp_tools("http", &json!({"endpoint": endpoint}), None).await?;
+        let resolver = SecretResolver::env_only_for_tests();
+        let tools =
+            discover_mcp_tools(&resolver, "http", &json!({"endpoint": endpoint}), None).await?;
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "lookup_sales");
 
@@ -332,7 +248,9 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
 
+        let resolver = SecretResolver::env_only_for_tests();
         let tools = discover_mcp_tools(
+            &resolver,
             "http",
             &json!({"endpoint": endpoint}),
             Some("env://BIBI_TEST_MCP_TOKEN"),
@@ -341,6 +259,130 @@ mod tests {
         assert_eq!(tools[0].name, "secured_lookup");
 
         server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discovers_tools_with_configured_custom_header()
+    -> Result<(), Box<dyn std::error::Error>> {
+        async fn tools_list(headers: HeaderMap, Json(payload): Json<Value>) -> Json<Value> {
+            assert_eq!(
+                headers
+                    .get("x-api-key")
+                    .and_then(|value| value.to_str().ok()),
+                Some("test-key")
+            );
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": payload["id"].clone(),
+                "result": {
+                    "tools": [{
+                        "name": "secured_lookup",
+                        "inputSchema": {"type": "object", "properties": {}}
+                    }]
+                }
+            }))
+        }
+
+        let router = Router::new().route("/mcp", post(tools_list));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}/mcp", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let resolver = SecretResolver::env_only_for_tests();
+        let tools = discover_mcp_tools(
+            &resolver,
+            "http",
+            &json!({"endpoint": endpoint, "headers": {"X-API-Key": "test-key"}}),
+            None,
+        )
+        .await?;
+        assert_eq!(tools[0].name, "secured_lookup");
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discovers_tools_with_vault_backed_bearer_secret()
+    -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            std::env::set_var("BIBI_TEST_MCP_VAULT_TOKEN", "vault-control-token");
+        }
+        async fn vault_secret(Path(path): Path<String>, headers: HeaderMap) -> Json<Value> {
+            assert_eq!(path, "secret/data/mcp/server");
+            assert_eq!(
+                headers
+                    .get("x-vault-token")
+                    .and_then(|value| value.to_str().ok()),
+                Some("vault-control-token")
+            );
+            Json(json!({"data": {"data": {"token": "vault-mcp-secret"}}}))
+        }
+        async fn tools_list(headers: HeaderMap, Json(payload): Json<Value>) -> Json<Value> {
+            assert_eq!(
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer vault-mcp-secret")
+            );
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": payload["id"].clone(),
+                "result": {"tools": [{"name": "vault_lookup", "inputSchema": {"type": "object"}}]}
+            }))
+        }
+        let router = Router::new()
+            .route("/v1/{*path}", get(vault_secret))
+            .route("/mcp", post(tools_list));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        let endpoint = format!("{base_url}/mcp");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let resolver = SecretResolver::new(crate::configuration::SecretResolverSettings {
+            timeout_milliseconds: 2_000,
+            vault_enabled: true,
+            vault_base_url: Some(base_url),
+            vault_token_ref: Some("env://BIBI_TEST_MCP_VAULT_TOKEN".to_string()),
+            vault_namespace: None,
+            kms_enabled: false,
+            kms_base_url: None,
+            kms_auth_token_ref: None,
+            rotation_gateway_enabled: false,
+            rotation_gateway_base_url: None,
+            rotation_gateway_auth_token_ref: None,
+        })?;
+        let tools = discover_mcp_tools(
+            &resolver,
+            "http",
+            &json!({"endpoint": endpoint}),
+            Some("vault://secret/data/mcp/server#token"),
+        )
+        .await?;
+        assert_eq!(tools[0].name, "vault_lookup");
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BIBI_TEST_STREAMABLE_MCP_URL"]
+    async fn discovers_tools_from_real_streamable_http_server()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint = std::env::var("BIBI_TEST_STREAMABLE_MCP_URL")?;
+        let resolver = SecretResolver::env_only_for_tests();
+        let tools = discover_mcp_tools(
+            &resolver,
+            "streamable-http",
+            &json!({"endpoint": endpoint, "timeout_ms": 30_000}),
+            None,
+        )
+        .await?;
+        assert!(!tools.is_empty());
+        assert!(tools.iter().all(|tool| !tool.name.trim().is_empty()));
         Ok(())
     }
 }

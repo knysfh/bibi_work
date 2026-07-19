@@ -1,0 +1,124 @@
+import type { IProvider } from '@/common/config/storage';
+import ModalHOC from '@/renderer/utils/ui/ModalHOC';
+import BiWorkModal from '@/renderer/components/base/BiWorkModal';
+import { Button, Select, Tag } from '@arco-design/web-react';
+import React, { useCallback, useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import useModeModeList from '@renderer/hooks/agent/useModeModeList';
+import {
+  isNewApiPlatform,
+  NEW_API_PROTOCOL_OPTIONS,
+  detectNewApiProtocol,
+} from '@/renderer/utils/model/modelPlatforms';
+
+const AddModelModal = ModalHOC<{ data?: IProvider; onSubmit: (model: IProvider) => void }>(
+  ({ modalProps, data, onSubmit, modalCtrl }) => {
+    const { t } = useTranslation();
+    const [models, setModels] = useState<string[]>([]);
+    const [modelProtocol, setModelProtocol] = useState<string>('openai');
+    const isNewApi = isNewApiPlatform(data?.platform ?? '');
+    const { data: modelList, isLoading } = useModeModeList(data?.platform, data?.base_url, data?.api_key);
+    const existingModels = data?.models || [];
+    const optionsList = useMemo(() => {
+      // 处理新的数据格式，可能包含 fix_base_url
+      const models = Array.isArray(modelList) ? modelList : modelList?.models || [];
+      if (!models || !data?.models) return models;
+      return models.map((item) => {
+        return { ...item, disabled: data.models.includes(item.value) };
+      });
+    }, [modelList, data?.models]);
+    const previewModels = useMemo(() => existingModels.slice(0, 6), [existingModels]);
+    const remainingCount =
+      existingModels.length > previewModels.length ? existingModels.length - previewModels.length : 0;
+
+    const handleConfirm = useCallback(() => {
+      if (!models.length) return;
+      const updatedData: IProvider = { ...data, models: [...existingModels, ...models] };
+
+      // new-api 平台：为每个选中的模型添加协议配置 / new-api platform: add protocol config for every selected model
+      if (isNewApi) {
+        updatedData.model_protocols = {
+          ...data?.model_protocols,
+          ...Object.fromEntries(models.map((m) => [m, modelProtocol])),
+        };
+      }
+
+      onSubmit(updatedData);
+      modalCtrl.close();
+    }, [data, existingModels, models, modelProtocol, isNewApi, onSubmit, modalCtrl]);
+
+    return (
+      <BiWorkModal
+        visible={modalProps.visible}
+        onCancel={modalCtrl.close}
+        header={{ title: t('settings.addModel'), showClose: true }}
+        style={{ maxHeight: '90vh' }}
+        contentStyle={{
+          background: 'var(--dialog-fill-0)',
+          borderRadius: 16,
+          padding: '20px 24px',
+          overflow: 'auto',
+        }}
+        onOk={handleConfirm}
+        okText={t('common.confirm')}
+        cancelText={t('common.cancel')}
+        okButtonProps={{ disabled: !models.length }}
+      >
+        <div className='flex flex-col gap-16px pt-20px'>
+          <div className='space-y-8px'>
+            <div className='text-13px font-500 text-t-secondary'>{t('settings.addModelPlaceholder')}</div>
+            <Select
+              mode='multiple'
+              showSearch
+              options={optionsList}
+              loading={isLoading}
+              onChange={(value: string[]) => {
+                setModels(value);
+                // new-api 平台：以最后选中的模型推断协议 / new-api: infer protocol from the last picked model
+                if (isNewApi && value.length > 0) setModelProtocol(detectNewApiProtocol(value[value.length - 1]));
+              }}
+              value={models}
+              allowCreate
+              placeholder={t('settings.addModelPlaceholder')}
+            ></Select>
+          </div>
+
+          {/* New API 协议选择 / New API Protocol Selection */}
+          {isNewApi && (
+            <div className='space-y-8px'>
+              <div className='text-13px font-500 text-t-secondary'>{t('settings.modelProtocol')}</div>
+              <Select
+                value={modelProtocol}
+                onChange={setModelProtocol}
+                options={NEW_API_PROTOCOL_OPTIONS}
+                triggerProps={{ getPopupContainer: (node) => node.parentElement || document.body }}
+              />
+              <div className='text-11px text-t-secondary leading-4'>{t('settings.modelProtocolTip')}</div>
+            </div>
+          )}
+
+          <div className='space-y-8px'>
+            {/* <div className='text-13px font-500 text-t-secondary'>{t('settings.current_modelsLabel')}</div>
+          {existingModels.length === 0 ? (
+            <div className='text-13px text-t-secondary bg-fill-1 rd-8px px-12px py-14px border border-dashed border-border-2'>{t('settings.addModelNoExisting')}</div>
+          ) : (
+            <div className='flex flex-wrap gap-8px bg-1 rd-8px px-12px py-10px border border-solid border-border-2'>
+              {previewModels.map((item) => (
+                <Tag key={item} bordered color='arcoblue' className='text-12px'>
+                  {item}
+                </Tag>
+              ))}
+              {remainingCount > 0 && <Tag bordered>{t('settings.addModelMoreCount', { count: remainingCount })}</Tag>}
+            </div>
+          )} */}
+          </div>
+
+          {/* <div className='text-12px tet-t-tertiary leading-5 bg-fill-1 rd-8px px-12px py-10px border border-dashed border-border-2'>{t('settings.addModelTips')}</div> */}
+        </div>
+        {/* <div className='text-12px text-t-secondary leading-5 my-4'>{model ? t('settings.addModelSelectedHint', { model }) : t('settings.addModelHint')}</div> */}
+      </BiWorkModal>
+    );
+  }
+);
+
+export default AddModelModal;
