@@ -1,0 +1,17 @@
+{
+  "promptExamplesHint": "Bu talimatları deneyin",
+  "defaultPrompts": {
+    "capabilities": "Benim için neler yapabilirsin?",
+    "skills": "Hangi becerilere sahipsin?",
+    "tools": "Hangi araçlara sahipsin?"
+  },
+  "selectAssistantHint": "Göreve başlamak için bir asistan seçin",
+  "workspace": {
+    "workInProject": "Projede çalış",
+    "optional": "İsteğe bağlı",
+    "clearWorkspace": "Temizle",
+    "specifyWorkspace": "Proje klasörü seç",
+    "searchPlaceholder": "Proje ara…",
+    "noProject": "Proje Yok"
+  }
+}

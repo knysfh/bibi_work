@@ -5,7 +5,7 @@ use axum::{
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -1023,33 +1023,29 @@ async fn write_memory_context_logs(
     run_id: Option<Uuid>,
     source: &str,
 ) -> Result<(), AppError> {
-    if memories.is_empty() {
-        write_memory_access_log(
-            pool,
+    let entries = if memories.is_empty() {
+        vec![MemoryAccessLogEntry {
             tenant_id,
-            None,
+            memory_id: None,
             actor_user_id,
             agent_id,
             run_id,
-            source,
-        )
-        .await?;
-        return Ok(());
-    }
-
-    for memory in memories {
-        write_memory_access_log(
-            pool,
-            tenant_id,
-            Some(memory.memory_id),
-            actor_user_id,
-            agent_id,
-            run_id,
-            source,
-        )
-        .await?;
-    }
-    Ok(())
+            action: source,
+        }]
+    } else {
+        memories
+            .iter()
+            .map(|memory| MemoryAccessLogEntry {
+                tenant_id,
+                memory_id: Some(memory.memory_id),
+                actor_user_id,
+                agent_id,
+                run_id,
+                action: source,
+            })
+            .collect()
+    };
+    write_memory_access_logs(pool, &entries).await
 }
 
 async fn load_memory(pool: &PgPool, memory_id: Uuid) -> Result<MemoryItemResponse, AppError> {
@@ -1175,18 +1171,51 @@ async fn write_memory_read_logs(
     run_id: Option<Uuid>,
     action: &str,
 ) -> Result<(), AppError> {
-    for memory in memories {
-        write_memory_access_log(
-            pool,
-            memory.tenant_id,
-            Some(memory.id),
+    let entries = memories
+        .iter()
+        .map(|memory| MemoryAccessLogEntry {
+            tenant_id: memory.tenant_id,
+            memory_id: Some(memory.id),
             actor_user_id,
-            memory.agent_id,
+            agent_id: memory.agent_id,
             run_id,
             action,
-        )
-        .await?;
+        })
+        .collect::<Vec<_>>();
+    write_memory_access_logs(pool, &entries).await
+}
+
+#[derive(Clone, Copy)]
+struct MemoryAccessLogEntry<'a> {
+    tenant_id: Uuid,
+    memory_id: Option<Uuid>,
+    actor_user_id: Uuid,
+    agent_id: Option<Uuid>,
+    run_id: Option<Uuid>,
+    action: &'a str,
+}
+
+async fn write_memory_access_logs(
+    pool: &PgPool,
+    entries: &[MemoryAccessLogEntry<'_>],
+) -> Result<(), AppError> {
+    if entries.is_empty() {
+        return Ok(());
     }
+
+    let mut query = QueryBuilder::<Postgres>::new(
+        "INSERT INTO memory_access_logs (tenant_id, memory_id, user_id, agent_id, run_id, action) ",
+    );
+    query.push_values(entries, |mut values, entry| {
+        values
+            .push_bind(entry.tenant_id)
+            .push_bind(entry.memory_id)
+            .push_bind(entry.actor_user_id)
+            .push_bind(entry.agent_id)
+            .push_bind(entry.run_id)
+            .push_bind(entry.action);
+    });
+    query.build().execute(pool).await?;
     Ok(())
 }
 
@@ -1199,21 +1228,18 @@ async fn write_memory_access_log(
     run_id: Option<Uuid>,
     action: &str,
 ) -> Result<(), AppError> {
-    sqlx::query(
-        r#"
-        INSERT INTO memory_access_logs (tenant_id, memory_id, user_id, agent_id, run_id, action)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        "#,
+    write_memory_access_logs(
+        pool,
+        &[MemoryAccessLogEntry {
+            tenant_id,
+            memory_id,
+            actor_user_id,
+            agent_id,
+            run_id,
+            action,
+        }],
     )
-    .bind(tenant_id)
-    .bind(memory_id)
-    .bind(actor_user_id)
-    .bind(agent_id)
-    .bind(run_id)
-    .bind(action)
-    .execute(pool)
-    .await?;
-    Ok(())
+    .await
 }
 
 async fn write_memory_access_log_tx(
@@ -1730,6 +1756,53 @@ mod tests {
             normalize_memory_batch_ids(vec![Uuid::new_v4(); MAX_MEMORY_BATCH_DECISION_ITEMS + 1])
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Postgres and the bibi_work schema"]
+    async fn batches_memory_access_logs_in_one_insert() -> Result<(), Box<dyn std::error::Error>> {
+        let state = test_state().await?;
+        let (tenant_id, user_id, _, run_id) = seed_run_context(&state.connect_pool).await?;
+        let entries = [
+            MemoryAccessLogEntry {
+                tenant_id,
+                memory_id: None,
+                actor_user_id: user_id,
+                agent_id: None,
+                run_id: Some(run_id),
+                action: "batch_access_test",
+            },
+            MemoryAccessLogEntry {
+                tenant_id,
+                memory_id: None,
+                actor_user_id: user_id,
+                agent_id: None,
+                run_id: Some(run_id),
+                action: "batch_access_test",
+            },
+        ];
+
+        write_memory_access_logs(&state.connect_pool, &entries).await?;
+
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM memory_access_logs
+            WHERE tenant_id = $1
+              AND user_id = $2
+              AND run_id = $3
+              AND action = 'batch_access_test'
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(run_id)
+        .fetch_one(&state.connect_pool)
+        .await?;
+        assert_eq!(count, 2);
+
+        cleanup_tenant(&state.connect_pool, tenant_id).await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -2381,6 +2454,11 @@ mod tests {
             rustfs_client: RustFsClient::disabled_for_tests(),
             memory_vector_client: MemoryVectorClient::new(memory_vector)?,
             internal_shared_token: "test-internal-token".to_string(),
+            audit_partition_cleanup_enabled: false,
+            secret_resolver:
+                crate::features::agent_platform::secret_resolver::SecretResolver::env_only_for_tests(
+                ),
+            credential_rotation_worker_enabled: false,
         })
     }
 
@@ -2398,6 +2476,7 @@ mod tests {
             roles: Vec::new(),
             session_id: Uuid::new_v4(),
             device_id: Uuid::new_v4(),
+            trace_id: "test-trace".to_string(),
             token_jti: None,
             token_exp: OffsetDateTime::now_utc() + Duration::hours(1),
         }

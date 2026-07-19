@@ -21,6 +21,7 @@ use crate::{
             audit::{self, ArchivedAuditEvidence, NewAuditLog, ToolCallEvidenceInput},
             event_store,
             ferriskey_oidc::PlatformRequestContext,
+            local_runtime_queue, memory_context,
             models::*,
             run_lifecycle,
             run_snapshot::{self, ConversationRunSnapshotRequest},
@@ -33,7 +34,10 @@ use crate::{
     startup::AppState,
 };
 
-use super::{capability_authz, memory_injection, memory_service, support::*, workflow_scheduler};
+use super::{
+    agent_team_service, capability_authz, memory_injection, memory_service, support::*,
+    workflow_scheduler,
+};
 
 pub async fn run_stream(
     State(state): State<AppState>,
@@ -43,12 +47,24 @@ pub async fn run_stream(
     Query(query): Query<EventStreamQuery>,
     Json(payload): Json<CreateRunRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    let after_seq = event_store::resolve_after_seq(&headers, query.after_seq);
+    let _run = create_and_dispatch_conversation_run(&state, &ctx, conversation_id, payload).await?;
+    let events = event_store::fetch_events(&state.connect_pool, conversation_id, after_seq).await?;
+    Ok(event_store::events_to_sse(events))
+}
+
+pub(super) async fn create_and_dispatch_conversation_run(
+    state: &AppState,
+    ctx: &PlatformRequestContext,
+    conversation_id: Uuid,
+    payload: CreateRunRequest,
+) -> Result<RunResponse, AppError> {
     ensure_tenant_member(&state.connect_pool, payload.tenant_id, ctx.platform_user_id).await?;
     let trace_id = Uuid::new_v4().to_string();
     let run_id = Uuid::new_v4();
     let input = payload.input.unwrap_or_else(|| json!({}));
     let conversation_scope =
-        load_conversation_run_scope(&state, payload.tenant_id, conversation_id).await?;
+        load_conversation_run_scope(state, payload.tenant_id, conversation_id).await?;
     let workspace_id = conversation_scope.workspace_id;
     let project_id = resolve_run_project_id(
         payload.project_id,
@@ -61,6 +77,7 @@ pub async fn run_stream(
         .or(conversation_scope.default_agent_id);
     let requested_agent_version_id = payload
         .agent_version_id
+        .or(conversation_scope.agent_version_id)
         .or(conversation_scope.default_agent_version_id);
     let compiled_snapshot = run_snapshot::compile_conversation_run_snapshot(
         &state.connect_pool,
@@ -72,19 +89,26 @@ pub async fn run_stream(
             requested_agent_id,
             agent_version_id: requested_agent_version_id,
             project_id,
+            selected_mcp_server_ids: conversation_scope.selected_mcp_server_ids.clone(),
             thread_id: payload.thread_id.clone(),
             client_snapshot: payload.run_config_snapshot,
-            ctx: &ctx,
+            ctx,
         },
     )
     .await?;
     let resolved_agent_id = compiled_snapshot.agent_id;
     let resolved_agent_version_id = compiled_snapshot.agent_version_id;
     let mut snapshot = compiled_snapshot.snapshot;
+    let runtime_kind = run_snapshot::execution_runtime_kind(&snapshot)?.to_string();
+    if runtime_kind != run_snapshot::PYTHON_RUNTIME_KIND
+        && runtime_kind != run_snapshot::DESKTOP_ACP_RUNTIME_KIND
+    {
+        run_snapshot::ensure_python_dispatch_runtime(&snapshot)?;
+    }
 
     require_ferriskey_allow(
-        &state,
-        &ctx,
+        state,
+        ctx,
         payload.tenant_id,
         "run",
         "conversation",
@@ -99,8 +123,8 @@ pub async fn run_stream(
     .await?;
     if let Some(agent_id) = resolved_agent_id {
         require_ferriskey_allow(
-            &state,
-            &ctx,
+            state,
+            ctx,
             payload.tenant_id,
             "run",
             "agent",
@@ -116,8 +140,8 @@ pub async fn run_stream(
     }
     if let Some(project_id) = project_id {
         require_ferriskey_allow(
-            &state,
-            &ctx,
+            state,
+            ctx,
             payload.tenant_id,
             "use",
             "project",
@@ -133,8 +157,8 @@ pub async fn run_stream(
     }
     if let Some(agent_version_id) = resolved_agent_version_id {
         capability_authz::require_agent_version_capabilities(
-            &state,
-            &ctx,
+            state,
+            ctx,
             payload.tenant_id,
             agent_version_id,
             AuthzContext {
@@ -147,16 +171,11 @@ pub async fn run_stream(
         .await?;
     }
 
-    let after_seq = event_store::resolve_after_seq(&headers, query.after_seq);
-
     if let Some(idempotency_key) = payload.idempotency_key.as_deref()
         && let Some(existing) =
             find_run_by_idempotency(&state.connect_pool, payload.tenant_id, idempotency_key).await?
     {
-        let events =
-            event_store::fetch_events(&state.connect_pool, existing.conversation_id, after_seq)
-                .await?;
-        return Ok(event_store::events_to_sse(events));
+        return Ok(existing);
     }
 
     let mut tx = state.connect_pool.begin().await?;
@@ -213,11 +232,52 @@ pub async fn run_stream(
         .await
         .map_err(|_| AppError::DatabaseTransaction)?;
     for event in &persisted_events {
-        event_store::publish_single_event(&state, event).await;
+        event_store::publish_single_event(state, event).await;
+    }
+
+    if runtime_kind == run_snapshot::DESKTOP_ACP_RUNTIME_KIND {
+        let runtime = snapshot.get("runtime").cloned().ok_or_else(|| {
+            AppError::InvalidInput("desktop ACP runtime config is required".to_string())
+        })?;
+        let queue_result = local_runtime_queue::enqueue(
+            &state.connect_pool,
+            local_runtime_queue::EnqueueLocalRuntimeRequest {
+                tenant_id: payload.tenant_id,
+                device_id: Some(ctx.device_id),
+                project_id,
+                run_id: Some(run.id),
+                command: json!({
+                    "protocol": "biwork_acp.v1",
+                    "kind": run_snapshot::DESKTOP_ACP_RUNTIME_KIND,
+                    "conversation_id": conversation_id,
+                    "run_id": run.id,
+                    "trace_id": run.trace_id.clone(),
+                    "trace_context": crate::telemetry::current_trace_headers(),
+                    "input": input.clone(),
+                    "runtime": runtime
+                }),
+                timeout_ms: 300_000,
+                max_output_bytes: 4 * 1_048_576,
+            },
+        )
+        .await;
+        if let Err(err) = queue_result {
+            run_lifecycle::mark_dispatch_failed(
+                state,
+                payload.tenant_id,
+                conversation_id,
+                run.id,
+                Some(run.trace_id.clone()),
+                &err.to_string(),
+            )
+            .await?;
+            return Err(err);
+        }
+        return Ok(run);
     }
 
     memory_injection::inject_memory_context_for_run(
-        &state,
+        state,
         memory_injection::MemoryInjectionRequest {
             actor: ActorRef {
                 user_id: ctx.platform_user_id,
@@ -236,7 +296,7 @@ pub async fn run_stream(
     .await?;
 
     if let Err(err) = secret_resolver::attach_llm_runtime_credential(
-        &state,
+        state,
         payload.tenant_id,
         run.id,
         &mut snapshot,
@@ -244,7 +304,7 @@ pub async fn run_stream(
     .await
     {
         run_lifecycle::mark_dispatch_failed(
-            &state,
+            state,
             payload.tenant_id,
             conversation_id,
             run.id,
@@ -268,7 +328,7 @@ pub async fn run_stream(
         .await
     {
         run_lifecycle::mark_dispatch_failed(
-            &state,
+            state,
             payload.tenant_id,
             conversation_id,
             run.id,
@@ -279,17 +339,18 @@ pub async fn run_stream(
         return Err(err);
     }
 
-    let events = event_store::fetch_events(&state.connect_pool, conversation_id, after_seq).await?;
-    Ok(event_store::events_to_sse(events))
+    Ok(run)
 }
 
 struct ConversationRunScope {
     workspace_id: Option<Uuid>,
     project_id: Option<Uuid>,
     agent_id: Option<Uuid>,
+    agent_version_id: Option<Uuid>,
     remote_project_id: Option<Uuid>,
     default_agent_id: Option<Uuid>,
     default_agent_version_id: Option<Uuid>,
+    selected_mcp_server_ids: Vec<Uuid>,
 }
 
 async fn load_conversation_run_scope(
@@ -299,9 +360,18 @@ async fn load_conversation_run_scope(
 ) -> Result<ConversationRunScope, AppError> {
     let row = sqlx::query(
         r#"
-        SELECT c.workspace_id, c.project_id, c.agent_id,
+        SELECT c.workspace_id, c.project_id, c.agent_id, c.metadata,
                w.id AS loaded_workspace_id, w.remote_project_id, w.default_agent_id,
-               w.default_agent_version_id
+               w.default_agent_version_id,
+               (
+                   SELECT av.id
+                   FROM agent_versions av
+                   WHERE av.tenant_id = c.tenant_id
+                     AND av.agent_id = c.agent_id
+                     AND av.status = 'published'
+                   ORDER BY av.created_at DESC, av.id DESC
+                   LIMIT 1
+               ) AS latest_agent_version_id
         FROM conversations c
         LEFT JOIN workspaces w
           ON w.id = c.workspace_id
@@ -322,13 +392,122 @@ async fn load_conversation_run_scope(
     if workspace_id.is_some() && loaded_workspace_id.is_none() {
         return Err(AppError::NotFound("workspace not found".to_string()));
     }
+    let metadata: Value = row.try_get("metadata")?;
+    let pinned_agent_version_id = conversation_pinned_agent_version_id(&metadata)?;
+    let latest_agent_version_id: Option<Uuid> = row.try_get("latest_agent_version_id")?;
+    let agent_version_id = resolve_conversation_agent_version(
+        state,
+        tenant_id,
+        conversation_id,
+        pinned_agent_version_id,
+        latest_agent_version_id,
+    )
+    .await?;
+    let selected_mcp_server_ids = conversation_selected_mcp_server_ids(&metadata)?;
     Ok(ConversationRunScope {
         workspace_id,
         project_id: row.try_get("project_id")?,
         agent_id: row.try_get("agent_id")?,
+        agent_version_id,
         remote_project_id: row.try_get("remote_project_id")?,
         default_agent_id: row.try_get("default_agent_id")?,
         default_agent_version_id: row.try_get("default_agent_version_id")?,
+        selected_mcp_server_ids,
+    })
+}
+
+async fn resolve_conversation_agent_version(
+    state: &AppState,
+    tenant_id: Uuid,
+    conversation_id: Uuid,
+    pinned_agent_version_id: Option<Uuid>,
+    latest_agent_version_id: Option<Uuid>,
+) -> Result<Option<Uuid>, AppError> {
+    let Some(pinned_agent_version_id) = pinned_agent_version_id else {
+        return Ok(latest_agent_version_id);
+    };
+    let pinned_is_published: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM agent_versions
+            WHERE id = $1
+              AND tenant_id = $2
+              AND status = 'published'
+        )
+        "#,
+    )
+    .bind(pinned_agent_version_id)
+    .bind(tenant_id)
+    .fetch_one(&state.connect_pool)
+    .await?;
+    if pinned_is_published {
+        return Ok(Some(pinned_agent_version_id));
+    }
+
+    let Some(latest_agent_version_id) = latest_agent_version_id else {
+        return Ok(Some(pinned_agent_version_id));
+    };
+    sqlx::query(
+        r#"
+        UPDATE conversations
+        SET metadata = jsonb_set(
+                metadata,
+                '{biwork,agent_version_id}',
+                to_jsonb($3::text),
+                true
+            ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1
+          AND tenant_id = $2
+          AND deleted_at IS NULL
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(tenant_id)
+    .bind(latest_agent_version_id)
+    .execute(&state.connect_pool)
+    .await?;
+    Ok(Some(latest_agent_version_id))
+}
+
+fn conversation_selected_mcp_server_ids(metadata: &Value) -> Result<Vec<Uuid>, AppError> {
+    let selected = metadata
+        .pointer("/extra/selected_mcp_server_ids")
+        .or_else(|| metadata.pointer("/extra/mcp_server_ids"));
+    let Some(values) = selected else {
+        return Ok(Vec::new());
+    };
+    let values = values.as_array().ok_or_else(|| {
+        AppError::InvalidInput("conversation MCP server ids must be an array".to_string())
+    })?;
+    let mut ids = Vec::with_capacity(values.len());
+    for value in values {
+        let raw = value.as_str().ok_or_else(|| {
+            AppError::InvalidInput("conversation MCP server id must be a UUID".to_string())
+        })?;
+        let id = Uuid::parse_str(raw).map_err(|_| {
+            AppError::InvalidInput("conversation MCP server id must be a UUID".to_string())
+        })?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+fn conversation_pinned_agent_version_id(metadata: &Value) -> Result<Option<Uuid>, AppError> {
+    let Some(value) = metadata.pointer("/biwork/agent_version_id") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let value = value.as_str().ok_or_else(|| {
+        AppError::InvalidInput("conversation agent_version_id must be a UUID".to_string())
+    })?;
+    Uuid::parse_str(value).map(Some).map_err(|_| {
+        AppError::InvalidInput("conversation agent_version_id must be a UUID".to_string())
     })
 }
 
@@ -618,6 +797,12 @@ pub async fn cancel_run(
     };
 
     let updated = run_from_row(row)?;
+    event_store::update_scheduled_job_run_status_from_event(
+        &mut tx,
+        Some(updated.id),
+        "run.cancelled",
+    )
+    .await?;
     let event = event_store::insert_event_tx(
         &mut tx,
         updated.tenant_id,
@@ -630,6 +815,19 @@ pub async fn cancel_run(
             trace_id: Some(updated.trace_id.clone()),
         },
     )
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE local_exec_requests
+        SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
+        WHERE tenant_id = $1
+          AND run_id = $2
+          AND status IN ('queued', 'dispatching')
+        "#,
+    )
+    .bind(updated.tenant_id)
+    .bind(updated.id)
+    .execute(&mut *tx)
     .await?;
 
     tx.commit()
@@ -741,6 +939,19 @@ pub async fn ingest_run_events(
             if event_store::is_run_state_event(&event_type) {
                 event_store::update_run_status_from_event(&mut tx, payload.run_id, &event_type)
                     .await?;
+                inserted.push(inserted_event.clone());
+                inserted.extend(
+                    agent_team_service::apply_team_member_run_state_event_tx(
+                        &mut tx,
+                        payload.tenant_id,
+                        payload.conversation_id,
+                        payload.run_id,
+                        &event_type,
+                        &event_payload,
+                        inserted_event.trace_id.clone(),
+                    )
+                    .await?,
+                );
                 if let Some(workflow_run_id) = update_workflow_node_status_from_run_event(
                     &mut tx,
                     payload.run_id,
@@ -768,7 +979,9 @@ pub async fn ingest_run_events(
                 completed_events.push((payload.run_id, inserted_event.id, event_payload));
             }
 
-            inserted.push(inserted_event);
+            if !event_store::is_run_state_event(&event_type) {
+                inserted.push(inserted_event);
+            }
         }
 
         Ok::<_, AppError>(())
@@ -872,6 +1085,7 @@ pub async fn get_conversation_event_stream(
         tenant_id,
         conversation_id,
         after_seq,
+        ctx,
     ))
 }
 
@@ -908,6 +1122,7 @@ pub async fn get_conversation_ws(
             tenant_id,
             conversation_id,
             after_seq,
+            ctx,
         )
         .await;
     }))
@@ -920,15 +1135,45 @@ const MAX_TOOL_RESULT_FILES: usize = 50;
 const MAX_TOOL_RESULT_PREVIEW_BYTES: usize = 32 * 1024;
 const MAX_TOOL_RESULT_MARKDOWN_CHARS: usize = 4000;
 const MAX_TOOL_RESULT_TITLE_CHARS: usize = 160;
+const MAX_TOOL_SUMMARY_CHARS: usize = 4000;
+const MAX_TOOL_ARGUMENT_DELTA_CHARS: usize = 4096;
+const MAX_TOOL_ARGUMENT_TEXT_CHARS: usize = 16 * 1024;
+const MAX_TOOL_INPUT_SUMMARY_CHARS: usize = 1000;
+const MAX_ARTIFACT_DRAFT_PATH_CHARS: usize = 1024;
+const MAX_ARTIFACT_DRAFT_DELTA_CHARS: usize = 4096;
+const MAX_ARTIFACT_DRAFT_ERROR_CHARS: usize = 1000;
+const MAX_ARTIFACT_DRAFT_PREVIOUS_CHARS: usize = 80 * 1024;
 
 fn sanitize_tool_result_payload(event_type: &str, payload: Value) -> Value {
-    if event_type != "tool.call.completed" {
+    if event_type.starts_with("artifact.draft.") {
+        return sanitize_artifact_draft_payload(event_type, payload);
+    }
+    if event_type == "tool.call.delta" {
+        return sanitize_tool_call_delta_payload(payload);
+    }
+
+    if !matches!(event_type, "tool.call.completed" | "tool.call.failed") {
         return payload;
     }
 
     let Value::Object(mut payload_object) = payload else {
         return json!({});
     };
+    sanitize_tool_terminal_summary(
+        &mut payload_object,
+        if event_type == "tool.call.completed" {
+            "output_summary"
+        } else {
+            "error_summary"
+        },
+    );
+    sanitize_tool_terminal_summary(&mut payload_object, "input_summary");
+    sanitize_tool_terminal_summary(&mut payload_object, "error_type");
+
+    if event_type == "tool.call.failed" {
+        return Value::Object(payload_object);
+    }
+
     let Some(raw_views) = payload_object.remove("views") else {
         return Value::Object(payload_object);
     };
@@ -947,6 +1192,224 @@ fn sanitize_tool_result_payload(event_type: &str, payload: Value) -> Value {
     }
 
     Value::Object(payload_object)
+}
+
+fn sanitize_tool_terminal_summary(payload_object: &mut serde_json::Map<String, Value>, key: &str) {
+    let Some(value) = payload_object.get(key).and_then(Value::as_str) else {
+        return;
+    };
+    let redacted = memory_context::redact_sensitive_text(value);
+    payload_object.insert(
+        key.to_string(),
+        Value::String(truncate_chars(&redacted, MAX_TOOL_SUMMARY_CHARS)),
+    );
+}
+
+fn sanitize_tool_call_delta_payload(payload: Value) -> Value {
+    let Value::Object(payload_object) = payload else {
+        return json!({});
+    };
+    let mut sanitized = serde_json::Map::new();
+
+    for key in [
+        "run_id",
+        "tool_call_id",
+        "tool_name",
+        "name",
+        "status",
+        "subagent_id",
+        "subagent_name",
+        "parent_tool_call_id",
+    ] {
+        if let Some(value) = payload_object.get(key).and_then(Value::as_str) {
+            sanitized.insert(key.to_string(), Value::String(truncate_chars(value, 160)));
+        }
+    }
+    if let Some(value) = payload_object.get("input_summary").and_then(Value::as_str) {
+        sanitized.insert(
+            "input_summary".to_string(),
+            Value::String(truncate_chars(value, MAX_TOOL_INPUT_SUMMARY_CHARS)),
+        );
+    }
+    if let Some(value) = payload_object
+        .get("arguments_delta")
+        .and_then(Value::as_str)
+    {
+        sanitized.insert(
+            "arguments_delta".to_string(),
+            Value::String(truncate_chars(value, MAX_TOOL_ARGUMENT_DELTA_CHARS)),
+        );
+    }
+    if let Some(value) = payload_object.get("arguments_text").and_then(Value::as_str) {
+        sanitized.insert(
+            "arguments_text".to_string(),
+            Value::String(truncate_chars(value, MAX_TOOL_ARGUMENT_TEXT_CHARS)),
+        );
+    }
+    if let Some(value) = payload_object.get("truncated").and_then(Value::as_bool) {
+        sanitized.insert("truncated".to_string(), json!(value));
+    }
+    if let Some(Value::Object(target)) = payload_object.get("target") {
+        let kind = target
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let path = target
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if is_artifact_draft_target_kind(kind) && !path.is_empty() {
+            sanitized.insert(
+                "target".to_string(),
+                json!({
+                    "kind": kind,
+                    "path": truncate_chars(path, MAX_ARTIFACT_DRAFT_PATH_CHARS)
+                }),
+            );
+        }
+    }
+
+    Value::Object(sanitized)
+}
+
+fn sanitize_artifact_draft_payload(event_type: &str, payload: Value) -> Value {
+    let Value::Object(payload_object) = payload else {
+        return json!({});
+    };
+    let mut sanitized = serde_json::Map::new();
+
+    for key in [
+        "draft_id",
+        "run_id",
+        "project_id",
+        "tool_call_id",
+        "tool_name",
+        "args_hash",
+        "operation",
+        "content_type",
+        "format",
+        "mime_type",
+        "content_hash",
+        "object_reference_id",
+        "subagent_id",
+        "subagent_name",
+        "parent_tool_call_id",
+    ] {
+        if let Some(value) = payload_object.get(key).and_then(Value::as_str) {
+            sanitized.insert(key.to_string(), Value::String(truncate_chars(value, 160)));
+        }
+    }
+
+    if let Some(path) = payload_object.get("path").and_then(Value::as_str) {
+        sanitized.insert(
+            "path".to_string(),
+            Value::String(truncate_chars(path, MAX_ARTIFACT_DRAFT_PATH_CHARS)),
+        );
+    }
+    if let Some(renderer) = payload_object.get("renderer").and_then(Value::as_str)
+        && matches!(
+            renderer,
+            "markdown"
+                | "html"
+                | "svg"
+                | "mermaid"
+                | "drawio"
+                | "json"
+                | "text"
+                | "py"
+                | "rs"
+                | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "sql"
+                | "yaml"
+                | "yml"
+        )
+    {
+        sanitized.insert("renderer".to_string(), Value::String(renderer.to_string()));
+    }
+    if let Some(status) = payload_object.get("status").and_then(Value::as_str)
+        && matches!(status, "running" | "completed" | "failed")
+    {
+        sanitized.insert("status".to_string(), Value::String(status.to_string()));
+    }
+    if event_type == "artifact.draft.delta"
+        && let Some(delta) = payload_object.get("delta").and_then(Value::as_str)
+    {
+        sanitized.insert(
+            "delta".to_string(),
+            Value::String(truncate_chars(delta, MAX_ARTIFACT_DRAFT_DELTA_CHARS)),
+        );
+    }
+    if let Some(error_summary) = payload_object.get("error_summary").and_then(Value::as_str) {
+        sanitized.insert(
+            "error_summary".to_string(),
+            Value::String(truncate_chars(
+                error_summary,
+                MAX_ARTIFACT_DRAFT_ERROR_CHARS,
+            )),
+        );
+    }
+    if let Some(previous_preview) = payload_object
+        .get("previous_preview")
+        .and_then(Value::as_str)
+    {
+        sanitized.insert(
+            "previous_preview".to_string(),
+            Value::String(truncate_chars(
+                previous_preview,
+                MAX_ARTIFACT_DRAFT_PREVIOUS_CHARS,
+            )),
+        );
+    }
+    for key in [
+        "chunk_index",
+        "offset",
+        "offset_bytes",
+        "size_bytes",
+        "previous_size_bytes",
+        "preview_size_bytes",
+        "revision",
+    ] {
+        if let Some(value) = payload_object.get(key).and_then(Value::as_i64) {
+            sanitized.insert(key.to_string(), json!(value.max(0)));
+        }
+    }
+    if let Some(value) = payload_object.get("truncated").and_then(Value::as_bool) {
+        sanitized.insert("truncated".to_string(), json!(value));
+    }
+    if let Some(Value::Object(target)) = payload_object.get("target") {
+        let kind = target
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let path = target
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if is_artifact_draft_target_kind(kind) && !path.is_empty() {
+            sanitized.insert(
+                "target".to_string(),
+                json!({
+                    "kind": kind,
+                    "path": truncate_chars(path, MAX_ARTIFACT_DRAFT_PATH_CHARS)
+                }),
+            );
+        }
+    }
+    Value::Object(sanitized)
+}
+
+fn is_artifact_draft_target_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "artifact" | "workspace_file" | "local_file" | "scratch_file"
+    )
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 async fn validate_tool_result_payload_refs_tx(
@@ -1007,13 +1470,15 @@ async fn validate_tool_result_view_refs_tx(
         };
         register_tool_result_artifact_tx(
             tx,
-            tenant_id,
-            run_id.or(artifact.run_id),
-            tool_call_id,
-            &kind,
-            key,
-            &artifact,
-            reference,
+            ToolResultArtifactRegistration {
+                tenant_id,
+                run_id: run_id.or(artifact.run_id),
+                tool_call_id,
+                view_kind: &kind,
+                ref_kind: key,
+                artifact: &artifact,
+                reference,
+            },
         )
         .await?;
     }
@@ -1101,18 +1566,27 @@ async fn tool_result_artifact_info_tx(
     }))
 }
 
-async fn register_tool_result_artifact_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+struct ToolResultArtifactRegistration<'a> {
     tenant_id: Uuid,
     run_id: Option<Uuid>,
     tool_call_id: Option<Uuid>,
-    view_kind: &str,
-    ref_kind: &str,
-    artifact: &ToolResultArtifactInfo,
-    reference: &Value,
+    view_kind: &'a str,
+    ref_kind: &'a str,
+    artifact: &'a ToolResultArtifactInfo,
+    reference: &'a Value,
+}
+
+async fn register_tool_result_artifact_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    registration: ToolResultArtifactRegistration<'_>,
 ) -> Result<(), AppError> {
-    let persisted_tool_call_id =
-        existing_tool_call_id_tx(tx, tenant_id, run_id, tool_call_id).await?;
+    let persisted_tool_call_id = existing_tool_call_id_tx(
+        tx,
+        registration.tenant_id,
+        registration.run_id,
+        registration.tool_call_id,
+    )
+    .await?;
     sqlx::query(
         r#"
         INSERT INTO tool_result_artifacts (
@@ -1129,21 +1603,21 @@ async fn register_tool_result_artifact_tx(
             metadata = EXCLUDED.metadata
         "#,
     )
-    .bind(tenant_id)
-    .bind(run_id)
+    .bind(registration.tenant_id)
+    .bind(registration.run_id)
     .bind(persisted_tool_call_id)
-    .bind(view_kind)
-    .bind(ref_kind)
-    .bind(artifact.project_id)
-    .bind(&artifact.path)
-    .bind(artifact.revision)
-    .bind(artifact.file_revision_id)
-    .bind(artifact.object_reference_id)
-    .bind(&artifact.content_hash)
-    .bind(&artifact.content_type)
-    .bind(artifact.size_bytes)
+    .bind(registration.view_kind)
+    .bind(registration.ref_kind)
+    .bind(registration.artifact.project_id)
+    .bind(&registration.artifact.path)
+    .bind(registration.artifact.revision)
+    .bind(registration.artifact.file_revision_id)
+    .bind(registration.artifact.object_reference_id)
+    .bind(&registration.artifact.content_hash)
+    .bind(&registration.artifact.content_type)
+    .bind(registration.artifact.size_bytes)
     .bind(json!({
-        "artifact_id": reference.get("artifact_id").cloned().unwrap_or(Value::Null)
+        "artifact_id": registration.reference.get("artifact_id").cloned().unwrap_or(Value::Null)
     }))
     .execute(&mut **tx)
     .await?;
@@ -1262,10 +1736,56 @@ fn sanitize_tool_result_view(view: Value) -> Option<Value> {
             let artifact_ref = sanitize_artifact_ref(view_object.get("artifact_ref")?)?;
             sanitized.insert("artifact_ref".to_string(), artifact_ref);
         }
+        "source_list" => {
+            let sources = sanitize_source_list(view_object.get("sources")?)?;
+            sanitized.insert("sources".to_string(), sources);
+            insert_optional_ref(&mut sanitized, &view_object, "data_ref");
+        }
+        "document" => {
+            let text_preview = view_object.get("text_preview")?.as_str()?;
+            sanitized.insert(
+                "text_preview".to_string(),
+                Value::String(
+                    text_preview
+                        .chars()
+                        .take(MAX_TOOL_RESULT_MARKDOWN_CHARS)
+                        .collect(),
+                ),
+            );
+            insert_optional_short_string(&mut sanitized, &view_object, "url", 2048);
+            insert_optional_ref(&mut sanitized, &view_object, "data_ref");
+        }
         _ => return None,
     }
 
     Some(Value::Object(sanitized))
+}
+
+fn sanitize_source_list(sources: &Value) -> Option<Value> {
+    let Value::Array(items) = sources else {
+        return None;
+    };
+    let mut sanitized_items = Vec::new();
+    for item in items.iter().take(MAX_TOOL_RESULT_FILES) {
+        let Value::Object(source) = item else {
+            continue;
+        };
+        let url = source.get("url")?.as_str()?.trim();
+        if url.is_empty() || url.chars().count() > 2048 {
+            continue;
+        }
+        let mut sanitized = serde_json::Map::new();
+        sanitized.insert("url".to_string(), Value::String(url.to_string()));
+        insert_optional_short_string(&mut sanitized, source, "title", 240);
+        insert_optional_short_string(&mut sanitized, source, "snippet", 1000);
+        insert_optional_ref(&mut sanitized, source, "text_ref");
+        sanitized_items.push(Value::Object(sanitized));
+    }
+    if sanitized_items.is_empty() {
+        return None;
+    }
+    let value = Value::Array(sanitized_items);
+    clone_if_small_value(&value, MAX_TOOL_RESULT_PREVIEW_BYTES)
 }
 
 fn sanitize_table_columns(columns: &Value) -> Option<Value> {
@@ -1295,13 +1815,13 @@ fn sanitize_table_columns(columns: &Value) -> Option<Value> {
                 "label",
                 MAX_TOOL_RESULT_TITLE_CHARS,
             );
-            if let Some(column_type) = column.get("type").and_then(Value::as_str) {
-                if matches!(
+            if let Some(column_type) = column.get("type").and_then(Value::as_str)
+                && matches!(
                     column_type,
                     "string" | "number" | "boolean" | "datetime" | "currency"
-                ) {
-                    sanitized.insert("type".to_string(), Value::String(column_type.to_string()));
-                }
+                )
+            {
+                sanitized.insert("type".to_string(), Value::String(column_type.to_string()));
             }
             Some(Value::Object(sanitized))
         })
@@ -1685,6 +2205,55 @@ mod tests {
     };
 
     #[test]
+    fn conversation_mcp_selection_accepts_alias_and_deduplicates_ids() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let metadata = json!({
+            "extra": {
+                "selected_mcp_server_ids": [first, first, second]
+            }
+        });
+
+        assert_eq!(
+            conversation_selected_mcp_server_ids(&metadata).unwrap(),
+            vec![first, second]
+        );
+    }
+
+    #[test]
+    fn conversation_mcp_selection_rejects_non_uuid_values() {
+        let metadata = json!({
+            "extra": {
+                "selected_mcp_server_ids": ["builtin-local-server"]
+            }
+        });
+
+        assert!(conversation_selected_mcp_server_ids(&metadata).is_err());
+    }
+
+    #[test]
+    fn conversation_agent_version_pin_accepts_uuid_and_rejects_corruption() {
+        let version_id = Uuid::new_v4();
+        assert_eq!(
+            conversation_pinned_agent_version_id(&json!({
+                "biwork": { "agent_version_id": version_id.to_string() }
+            }))
+            .unwrap(),
+            Some(version_id)
+        );
+        assert_eq!(
+            conversation_pinned_agent_version_id(&json!({ "biwork": {} })).unwrap(),
+            None
+        );
+        assert!(
+            conversation_pinned_agent_version_id(&json!({
+                "biwork": { "agent_version_id": "not-a-uuid" }
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn tool_call_event_update_extracts_completed_summary() {
         let tool_call_id = Uuid::new_v4();
         let update = tool_call_event_update(
@@ -1745,18 +2314,64 @@ mod tests {
                         "unexpected": "dropped"
                     },
                     {
+                        "kind": "file_diff",
+                        "title": "Patch preview",
+                        "files": [{
+                            "file_name": "report.md",
+                            "file_diff": "--- a/report.md\n+++ b/report.md\n@@\n-old\n+new\n",
+                            "path": "/workspace/report.md"
+                        }]
+                    },
+                    {
+                        "kind": "markdown",
+                        "title": "Summary",
+                        "text": "renderable summary"
+                    },
+                    {
                         "kind": "chart",
                         "spec_kind": "unsupported",
                         "spec": {}
                     },
                     {
                         "kind": "artifact",
+                        "title": "Full result",
                         "artifact_ref": {
                             "artifact_id": "artifact-1",
                             "object_reference_id": Uuid::new_v4(),
                             "content_type": "application/json",
                             "content_hash": "sha256:abc",
                             "size_bytes": 12
+                        }
+                    },
+                    {
+                        "kind": "source_list",
+                        "title": "Web sources",
+                        "sources": [
+                            {
+                                "title": "Example",
+                                "url": "https://example.com",
+                                "snippet": "source snippet",
+                                "text_ref": {
+                                    "artifact_id": "source-text",
+                                    "object_reference_id": Uuid::new_v4(),
+                                    "content_type": "text/plain; charset=utf-8",
+                                    "content_hash": "sha256:def",
+                                    "size_bytes": 128
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "kind": "document",
+                        "title": "Fetched page",
+                        "url": "https://example.com",
+                        "text_preview": "page text",
+                        "data_ref": {
+                            "artifact_id": "source-text",
+                            "object_reference_id": Uuid::new_v4(),
+                            "content_type": "text/plain; charset=utf-8",
+                            "content_hash": "sha256:def",
+                            "size_bytes": 128
                         }
                     }
                 ]
@@ -1767,12 +2382,51 @@ mod tests {
             .get("views")
             .and_then(Value::as_array)
             .expect("views");
-        assert_eq!(views.len(), 2);
+        assert_eq!(views.len(), 6);
         assert_eq!(views[0].get("kind").and_then(Value::as_str), Some("table"));
+        assert_eq!(views[0].get("title").and_then(Value::as_str), Some("Rows"));
         assert!(views[0].get("unexpected").is_none());
         assert_eq!(
             views[1].get("kind").and_then(Value::as_str),
+            Some("file_diff")
+        );
+        assert_eq!(
+            views[1].get("title").and_then(Value::as_str),
+            Some("Patch preview")
+        );
+        assert_eq!(
+            views[1]
+                .pointer("/files/0/file_diff")
+                .and_then(Value::as_str),
+            Some("--- a/report.md\n+++ b/report.md\n@@\n-old\n+new\n")
+        );
+        assert_eq!(
+            views[2].get("kind").and_then(Value::as_str),
+            Some("markdown")
+        );
+        assert_eq!(
+            views[2].get("title").and_then(Value::as_str),
+            Some("Summary")
+        );
+        assert_eq!(
+            views[3].get("kind").and_then(Value::as_str),
             Some("artifact")
+        );
+        assert_eq!(
+            views[3].get("title").and_then(Value::as_str),
+            Some("Full result")
+        );
+        assert_eq!(
+            views[4]
+                .pointer("/sources/0/text_ref/content_hash")
+                .and_then(Value::as_str),
+            Some("sha256:def")
+        );
+        assert_eq!(
+            views[5]
+                .pointer("/data_ref/content_hash")
+                .and_then(Value::as_str),
+            Some("sha256:def")
         );
     }
 
@@ -1792,6 +2446,313 @@ mod tests {
             sanitized.get("output_summary").and_then(Value::as_str),
             Some("ok")
         );
+    }
+
+    #[test]
+    fn sanitize_tool_result_payload_redacts_terminal_summaries() {
+        let failed = sanitize_tool_result_payload(
+            "tool.call.failed",
+            json!({
+                "tool_call_id": Uuid::new_v4(),
+                "tool_name": "call_provider",
+                "error_summary": "provider failed api_key=sk-test authorization: Bearer raw-secret Bearer standalone-secret"
+            }),
+        );
+        let failed_text = failed.to_string();
+
+        assert!(failed_text.contains("api_key=[REDACTED]"));
+        assert!(failed_text.contains("Bearer [REDACTED]"));
+        assert!(!failed_text.contains("sk-test"));
+        assert!(!failed_text.contains("raw-secret"));
+        assert!(!failed_text.contains("standalone-secret"));
+
+        let completed = sanitize_tool_result_payload(
+            "tool.call.completed",
+            json!({
+                "tool_call_id": Uuid::new_v4(),
+                "output_summary": "ok token=plain-secret",
+                "views": []
+            }),
+        );
+        let completed_text = completed.to_string();
+
+        assert!(completed_text.contains("token=[REDACTED]"));
+        assert!(!completed_text.contains("plain-secret"));
+    }
+
+    #[test]
+    fn sanitize_tool_result_payload_caps_artifact_draft_delta() {
+        let sanitized = sanitize_tool_result_payload(
+            "artifact.draft.delta",
+            json!({
+                "draft_id": "draft-1",
+                "run_id": Uuid::new_v4().to_string(),
+                "path": "/local/main/report.md",
+                "format": "markdown",
+                "mime_type": "text/markdown",
+                "renderer": "markdown",
+                "status": "running",
+                "subagent_id": "sub-1",
+                "subagent_name": "writer",
+                "parent_tool_call_id": "call-task",
+                "chunk_index": 2,
+                "offset": 20,
+                "offset_bytes": 20,
+                "preview_size_bytes": 4096,
+                "previous_size_bytes": 8192,
+                "previous_preview": "p".repeat(MAX_ARTIFACT_DRAFT_PREVIOUS_CHARS + 10),
+                "truncated": true,
+                "delta": "x".repeat(MAX_ARTIFACT_DRAFT_DELTA_CHARS + 10),
+                "unsafe": "dropped"
+            }),
+        );
+
+        assert_eq!(
+            sanitized.get("draft_id").and_then(Value::as_str),
+            Some("draft-1")
+        );
+        assert_eq!(
+            sanitized.get("renderer").and_then(Value::as_str),
+            Some("markdown")
+        );
+        assert_eq!(
+            sanitized.get("mime_type").and_then(Value::as_str),
+            Some("text/markdown")
+        );
+        assert_eq!(
+            sanitized.get("subagent_id").and_then(Value::as_str),
+            Some("sub-1")
+        );
+        assert_eq!(
+            sanitized.get("subagent_name").and_then(Value::as_str),
+            Some("writer")
+        );
+        assert_eq!(
+            sanitized.get("parent_tool_call_id").and_then(Value::as_str),
+            Some("call-task")
+        );
+        assert_eq!(sanitized.get("offset").and_then(Value::as_i64), Some(20));
+        assert_eq!(
+            sanitized.get("preview_size_bytes").and_then(Value::as_i64),
+            Some(4096)
+        );
+        assert_eq!(
+            sanitized.get("previous_size_bytes").and_then(Value::as_i64),
+            Some(8192)
+        );
+        assert_eq!(
+            sanitized
+                .get("previous_preview")
+                .and_then(Value::as_str)
+                .unwrap()
+                .len(),
+            MAX_ARTIFACT_DRAFT_PREVIOUS_CHARS
+        );
+        assert_eq!(
+            sanitized.get("truncated").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            sanitized
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap()
+                .len(),
+            MAX_ARTIFACT_DRAFT_DELTA_CHARS
+        );
+        assert!(sanitized.get("unsafe").is_none());
+    }
+
+    #[test]
+    fn sanitize_artifact_draft_payload_keeps_artifact_and_scratch_targets() {
+        let artifact = sanitize_tool_result_payload(
+            "artifact.draft.completed",
+            json!({
+                "draft_id": "draft-artifact",
+                "path": "/artifacts/report.md",
+                "target": {"kind": "artifact", "path": "/artifacts/report.md"},
+                "status": "completed"
+            }),
+        );
+
+        assert_eq!(
+            artifact.pointer("/target/kind").and_then(Value::as_str),
+            Some("artifact")
+        );
+        assert_eq!(
+            artifact.pointer("/target/path").and_then(Value::as_str),
+            Some("/artifacts/report.md")
+        );
+
+        let scratch = sanitize_tool_result_payload(
+            "artifact.draft.started",
+            json!({
+                "draft_id": "draft-scratch",
+                "path": "/scratch/notes.md",
+                "target": {"kind": "scratch_file", "path": "/scratch/notes.md"},
+                "status": "running"
+            }),
+        );
+
+        assert_eq!(
+            scratch.pointer("/target/kind").and_then(Value::as_str),
+            Some("scratch_file")
+        );
+        assert_eq!(
+            scratch.pointer("/target/path").and_then(Value::as_str),
+            Some("/scratch/notes.md")
+        );
+    }
+
+    #[test]
+    fn sanitize_tool_result_payload_caps_tool_call_delta() {
+        let sanitized = sanitize_tool_result_payload(
+            "tool.call.delta",
+            json!({
+                "run_id": Uuid::new_v4().to_string(),
+                "tool_call_id": "call-1",
+                "tool_name": "write_file",
+                "status": "running",
+                "subagent_id": "sub-1",
+                "subagent_name": "writer",
+                "parent_tool_call_id": "call-task",
+                "input_summary": "s".repeat(MAX_TOOL_INPUT_SUMMARY_CHARS + 10),
+                "arguments_delta": "d".repeat(MAX_TOOL_ARGUMENT_DELTA_CHARS + 10),
+                "arguments_text": "t".repeat(MAX_TOOL_ARGUMENT_TEXT_CHARS + 10),
+                "target": {"kind": "local_file", "path": "/local/main/report.md"},
+                "unsafe": "dropped"
+            }),
+        );
+
+        assert_eq!(
+            sanitized.get("tool_call_id").and_then(Value::as_str),
+            Some("call-1")
+        );
+        assert_eq!(
+            sanitized.get("subagent_id").and_then(Value::as_str),
+            Some("sub-1")
+        );
+        assert_eq!(
+            sanitized.get("subagent_name").and_then(Value::as_str),
+            Some("writer")
+        );
+        assert_eq!(
+            sanitized.get("parent_tool_call_id").and_then(Value::as_str),
+            Some("call-task")
+        );
+        assert_eq!(
+            sanitized.pointer("/target/path").and_then(Value::as_str),
+            Some("/local/main/report.md")
+        );
+        assert_eq!(
+            sanitized
+                .get("input_summary")
+                .and_then(Value::as_str)
+                .unwrap()
+                .len(),
+            MAX_TOOL_INPUT_SUMMARY_CHARS
+        );
+        assert_eq!(
+            sanitized
+                .get("arguments_delta")
+                .and_then(Value::as_str)
+                .unwrap()
+                .len(),
+            MAX_TOOL_ARGUMENT_DELTA_CHARS
+        );
+        assert_eq!(
+            sanitized
+                .get("arguments_text")
+                .and_then(Value::as_str)
+                .unwrap()
+                .len(),
+            MAX_TOOL_ARGUMENT_TEXT_CHARS
+        );
+        assert!(sanitized.get("unsafe").is_none());
+    }
+
+    #[test]
+    fn sanitize_tool_call_delta_keeps_artifact_target() {
+        let sanitized = sanitize_tool_result_payload(
+            "tool.call.delta",
+            json!({
+                "tool_call_id": "call-artifact",
+                "tool_name": "write_file",
+                "target": {"kind": "artifact", "path": "/artifacts/report.md"}
+            }),
+        );
+
+        assert_eq!(
+            sanitized.pointer("/target/kind").and_then(Value::as_str),
+            Some("artifact")
+        );
+        assert_eq!(
+            sanitized.pointer("/target/path").and_then(Value::as_str),
+            Some("/artifacts/report.md")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Postgres and the bibi_work schema"]
+    async fn create_conversation_run_denies_agent_version_capability_before_writing_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let state = test_state().await?;
+        let context = seed_conversation_run_capability_context(&state.connect_pool).await?;
+
+        let result = create_and_dispatch_conversation_run(
+            &state,
+            &test_platform_context(context.tenant_id, context.user_id),
+            context.conversation_id,
+            CreateRunRequest {
+                tenant_id: context.tenant_id,
+                agent_id: Some(context.agent_id),
+                agent_version_id: Some(context.agent_version_id),
+                project_id: None,
+                idempotency_key: Some(format!("deny-{}", Uuid::new_v4())),
+                input: Some(json!({"prompt": "must not dispatch"})),
+                run_config_snapshot: None,
+                thread_id: Some(format!("thread-{}", Uuid::new_v4())),
+            },
+        )
+        .await;
+
+        match result {
+            Err(AppError::PermissionDenied(message)) => {
+                assert!(message.contains("resource=skill:"));
+                assert!(message.contains(&context.skill_id.to_string()));
+                assert!(message.contains("policy_explicit_deny"));
+            }
+            other => panic!("expected skill capability denial, got {other:?}"),
+        }
+
+        let run_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM runs
+            WHERE tenant_id = $1 AND conversation_id = $2
+            "#,
+        )
+        .bind(context.tenant_id)
+        .bind(context.conversation_id)
+        .fetch_one(&state.connect_pool)
+        .await?;
+        let run_event_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM run_events
+            WHERE tenant_id = $1 AND conversation_id = $2
+            "#,
+        )
+        .bind(context.tenant_id)
+        .bind(context.conversation_id)
+        .fetch_one(&state.connect_pool)
+        .await?;
+
+        assert_eq!(run_count, 0);
+        assert_eq!(run_event_count, 0);
+
+        cleanup_tenant(&state.connect_pool, context.tenant_id).await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -2086,6 +3047,11 @@ mod tests {
                 worker_max_attempts: 1,
             })?,
             internal_shared_token: "test-internal-token".to_string(),
+            audit_partition_cleanup_enabled: false,
+            secret_resolver:
+                crate::features::agent_platform::secret_resolver::SecretResolver::env_only_for_tests(
+                ),
+            credential_rotation_worker_enabled: false,
         })
     }
 
@@ -2095,6 +3061,242 @@ mod tests {
         conversation_id: Uuid,
         run_id: Uuid,
         tool_call_id: Uuid,
+    }
+
+    struct ConversationRunCapabilityContext {
+        tenant_id: Uuid,
+        user_id: Uuid,
+        conversation_id: Uuid,
+        agent_id: Uuid,
+        agent_version_id: Uuid,
+        skill_id: Uuid,
+    }
+
+    async fn seed_conversation_run_capability_context(
+        pool: &PgPool,
+    ) -> Result<ConversationRunCapabilityContext, sqlx::Error> {
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+
+        sqlx::query("INSERT INTO tenants (id, name, slug) VALUES ($1, $2, $3)")
+            .bind(tenant_id)
+            .bind("Conversation run capability test")
+            .bind(format!("conversation-run-capability-{tenant_id}"))
+            .execute(pool)
+            .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO platform_users (id, tenant_id, ferriskey_subject, username)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .bind(format!("conversation-run-capability-subject-{user_id}"))
+        .bind(format!("conversation-run-capability-user-{user_id}"))
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO user_tenant_memberships (tenant_id, user_id, role)
+            VALUES ($1, $2, 'member')
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+
+        let model_profile_id = seed_run_model_profile(pool, tenant_id).await?;
+        let agent_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO agents (tenant_id, owner_user_id, name, status)
+            VALUES ($1, $2, $3, 'active')
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(format!("conversation-run-agent-{}", Uuid::new_v4()))
+        .fetch_one(pool)
+        .await?;
+        let agent_version_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO agent_versions (
+                tenant_id, agent_id, version_label, config_snapshot, status
+            )
+            VALUES ($1, $2, $3, $4, 'published')
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(agent_id)
+        .bind(format!("v-{}", Uuid::new_v4()))
+        .bind(json!({
+            "model_profile_id": model_profile_id,
+            "agent": {"system_prompt": "capability gated conversation run"}
+        }))
+        .fetch_one(pool)
+        .await?;
+        let skill_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO skills (tenant_id, name, status)
+            VALUES ($1, $2, 'active')
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(format!("conversation-run-skill-{}", Uuid::new_v4()))
+        .fetch_one(pool)
+        .await?;
+        let skill_version_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO skill_versions (tenant_id, skill_id, version_label, status)
+            VALUES ($1, $2, $3, 'published')
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(skill_id)
+        .bind(format!("v-{}", Uuid::new_v4()))
+        .fetch_one(pool)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO agent_version_skill_bindings (agent_version_id, skill_version_id)
+            VALUES ($1, $2)
+            "#,
+        )
+        .bind(agent_version_id)
+        .bind(skill_version_id)
+        .execute(pool)
+        .await?;
+
+        seed_run_policy_binding(
+            pool,
+            tenant_id,
+            user_id,
+            "agent",
+            &agent_id.to_string(),
+            "run",
+            "allow",
+        )
+        .await?;
+        seed_run_policy_binding(
+            pool,
+            tenant_id,
+            user_id,
+            "skill",
+            &skill_id.to_string(),
+            "use",
+            "deny",
+        )
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO conversations (id, tenant_id, created_by_user_id, agent_id, title)
+            VALUES ($1, $2, $3, $4, 'Conversation run capability test')
+            "#,
+        )
+        .bind(conversation_id)
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(agent_id)
+        .execute(pool)
+        .await?;
+
+        Ok(ConversationRunCapabilityContext {
+            tenant_id,
+            user_id,
+            conversation_id,
+            agent_id,
+            agent_version_id,
+            skill_id,
+        })
+    }
+
+    async fn seed_run_model_profile(pool: &PgPool, tenant_id: Uuid) -> Result<Uuid, sqlx::Error> {
+        let suffix = Uuid::new_v4();
+        let provider_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO llm_providers (tenant_id, provider_key, display_name, base_url)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind("test")
+        .bind(format!("Conversation Run Test Provider {suffix}"))
+        .bind("http://localhost:1/v1")
+        .fetch_one(pool)
+        .await?;
+
+        sqlx::query_scalar(
+            r#"
+            INSERT INTO llm_model_profiles (
+                tenant_id, provider_id, profile_name, model_name,
+                max_output_tokens, temperature
+            )
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(provider_id)
+        .bind(format!("conversation-run-profile-{suffix}"))
+        .bind("fake-model")
+        .bind(1024_i64)
+        .bind(0.0_f64)
+        .fetch_one(pool)
+        .await
+    }
+
+    async fn seed_run_policy_binding(
+        pool: &PgPool,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        resource_type: &str,
+        resource_id: &str,
+        action: &str,
+        effect: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO resource_policy_bindings (
+                tenant_id, resource_type, resource_id, action,
+                subject_type, subject_id, effect, created_by_user_id
+            )
+            VALUES ($1, $2, $3, $4, 'user', $5, $6, $7)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(resource_type)
+        .bind(resource_id)
+        .bind(action)
+        .bind(user_id.to_string())
+        .bind(effect)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    fn test_platform_context(tenant_id: Uuid, user_id: Uuid) -> PlatformRequestContext {
+        PlatformRequestContext {
+            tenant_id,
+            platform_user_id: user_id,
+            ferriskey_subject: format!("test-subject-{user_id}"),
+            preferred_username: Some(format!("test-user-{user_id}")),
+            email: None,
+            roles: vec!["tenant_member".to_string()],
+            session_id: Uuid::new_v4(),
+            device_id: Uuid::new_v4(),
+            trace_id: format!("trace-{}", Uuid::new_v4()),
+            token_jti: None,
+            token_exp: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        }
     }
 
     async fn seed_tool_call_context(

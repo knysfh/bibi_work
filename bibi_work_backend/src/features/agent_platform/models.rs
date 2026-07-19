@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -33,6 +33,7 @@ pub struct AuthzContext {
     pub risk_level: Option<String>,
     pub source_ip: Option<String>,
     pub user_agent: Option<String>,
+    pub trace_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -150,7 +151,7 @@ pub struct AuthzBatchCheckResponse {
     pub decisions: Vec<AuthzDecision>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct MeUserResponse {
     pub id: Uuid,
     pub tenant_id: Uuid,
@@ -165,7 +166,7 @@ pub struct MeUserResponse {
     pub updated_at: OffsetDateTime,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct MeTenantResponse {
     pub id: Uuid,
     pub name: String,
@@ -174,7 +175,7 @@ pub struct MeTenantResponse {
     pub metadata: Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct MeDeviceResponse {
     pub id: Uuid,
     pub tenant_id: Uuid,
@@ -187,7 +188,7 @@ pub struct MeDeviceResponse {
     pub revoked_at: Option<OffsetDateTime>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct MeSessionResponse {
     pub id: Uuid,
     pub tenant_id: Uuid,
@@ -202,7 +203,7 @@ pub struct MeSessionResponse {
     pub revoked_at: Option<OffsetDateTime>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct MeResponse {
     pub tenant_id: Uuid,
     pub user: MeUserResponse,
@@ -368,6 +369,35 @@ pub struct CreateLlmCredentialRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RotateLlmCredentialRequest {
+    pub tenant_id: Uuid,
+    pub secret_ref: String,
+    pub secret_hash: Option<String>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateLlmCredentialRotationPolicyRequest {
+    pub tenant_id: Uuid,
+    pub enabled: bool,
+    pub interval_seconds: Option<i64>,
+    pub rotate_before_seconds: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LlmCredentialRotationHealthQuery {
+    pub tenant_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LlmCredentialRotationAttemptQuery {
+    pub tenant_id: Uuid,
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CreateLlmModelProfileRequest {
     pub tenant_id: Uuid,
     pub provider_id: Uuid,
@@ -413,6 +443,7 @@ pub struct PublishVersionRequest {
     pub content_hash: Option<String>,
     pub source_uri: Option<String>,
     pub policy_version: Option<String>,
+    pub secret_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -460,6 +491,7 @@ pub struct AgentVersionCapabilitiesResponse {
     pub config_snapshot: Value,
     pub skills: Vec<CapabilityResourceResponse>,
     pub tools: Vec<CapabilityResourceResponse>,
+    pub sql_tools: Vec<CapabilityResourceResponse>,
     pub mcp_tools: Vec<CapabilityResourceResponse>,
 }
 
@@ -468,6 +500,7 @@ pub struct BindAgentVersionRequest {
     pub tenant_id: Uuid,
     pub skill_version_ids: Option<Vec<Uuid>>,
     pub tool_version_ids: Option<Vec<Uuid>>,
+    pub sql_tool_version_ids: Option<Vec<Uuid>>,
     pub mcp_tool_ids: Option<Vec<Uuid>>,
 }
 
@@ -491,6 +524,58 @@ pub struct AuditHashChainVerifyQuery {
 pub struct AuditHashChainSealRequest {
     pub tenant_id: Uuid,
     pub max_rows: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuditLegalHoldQuery {
+    pub tenant_id: Uuid,
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateAuditLegalHoldRequest {
+    pub tenant_id: Uuid,
+    pub scope_type: String,
+    pub scope_id: Option<String>,
+    pub resource_type: Option<String>,
+    pub reason: String,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReleaseAuditLegalHoldRequest {
+    pub tenant_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuditRetentionEligibilityQuery {
+    pub tenant_id: Uuid,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuditHashBackfillQuery {
+    pub tenant_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuditHashBackfillRequest {
+    pub tenant_id: Uuid,
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuditPartitionCleanupRequest {
+    pub tenant_id: Uuid,
+    pub partition_name: String,
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -545,6 +630,33 @@ pub struct CreateWorkspaceRequest {
     pub metadata: Option<Value>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NullableUuidPatch {
+    #[default]
+    Missing,
+    Clear,
+    Set(Uuid),
+}
+
+impl<'de> Deserialize<'de> for NullableUuidPatch {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match Option::<Uuid>::deserialize(deserializer)? {
+            Some(value) => Self::Set(value),
+            None => Self::Clear,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateWorkspaceRequest {
+    pub tenant_id: Uuid,
+    #[serde(default)]
+    pub remote_project_id: NullableUuidPatch,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateLocalMountRequest {
     pub tenant_id: Uuid,
@@ -568,6 +680,13 @@ pub struct CreateConversationRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct UpdateConversationRequest {
+    pub tenant_id: Uuid,
+    #[serde(default)]
+    pub project_id: NullableUuidPatch,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CreateRunRequest {
     pub tenant_id: Uuid,
     pub agent_id: Option<Uuid>,
@@ -577,6 +696,76 @@ pub struct CreateRunRequest {
     pub input: Option<Value>,
     pub run_config_snapshot: Option<Value>,
     pub thread_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentTeamListQuery {
+    pub tenant_id: Option<Uuid>,
+    pub workspace_id: Option<Uuid>,
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateAgentTeamRequest {
+    pub tenant_id: Uuid,
+    pub workspace_id: Option<Uuid>,
+    pub name: String,
+    pub description: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateAgentTeamRequest {
+    pub tenant_id: Uuid,
+    #[serde(default)]
+    pub workspace_id: NullableUuidPatch,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub status: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateAgentTeamMemberRequest {
+    pub tenant_id: Uuid,
+    pub agent_id: Uuid,
+    pub agent_version_id: Option<Uuid>,
+    pub role: Option<String>,
+    pub display_name: Option<String>,
+    pub slot_order: i32,
+    pub policy_snapshot: Option<Value>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateAgentTeamMemberRequest {
+    pub tenant_id: Uuid,
+    #[serde(default)]
+    pub agent_version_id: NullableUuidPatch,
+    pub role: Option<String>,
+    pub display_name: Option<String>,
+    pub slot_order: Option<i32>,
+    pub status: Option<String>,
+    pub policy_snapshot: Option<Value>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StartAgentTeamRunRequest {
+    pub tenant_id: Uuid,
+    pub conversation_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub input: Option<Value>,
+    pub run_config_snapshot: Option<Value>,
+    pub thread_id: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CancelAgentTeamRunRequest {
+    pub tenant_id: Uuid,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -596,6 +785,172 @@ pub struct RunEventInput {
     pub trace_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunEventKind {
+    RunQueued,
+    RunStarted,
+    RunCompleted,
+    RunFailed,
+    RunCancelled,
+    MessageStarted,
+    MessageDelta,
+    MessageCompleted,
+    ThinkingStarted,
+    ThinkingDelta,
+    ThinkingCompleted,
+    ToolCallRequested,
+    ToolCallAuthorized,
+    ToolCallApprovalRequired,
+    ToolCallStarted,
+    ToolCallDelta,
+    ToolCallCompleted,
+    ToolCallFailed,
+    ApprovalRequested,
+    ApprovalDecided,
+    ArtifactDraftStarted,
+    ArtifactDraftDelta,
+    ArtifactDraftCompleted,
+    ArtifactDraftFailed,
+    FileChanged,
+    TaskCreated,
+    TaskUpdated,
+    TaskCompleted,
+    TaskFailed,
+    SubagentStarted,
+    SubagentMessage,
+    SubagentToolCall,
+    SubagentCompleted,
+    SubagentFailed,
+    WorkflowNodeStarted,
+    WorkflowNodeCompleted,
+    WorkflowNodeFailed,
+    WorkflowNodeBlocked,
+    TeamRunStarted,
+    TeamRunUpdated,
+    TeamRunCompleted,
+    TeamRunFailed,
+    TeamRunCancelled,
+    TeamMemberQueued,
+    TeamMemberStarted,
+    TeamMemberUpdated,
+    TeamMemberBlocked,
+    TeamMemberCompleted,
+    TeamMemberFailed,
+    TeamMemberCancelled,
+    ActivityRaw,
+    LegacyInterruptRequested,
+    LegacyApprovalCompleted,
+    LocalExecCompleted,
+    LocalExecFailed,
+    LegacyToolCallUnknown,
+}
+
+impl RunEventKind {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "run.queued" => Some(Self::RunQueued),
+            "run.started" => Some(Self::RunStarted),
+            "run.completed" => Some(Self::RunCompleted),
+            "run.failed" => Some(Self::RunFailed),
+            "run.cancelled" => Some(Self::RunCancelled),
+            "message.started" => Some(Self::MessageStarted),
+            "message.delta" => Some(Self::MessageDelta),
+            "message.completed" => Some(Self::MessageCompleted),
+            "thinking.started" => Some(Self::ThinkingStarted),
+            "thinking.delta" => Some(Self::ThinkingDelta),
+            "thinking.completed" => Some(Self::ThinkingCompleted),
+            "tool.call.requested" => Some(Self::ToolCallRequested),
+            "tool.call.authorized" => Some(Self::ToolCallAuthorized),
+            "tool.call.approval_required" => Some(Self::ToolCallApprovalRequired),
+            "tool.call.started" => Some(Self::ToolCallStarted),
+            "tool.call.delta" => Some(Self::ToolCallDelta),
+            "tool.call.completed" => Some(Self::ToolCallCompleted),
+            "tool.call.failed" => Some(Self::ToolCallFailed),
+            "approval.requested" => Some(Self::ApprovalRequested),
+            "approval.decided" => Some(Self::ApprovalDecided),
+            "artifact.draft.started" => Some(Self::ArtifactDraftStarted),
+            "artifact.draft.delta" => Some(Self::ArtifactDraftDelta),
+            "artifact.draft.completed" => Some(Self::ArtifactDraftCompleted),
+            "artifact.draft.failed" => Some(Self::ArtifactDraftFailed),
+            "file.changed" => Some(Self::FileChanged),
+            "task.created" => Some(Self::TaskCreated),
+            "task.updated" => Some(Self::TaskUpdated),
+            "task.completed" => Some(Self::TaskCompleted),
+            "task.failed" => Some(Self::TaskFailed),
+            "subagent.started" => Some(Self::SubagentStarted),
+            "subagent.message" => Some(Self::SubagentMessage),
+            "subagent.tool_call" => Some(Self::SubagentToolCall),
+            "subagent.completed" => Some(Self::SubagentCompleted),
+            "subagent.failed" => Some(Self::SubagentFailed),
+            "workflow.node.started" => Some(Self::WorkflowNodeStarted),
+            "workflow.node.completed" => Some(Self::WorkflowNodeCompleted),
+            "workflow.node.failed" => Some(Self::WorkflowNodeFailed),
+            "workflow.node.blocked" => Some(Self::WorkflowNodeBlocked),
+            "team.run.started" => Some(Self::TeamRunStarted),
+            "team.run.updated" => Some(Self::TeamRunUpdated),
+            "team.run.completed" => Some(Self::TeamRunCompleted),
+            "team.run.failed" => Some(Self::TeamRunFailed),
+            "team.run.cancelled" => Some(Self::TeamRunCancelled),
+            "team.member.queued" => Some(Self::TeamMemberQueued),
+            "team.member.started" => Some(Self::TeamMemberStarted),
+            "team.member.updated" => Some(Self::TeamMemberUpdated),
+            "team.member.blocked" => Some(Self::TeamMemberBlocked),
+            "team.member.completed" => Some(Self::TeamMemberCompleted),
+            "team.member.failed" => Some(Self::TeamMemberFailed),
+            "team.member.cancelled" => Some(Self::TeamMemberCancelled),
+            "activity.raw" => Some(Self::ActivityRaw),
+            "interrupt.requested" => Some(Self::LegacyInterruptRequested),
+            "approval.completed" => Some(Self::LegacyApprovalCompleted),
+            "local_exec.completed" => Some(Self::LocalExecCompleted),
+            "local_exec.failed" => Some(Self::LocalExecFailed),
+            "tool.call.unknown" => Some(Self::LegacyToolCallUnknown),
+            _ => None,
+        }
+    }
+
+    pub fn validate_payload(self, payload: &Value) -> Result<(), String> {
+        let Some(object) = payload.as_object() else {
+            return Err("event payload must be a JSON object".to_string());
+        };
+        let required = match self {
+            Self::ToolCallRequested
+            | Self::ToolCallAuthorized
+            | Self::ToolCallApprovalRequired
+            | Self::ToolCallStarted
+            | Self::ToolCallDelta
+            | Self::ToolCallCompleted
+            | Self::ToolCallFailed => &["tool_call_id"][..],
+            Self::ApprovalRequested | Self::ApprovalDecided | Self::LegacyApprovalCompleted => {
+                &["approval_id"][..]
+            }
+            Self::ArtifactDraftStarted
+            | Self::ArtifactDraftDelta
+            | Self::ArtifactDraftCompleted
+            | Self::ArtifactDraftFailed => &["draft_id"][..],
+            Self::FileChanged => &["path"][..],
+            Self::TeamRunStarted
+            | Self::TeamRunUpdated
+            | Self::TeamRunCompleted
+            | Self::TeamRunFailed
+            | Self::TeamRunCancelled => &["team_run_id"][..],
+            Self::TeamMemberQueued
+            | Self::TeamMemberStarted
+            | Self::TeamMemberUpdated
+            | Self::TeamMemberBlocked
+            | Self::TeamMemberCompleted
+            | Self::TeamMemberFailed
+            | Self::TeamMemberCancelled => &["team_run_id", "team_member_id"][..],
+            _ => &[][..],
+        };
+        for key in required {
+            if !object.contains_key(*key) {
+                return Err(format!("event payload missing required field `{key}`"));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct StreamEventResponse {
     pub id: Uuid,
@@ -610,6 +965,478 @@ pub struct StreamEventResponse {
     pub trace_id: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchBootstrapResponse {
+    pub me: MeResponse,
+    pub navigation: WorkbenchNavigation,
+    pub workspaces: Vec<WorkspaceSummary>,
+    pub pinned_workspaces: Vec<WorkspaceSummary>,
+    pub recent_conversations: Vec<ConversationSummary>,
+    pub teams: Vec<AgentTeamSummary>,
+    pub pending_approvals_count: i64,
+    pub running_runs_count: i64,
+    pub device: MeDeviceResponse,
+    pub session: MeSessionResponse,
+    pub feature_flags: WorkbenchFeatureFlags,
+    pub ui_policy: WorkbenchUiPolicy,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchNavigation {
+    pub primary: Vec<String>,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchFeatureFlags {
+    pub teams_enabled: bool,
+    pub global_search_enabled: bool,
+    pub preview_external_open_enabled: bool,
+    pub auth: WorkbenchAuthFeatureFlags,
+    pub runtime: WorkbenchRuntimeFeatureFlags,
+    pub desktop: WorkbenchDesktopFeatureFlags,
+    pub enterprise: WorkbenchEnterpriseFeatureFlags,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchAuthFeatureFlags {
+    pub oidc_required: bool,
+    pub password_login: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchRuntimeFeatureFlags {
+    pub deepagents: bool,
+    pub biwork_cli: bool,
+    pub disabled: bool,
+    pub remote_agent_direct: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchDesktopFeatureFlags {
+    pub gateway_required_for_local_capabilities: bool,
+    pub shell: bool,
+    pub office_preview: bool,
+    pub preview_history: bool,
+    pub local_remote_control: bool,
+    pub cdp_remote_control: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchEnterpriseFeatureFlags {
+    pub assistants: bool,
+    pub providers: bool,
+    pub skills: bool,
+    pub mcp: bool,
+    pub conversations: bool,
+    pub teams: bool,
+    pub cron: bool,
+    pub channel_governance: bool,
+    pub extension_governance: bool,
+}
+
+impl WorkbenchFeatureFlags {
+    pub fn biwork_enterprise_default() -> Self {
+        Self {
+            teams_enabled: true,
+            global_search_enabled: true,
+            preview_external_open_enabled: false,
+            auth: WorkbenchAuthFeatureFlags {
+                oidc_required: true,
+                password_login: false,
+            },
+            runtime: WorkbenchRuntimeFeatureFlags {
+                deepagents: true,
+                biwork_cli: false,
+                disabled: true,
+                remote_agent_direct: false,
+            },
+            desktop: WorkbenchDesktopFeatureFlags {
+                gateway_required_for_local_capabilities: true,
+                shell: true,
+                office_preview: true,
+                preview_history: true,
+                local_remote_control: false,
+                cdp_remote_control: false,
+            },
+            enterprise: WorkbenchEnterpriseFeatureFlags {
+                assistants: true,
+                providers: true,
+                skills: true,
+                mcp: true,
+                conversations: true,
+                teams: true,
+                cron: true,
+                channel_governance: true,
+                extension_governance: true,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchUiPolicy {
+    pub can_create_workspace: bool,
+    pub can_mount_local_folder: bool,
+    pub can_manage_catalog: bool,
+    pub risk_auto_approval: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkspaceSummary {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub name: String,
+    pub status: String,
+    pub trust_state: String,
+    pub remote_project_id: Option<Uuid>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+    pub available_actions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConversationSummary {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub workspace_id: Option<Uuid>,
+    pub project_id: Option<Uuid>,
+    pub title: String,
+    pub status: String,
+    pub latest_run_status: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+    pub unread_activity_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentTeamSummary {
+    pub id: Uuid,
+    pub name: String,
+    pub status: String,
+    pub member_count: i64,
+    pub pending_approvals_count: i64,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentTeamResponse {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub owner_user_id: Option<Uuid>,
+    pub workspace_id: Option<Uuid>,
+    pub name: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub metadata: Value,
+    pub members: Vec<AgentTeamMemberResponse>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+    pub available_actions: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct AgentTeamMemberResponse {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub team_id: Uuid,
+    pub agent_id: Uuid,
+    pub agent_version_id: Option<Uuid>,
+    pub role: String,
+    pub display_name: String,
+    pub slot_order: i32,
+    pub policy_snapshot: Value,
+    pub status: String,
+    pub metadata: Value,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentTeamRunResponse {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub team_id: Uuid,
+    pub conversation_id: Uuid,
+    pub workspace_id: Option<Uuid>,
+    pub project_id: Option<Uuid>,
+    pub status: String,
+    pub trace_id: String,
+    pub thread_id: Option<String>,
+    pub input_snapshot: Value,
+    pub metadata: Value,
+    #[serde(with = "time::serde::rfc3339")]
+    pub queued_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub started_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub completed_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentTeamRunMemberResponse {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub team_run_id: Uuid,
+    pub team_member_id: Option<Uuid>,
+    pub run_id: Option<Uuid>,
+    pub agent_id: Option<Uuid>,
+    pub agent_version_id: Option<Uuid>,
+    pub role: String,
+    pub display_name: String,
+    pub slot_order: i32,
+    pub status: String,
+    pub member_snapshot: Value,
+    pub last_error: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub queued_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub started_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub completed_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentTeamRunDetailResponse {
+    pub team_run: AgentTeamRunResponse,
+    pub team: AgentTeamSummary,
+    pub members: Vec<AgentTeamRunMemberResponse>,
+    pub available_actions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchWorkspaceDetailResponse {
+    pub workspace: WorkspaceSummary,
+    pub local_mounts: Vec<LocalMountSummary>,
+    pub project: Option<ResourceResponse>,
+    pub conversations: Vec<ConversationSummary>,
+    pub available_actions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LocalMountSummary {
+    pub id: Uuid,
+    pub workspace_id: Uuid,
+    pub display_name: String,
+    pub virtual_path: String,
+    pub capabilities: Value,
+    pub trust_state: String,
+    pub status: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchConversationDetailResponse {
+    pub conversation: ConversationSummary,
+    pub workspace: Option<WorkspaceSummary>,
+    pub project: Option<ResourceResponse>,
+    pub latest_run: Option<RunResponse>,
+    pub events: Vec<StreamEventResponse>,
+    pub events_page: WorkbenchEventsPage,
+    pub pending_approvals: Vec<ApprovalResponse>,
+    pub artifacts: Vec<WorkbenchArtifactSummary>,
+    pub file_changes: Vec<WorkbenchFileChangeSummary>,
+    pub tasks: Vec<WorkbenchTaskSummary>,
+    pub subagents: Vec<WorkbenchSubagentSummary>,
+    pub memory_candidates: Vec<WorkbenchMemoryCandidateSummary>,
+    pub available_actions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchEventsPage {
+    pub after_seq: i64,
+    pub last_seq: i64,
+    pub has_more_before: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchArtifactSummary {
+    pub id: Uuid,
+    pub run_id: Option<Uuid>,
+    pub tool_call_id: Option<Uuid>,
+    pub kind: String,
+    pub title: String,
+    pub project_id: Uuid,
+    pub path: String,
+    pub revision: i64,
+    pub object_reference_id: Uuid,
+    pub content_type: String,
+    pub size_bytes: i64,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchFileChangeSummary {
+    pub event_id: String,
+    pub seq: i64,
+    pub project_id: Option<Uuid>,
+    pub path: Option<String>,
+    pub operation: Option<String>,
+    pub revision: Option<i64>,
+    pub reason: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchTaskSummary {
+    pub task_id: String,
+    pub title: String,
+    pub status: String,
+    pub summary: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchSubagentSummary {
+    pub subagent_id: String,
+    pub name: String,
+    pub status: String,
+    pub parent_tool_call_id: Option<String>,
+    pub summary: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchMemoryCandidateSummary {
+    pub id: Uuid,
+    pub layer: String,
+    pub content: String,
+    pub confidence: f64,
+    pub status: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchFileTreeResponse {
+    pub project_id: Uuid,
+    pub prefix: String,
+    pub files: Vec<FileRevisionResponse>,
+    pub entries: Vec<FileEntryResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PreviewDocument {
+    pub id: String,
+    pub title: String,
+    pub kind: String,
+    pub content: Value,
+    pub source: PreviewDocumentSource,
+    pub actions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PreviewDocumentSource {
+    pub project_id: Option<Uuid>,
+    pub path: Option<String>,
+    pub revision: Option<i64>,
+    pub artifact_id: Option<Uuid>,
+    pub object_reference_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchSearchResponse {
+    pub items: Vec<WorkbenchSearchItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchSearchItem {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub subtitle: String,
+    pub matched_text: Option<String>,
+    pub target: WorkbenchSearchTarget,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkbenchSearchTarget {
+    pub route: String,
+    pub conversation_id: Option<Uuid>,
+    pub workspace_id: Option<Uuid>,
+    pub team_id: Option<Uuid>,
+    pub artifact_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkbenchBootstrapQuery {
+    pub tenant_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkbenchWorkspaceDetailQuery {
+    pub tenant_id: Option<Uuid>,
+    pub conversation_limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkbenchConversationDetailQuery {
+    pub tenant_id: Option<Uuid>,
+    pub events_after_seq: Option<i64>,
+    pub events_limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkbenchSearchQuery {
+    pub tenant_id: Option<Uuid>,
+    pub query: Option<String>,
+    pub limit: Option<i64>,
+    pub scope: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkbenchFileTreeQuery {
+    pub tenant_id: Option<Uuid>,
+    pub project_id: Uuid,
+    pub prefix: Option<String>,
+    pub pattern: Option<String>,
+    pub run_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkbenchFilePreviewQuery {
+    pub tenant_id: Option<Uuid>,
+    pub project_id: Option<Uuid>,
+    pub path: Option<String>,
+    pub revision: Option<i64>,
+    pub artifact_id: Option<Uuid>,
+    pub object_reference_id: Option<Uuid>,
+    pub run_id: Option<Uuid>,
+    pub offset_bytes: Option<i64>,
+    pub limit_bytes: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkbenchFileDiffQuery {
+    pub tenant_id: Option<Uuid>,
+    pub project_id: Uuid,
+    pub path: String,
+    pub from_revision: i64,
+    pub to_revision: i64,
+    pub run_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkbenchArtifactPreviewQuery {
+    pub tenant_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -717,6 +1544,8 @@ pub struct VersionResponse {
     pub version_label: String,
     pub snapshot: Value,
     pub policy_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_secret_ref: Option<bool>,
     pub status: String,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -821,6 +1650,7 @@ pub struct ToolAuthorizeRequest {
     pub actor: ActorRef,
     pub conversation_id: Option<Uuid>,
     pub run_id: Option<Uuid>,
+    pub trace_id: Option<String>,
     pub tool_id: Option<Uuid>,
     pub tool_name: String,
     pub resource: Option<ResourceRef>,
@@ -876,6 +1706,8 @@ pub struct FileReadRequest {
     pub run_id: Option<Uuid>,
     pub include_content: Option<bool>,
     pub allow_binary: Option<bool>,
+    pub offset_bytes: Option<i64>,
+    pub limit_bytes: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -894,6 +1726,11 @@ pub struct FileWriteRequest {
     pub reason: String,
     pub run_id: Option<Uuid>,
     pub lock_token: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub args_hash: Option<String>,
+    pub parent_tool_call_id: Option<String>,
+    pub operation: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -945,6 +1782,8 @@ pub struct PublicFileReadQuery {
     pub run_id: Option<Uuid>,
     pub include_content: Option<bool>,
     pub allow_binary: Option<bool>,
+    pub offset_bytes: Option<i64>,
+    pub limit_bytes: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -984,6 +1823,16 @@ pub struct ToolResultArtifactReadQuery {
     pub object_reference_id: Uuid,
     pub offset: Option<i64>,
     pub limit: Option<i64>,
+    pub offset_bytes: Option<i64>,
+    pub limit_bytes: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ToolResultArtifactStreamQuery {
+    pub tenant_id: Uuid,
+    pub object_reference_id: Uuid,
+    pub offset_bytes: Option<i64>,
+    pub limit_bytes: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1044,6 +1893,9 @@ pub struct FileRevisionResponse {
     pub version_id: Option<String>,
     pub inline_content: Option<String>,
     pub content_base64: Option<String>,
+    pub content_offset_bytes: Option<i64>,
+    pub content_limit_bytes: Option<i64>,
+    pub content_truncated: Option<bool>,
     pub size_bytes: i64,
     pub content_type: String,
     pub is_binary: bool,
@@ -1425,9 +2277,14 @@ pub struct LocalExecRequest {
     pub content: Option<String>,
     pub query: Option<String>,
     pub expected_revision: Option<i64>,
+    pub reason: Option<String>,
     pub command: Option<Value>,
     pub timeout_ms: Option<i32>,
     pub max_output_bytes: Option<i32>,
+    pub tool_call_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub args_hash: Option<String>,
+    pub parent_tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1451,6 +2308,7 @@ pub struct LocalExecResponse {
 #[derive(Debug, Deserialize)]
 pub struct LocalExecNextQuery {
     pub tenant_id: Uuid,
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1471,6 +2329,35 @@ pub struct LocalExecCompleteRequest {
     pub status: String,
     pub result: Option<Value>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LocalExecEventsRequest {
+    pub tenant_id: Uuid,
+    pub events: Vec<RunEventInput>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LocalExecStatusResponse {
+    pub id: Uuid,
+    pub status: String,
+    pub run_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LocalExecPermissionRequest {
+    pub tenant_id: Uuid,
+    pub permission_id: String,
+    pub title: String,
+    pub options: Value,
+    pub tool_call: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LocalExecPermissionResponse {
+    pub approval_id: Uuid,
+    pub status: String,
+    pub selected_option_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1534,5 +2421,99 @@ mod tests {
             Value::String("1970-01-01T00:00:00Z".to_string())
         );
         assert_eq!(value["updated_at"], Value::Null);
+    }
+
+    #[test]
+    fn file_write_request_preserves_non_uuid_file_tool_context() {
+        let request: FileWriteRequest = serde_json::from_value(json!({
+            "tenant_id": Uuid::nil(),
+            "actor_user_id": Uuid::nil(),
+            "actor_device_id": null,
+            "actor_session_id": null,
+            "project_id": Uuid::nil(),
+            "path": "/workspace/a.txt",
+            "inline_content": "hello",
+            "expected_revision": 1,
+            "reason": "agent generated file",
+            "run_id": null,
+            "tool_call_id": "call-write",
+            "tool_name": "write_file",
+            "args_hash": "args-sha",
+            "parent_tool_call_id": "call-task",
+            "operation": "write_file"
+        }))
+        .unwrap();
+
+        assert_eq!(request.tool_call_id.as_deref(), Some("call-write"));
+        assert_eq!(request.tool_name.as_deref(), Some("write_file"));
+        assert_eq!(request.args_hash.as_deref(), Some("args-sha"));
+        assert_eq!(request.parent_tool_call_id.as_deref(), Some("call-task"));
+        assert_eq!(request.operation.as_deref(), Some("write_file"));
+    }
+
+    #[test]
+    fn local_exec_request_preserves_file_tool_context_and_reason() {
+        let request: LocalExecRequest = serde_json::from_value(json!({
+            "tenant_id": Uuid::nil(),
+            "actor_user_id": Uuid::nil(),
+            "actor_device_id": Uuid::nil(),
+            "actor_session_id": null,
+            "device_id": Uuid::nil(),
+            "local_mount_id": Uuid::nil(),
+            "project_id": Uuid::nil(),
+            "run_id": Uuid::nil(),
+            "operation": "write_text",
+            "virtual_path": "/local/main/a.txt",
+            "content": "hello",
+            "expected_revision": 2,
+            "reason": "agent local edit",
+            "tool_call_id": "call-local-write",
+            "tool_name": "write_file",
+            "args_hash": "local-args-sha"
+        }))
+        .unwrap();
+
+        assert_eq!(request.reason.as_deref(), Some("agent local edit"));
+        assert_eq!(request.tool_call_id.as_deref(), Some("call-local-write"));
+        assert_eq!(request.tool_name.as_deref(), Some("write_file"));
+        assert_eq!(request.args_hash.as_deref(), Some("local-args-sha"));
+    }
+
+    #[test]
+    fn tool_authorize_request_accepts_trace_id() {
+        let request: ToolAuthorizeRequest = serde_json::from_value(json!({
+            "tenant_id": Uuid::nil(),
+            "actor": {
+                "user_id": Uuid::nil(),
+                "roles": ["tenant_member"]
+            },
+            "conversation_id": null,
+            "run_id": Uuid::nil(),
+            "trace_id": "trace-1",
+            "tool_name": "read_file"
+        }))
+        .unwrap();
+
+        assert_eq!(request.trace_id.as_deref(), Some("trace-1"));
+        assert_eq!(request.tool_name, "read_file");
+    }
+
+    #[test]
+    fn workbench_feature_flags_explicitly_hide_out_of_scope_capabilities() {
+        let value = serde_json::to_value(WorkbenchFeatureFlags::biwork_enterprise_default())
+            .expect("workbench feature flags should serialize");
+
+        assert_eq!(value["runtime"]["deepagents"], true);
+        assert_eq!(value["runtime"]["biwork_cli"], false);
+        assert_eq!(value["runtime"]["remote_agent_direct"], false);
+        assert_eq!(
+            value["desktop"]["gateway_required_for_local_capabilities"],
+            true
+        );
+        assert_eq!(value["desktop"]["local_remote_control"], false);
+        assert_eq!(value["desktop"]["cdp_remote_control"], false);
+        assert_eq!(value["enterprise"]["conversations"], true);
+        assert_eq!(value["enterprise"]["cron"], true);
+        assert_eq!(value["teams_enabled"], true);
     }
 }

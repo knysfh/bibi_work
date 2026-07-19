@@ -2,12 +2,13 @@
 set -Eeuo pipefail
 
 # Bibi Work local service supervisor.
-# Starts: Rust backend, Python agent API, Python agent worker, Tauri desktop.
+# Starts: Rust backend, Python agent API, Python agent worker, Electron desktop.
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 BACKEND_DIR="$PROJECT_ROOT/bibi_work_backend"
 AGENT_DIR="$PROJECT_ROOT/bibi_work_agent"
-FRONTEND_DIR="$PROJECT_ROOT/bibi_work_frontend"
+FRONTEND_DIR="${BIBI_FRONTEND_DIR:-$PROJECT_ROOT/bibi_work_frontend}"
 LOG_DIR="$PROJECT_ROOT/logs"
 PID_DIR="$PROJECT_ROOT/run"
 
@@ -72,6 +73,11 @@ init_env() {
     export VITE_BIBI_WORK_API_BASE_URL="${VITE_BIBI_WORK_API_BASE_URL:-http://127.0.0.1:${APP_APPLICATION__PORT}/api/v1}"
     export VITE_FERRISKEY_CLIENT_ID="${VITE_FERRISKEY_CLIENT_ID:-bibi-work-desktop}"
     export VITE_BIBI_WORK_REDIRECT_URI="${VITE_BIBI_WORK_REDIRECT_URI:-bibi-work://auth/callback}"
+    export BIWORK_BACKEND_MODE="${BIWORK_BACKEND_MODE:-desktop-gateway}"
+    export BIWORK_ENTERPRISE_BACKEND_URL="${BIWORK_ENTERPRISE_BACKEND_URL:-http://127.0.0.1:${APP_APPLICATION__PORT}}"
+    if [ "$(uname -s)" = "Linux" ]; then
+        export BIWORK_DISABLE_HARDWARE_ACCELERATION="${BIWORK_DISABLE_HARDWARE_ACCELERATION:-1}"
+    fi
 }
 
 check_pid() {
@@ -86,7 +92,67 @@ check_pid() {
         return 0
     fi
 
+    local pgid
+    pgid="$(read_recorded_pgid "$pid_file")"
+    if [[ "$pgid" =~ ^[0-9]+$ ]] && kill -0 -- "-$pgid" >/dev/null 2>&1; then
+        return 0
+    fi
+
     return 1
+}
+
+service_health() {
+    local service="$1"
+    case "$service" in
+        backend)
+            curl -fsS --max-time 1 \
+                "http://127.0.0.1:${APP_APPLICATION__PORT}/api/route-ownership" \
+                >/dev/null 2>&1
+            ;;
+        agent-api)
+            curl -fsS --max-time 1 \
+                "http://127.0.0.1:${BIBI_AGENT__PORT}/health" \
+                >/dev/null 2>&1
+            ;;
+        agent-worker)
+            local output
+            output="$({
+                cd "$PROJECT_ROOT"
+                uv run --project "$AGENT_DIR" celery \
+                    -A bibi_work_agent.workers.celery_app:celery_app \
+                    inspect ping --timeout=1
+            } 2>/dev/null || true)"
+            [[ "$output" == *pong* ]]
+            ;;
+        desktop)
+            curl -fsS --max-time 1 \
+                "${BIWORK_LIVE_CDP_URL:-http://127.0.0.1:${BIWORK_CDP_PORT:-9230}}/json/version" \
+                >/dev/null 2>&1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+read_recorded_pgid() {
+    local pid_file="$1"
+    local pgid_file="${pid_file}.pgid"
+    local pgid
+
+    if [ ! -f "$pgid_file" ]; then
+        return 0
+    fi
+
+    pgid="$(cat "$pgid_file" 2>/dev/null || true)"
+    if [[ "$pgid" =~ ^[0-9]+$ ]]; then
+        echo "$pgid"
+    fi
+}
+
+remove_pid_files() {
+    local pid_file="$1"
+    rm -f "$pid_file" "${pid_file}.pgid" "${pid_file}.tmp" "${pid_file}.pgid.tmp"
 }
 
 require_command() {
@@ -170,15 +236,21 @@ start_process() {
     local pid_file="$2"
     local log_file="$3"
     local workdir="$4"
-    shift 4
+    local service="$5"
+    shift 5
 
     if check_pid "$pid_file"; then
         echo "$name already running (PID: $(cat "$pid_file"))"
         return
     fi
 
+    if service_health "$service"; then
+        echo "$name already running (health check passed; recorded PID is not visible)"
+        return
+    fi
+
     if [ -f "$pid_file" ]; then
-        rm -f "$pid_file"
+        remove_pid_files "$pid_file"
     fi
 
     echo "Starting $name..."
@@ -191,24 +263,87 @@ start_process() {
         echo
     } >>"$log_file"
 
+    remove_pid_files "$pid_file"
     (
         cd "$workdir"
         if command -v setsid >/dev/null 2>&1; then
-            exec setsid "$@" </dev/null
+            # Do not record the outer background job's $!: util-linux setsid may
+            # fork when that job is already a process-group leader. The new
+            # session leader records its own stable PID/PGID before exec.
+            exec setsid --fork bash -c '
+                pid_file="$1"
+                shift
+                printf "%s\n" "$$" >"${pid_file}.tmp"
+                mv -f "${pid_file}.tmp" "$pid_file"
+                printf "%s\n" "$$" >"${pid_file}.pgid.tmp"
+                mv -f "${pid_file}.pgid.tmp" "${pid_file}.pgid"
+                exec "$@"
+            ' bash "$pid_file" "$@" </dev/null
         fi
-        exec nohup "$@" </dev/null
+        exec nohup bash -c '
+            pid_file="$1"
+            shift
+            printf "%s\n" "$$" >"${pid_file}.tmp"
+            mv -f "${pid_file}.tmp" "$pid_file"
+            exec "$@"
+        ' bash "$pid_file" "$@" </dev/null
     ) >>"$log_file" 2>&1 &
 
-    echo "$!" >"$pid_file"
+    local i
+    for i in {1..50}; do
+        if check_pid "$pid_file"; then
+            break
+        fi
+        sleep 0.1
+    done
     sleep 1
 
     if check_pid "$pid_file"; then
         echo -e "${GREEN}$name started (PID: $(cat "$pid_file"))${NC}"
+    elif service_health "$service"; then
+        echo -e "${GREEN}$name started (health check passed; PID namespace is not visible)${NC}"
     else
         echo -e "${RED}$name failed to start. See $log_file${NC}"
-        rm -f "$pid_file"
+        remove_pid_files "$pid_file"
         return 1
     fi
+}
+
+wait_for_http_ready() {
+    local name="$1"
+    local url="$2"
+    local timeout_seconds="${3:-90}"
+    local i
+
+    if ! command -v curl >/dev/null 2>&1; then
+        echo -e "${RED}Missing command: curl${NC}" >&2
+        return 1
+    fi
+
+    echo "Waiting for $name to become ready ($url)..."
+    for ((i = 1; i <= timeout_seconds; i++)); do
+        if curl -fsS --max-time 2 "$url" >/dev/null 2>&1; then
+            echo -e "${GREEN}$name is ready${NC}"
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo -e "${RED}$name did not become ready within ${timeout_seconds}s${NC}" >&2
+    return 1
+}
+
+BACKEND_READY_WAITED=0
+
+ensure_backend_ready_once() {
+    if [ "$BACKEND_READY_WAITED" -eq 1 ]; then
+        return 0
+    fi
+    wait_for_http_ready \
+        "Backend" \
+        "http://127.0.0.1:${APP_APPLICATION__PORT}/api/route-ownership" \
+        "${BIBI_SERVICE_START_TIMEOUT:-90}"
+    BACKEND_READY_WAITED=1
 }
 
 collect_descendants() {
@@ -220,9 +355,24 @@ collect_descendants() {
     done
 }
 
+find_desktop_main_pid() {
+    local root_pid="$1"
+    local child_pid
+    local executable
+
+    for child_pid in $(collect_descendants "$root_pid" | sort -n || true); do
+        executable="$(readlink -f "/proc/$child_pid/exe" 2>/dev/null || true)"
+        if [ "${executable##*/}" = "electron" ]; then
+            echo "$child_pid"
+            return 0
+        fi
+    done
+}
+
 stop_process() {
     local name="$1"
     local pid_file="$2"
+    local service="${3:-}"
 
     if [ ! -f "$pid_file" ]; then
         echo "$name stopped (no PID file)"
@@ -230,33 +380,78 @@ stop_process() {
     fi
 
     local pid
+    local pgid
     pid="$(cat "$pid_file" 2>/dev/null || true)"
-    if ! [[ "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" >/dev/null 2>&1; then
+    pgid="$(read_recorded_pgid "$pid_file")"
+
+    local pid_alive=0
+    local group_alive=0
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" >/dev/null 2>&1; then
+        pid_alive=1
+    fi
+    if [[ "$pgid" =~ ^[0-9]+$ ]] && kill -0 -- "-$pgid" >/dev/null 2>&1; then
+        group_alive=1
+    fi
+
+    if [ "$pid_alive" -eq 0 ] && [ "$group_alive" -eq 0 ]; then
+        if [ -n "$service" ] && service_health "$service"; then
+            echo -e "${RED}$name is running, but PID/PGID $pid/$pgid is not signalable from this namespace.${NC}" >&2
+            echo -e "${RED}Refusing to remove its PID files or pretend it stopped.${NC}" >&2
+            return 1
+        fi
         echo "$name process is gone; removing stale PID file"
-        rm -f "$pid_file"
+        remove_pid_files "$pid_file"
         return
     fi
 
-    local descendants
-    descendants="$(collect_descendants "$pid" | sort -u || true)"
+    local descendants=""
+    if [ "$pid_alive" -eq 1 ]; then
+        descendants="$(collect_descendants "$pid" | sort -u || true)"
+    fi
 
-    echo "Stopping $name (PID: $pid)..."
-    kill -TERM "$pid" $descendants >/dev/null 2>&1 || true
+    local graceful_pid=""
+    if [ "$service" = "desktop" ] && [ "$pid_alive" -eq 1 ]; then
+        graceful_pid="$(find_desktop_main_pid "$pid")"
+    fi
+
+    if [ -n "$graceful_pid" ]; then
+        echo "Stopping $name gracefully (Electron PID: $graceful_pid, PGID: $pgid)..."
+        kill -TERM "$graceful_pid" >/dev/null 2>&1 || true
+    elif [ "$group_alive" -eq 1 ]; then
+        echo "Stopping $name (PID: $pid, PGID: $pgid)..."
+        kill -TERM -- "-$pgid" >/dev/null 2>&1 || true
+    elif [ "$pid_alive" -eq 1 ]; then
+        echo "Stopping $name (PID: $pid)..."
+        kill -TERM "$pid" $descendants >/dev/null 2>&1 || true
+    fi
 
     local i
     for i in {1..10}; do
-        if ! kill -0 "$pid" >/dev/null 2>&1; then
+        pid_alive=0
+        group_alive=0
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" >/dev/null 2>&1; then
+            pid_alive=1
+        fi
+        if [[ "$pgid" =~ ^[0-9]+$ ]] && kill -0 -- "-$pgid" >/dev/null 2>&1; then
+            group_alive=1
+        fi
+        if [ "$pid_alive" -eq 0 ] && [ "$group_alive" -eq 0 ]; then
             break
         fi
         sleep 1
     done
 
-    if kill -0 "$pid" >/dev/null 2>&1; then
+    if [ "$pid_alive" -eq 1 ] || [ "$group_alive" -eq 1 ]; then
         echo -e "${YELLOW}$name did not stop cleanly; sending SIGKILL${NC}"
-        kill -KILL "$pid" $descendants >/dev/null 2>&1 || true
+        if [ "$group_alive" -eq 1 ]; then
+            kill -KILL -- "-$pgid" >/dev/null 2>&1 || true
+        fi
+        if [ "$pid_alive" -eq 1 ]; then
+            kill -KILL "$pid" $descendants >/dev/null 2>&1 || true
+        fi
     fi
 
-    rm -f "$pid_file"
+    remove_pid_files "$pid_file"
     echo -e "${GREEN}$name stopped${NC}"
 }
 
@@ -291,17 +486,17 @@ start_one() {
     case "$1" in
         backend)
             require_command cargo
-            start_process "Backend" "$BACKEND_PID_FILE" "$BACKEND_LOG" "$BACKEND_DIR" cargo run
+            start_process "Backend" "$BACKEND_PID_FILE" "$BACKEND_LOG" "$BACKEND_DIR" backend cargo run
             ;;
         agent-api)
             require_command uv
-            start_process "Agent API" "$AGENT_API_PID_FILE" "$AGENT_API_LOG" "$PROJECT_ROOT" \
+            start_process "Agent API" "$AGENT_API_PID_FILE" "$AGENT_API_LOG" "$PROJECT_ROOT" agent-api \
                 uv run --project "$AGENT_DIR" uvicorn bibi_work_agent.main:app \
                 --host 0.0.0.0 --port "$BIBI_AGENT__PORT"
             ;;
         agent-worker)
             require_command uv
-            start_process "Agent Worker" "$AGENT_WORKER_PID_FILE" "$AGENT_WORKER_LOG" "$PROJECT_ROOT" \
+            start_process "Agent Worker" "$AGENT_WORKER_PID_FILE" "$AGENT_WORKER_LOG" "$PROJECT_ROOT" agent-worker \
                 uv run --project "$AGENT_DIR" celery \
                 -A bibi_work_agent.workers.celery_app:celery_app worker \
                 --loglevel="${BIBI_AGENT__CELERY_LOGLEVEL:-info}" \
@@ -309,14 +504,26 @@ start_one() {
                 -n "bibi-work-agent@%h"
             ;;
         desktop)
-            require_command npm
-            start_process "Desktop" "$DESKTOP_PID_FILE" "$DESKTOP_LOG" "$FRONTEND_DIR" npm run tauri:dev
+            require_command bun
+            case "${BIWORK_DESKTOP_MODE:-dev}" in
+                dev)
+                    start_process "Desktop" "$DESKTOP_PID_FILE" "$DESKTOP_LOG" "$FRONTEND_DIR" desktop bun start
+                    ;;
+                preview)
+                    start_process "Desktop Preview" "$DESKTOP_PID_FILE" "$DESKTOP_LOG" "$FRONTEND_DIR" desktop \
+                        bun run start:preview
+                    ;;
+                *)
+                    echo -e "${RED}Unsupported BIWORK_DESKTOP_MODE: ${BIWORK_DESKTOP_MODE}${NC}" >&2
+                    return 1
+                    ;;
+            esac
             ;;
     esac
 }
 
 stop_one() {
-    stop_process "$(service_label "$1")" "$(pid_file_for "$1")"
+    stop_process "$(service_label "$1")" "$(pid_file_for "$1")" "$1"
 }
 
 status_one() {
@@ -328,6 +535,9 @@ status_one() {
 
     if check_pid "$pid_file"; then
         printf "%-14s %bRUNNING%b  PID=%s\n" "$label:" "$GREEN" "$NC" "$(cat "$pid_file")"
+    elif service_health "$service"; then
+        printf "%-14s %bRUNNING%b  PID=%s (healthy; PID namespace unavailable)\n" \
+            "$label:" "$GREEN" "$NC" "$(cat "$pid_file" 2>/dev/null || echo unknown)"
     else
         printf "%-14s %bSTOPPED%b\n" "$label:" "$RED" "$NC"
     fi
@@ -346,7 +556,10 @@ warn_config() {
         echo -e "${YELLOW}Warning: using local default internal token. Override it in .env.local for shared machines.${NC}"
     fi
 
-    if [ -z "${OPENAI_API_KEY:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${GOOGLE_API_KEY:-}" ]; then
+    if [ -z "${OPENAI_API_KEY:-}" ] &&
+        [ -z "${ANTHROPIC_API_KEY:-}" ] &&
+        [ -z "${GOOGLE_API_KEY:-}" ] &&
+        [ -z "${COMPATIBLE_API_KEY:-}" ]; then
         echo -e "${YELLOW}Warning: no common LLM API key env detected. Services can start, but real model runs may fail.${NC}"
     fi
 }
@@ -373,7 +586,7 @@ EOF
 check_commands() {
     require_command cargo
     require_command uv
-    require_command npm
+    require_command bun
     require_command pgrep
     echo -e "${GREEN}Required commands are available.${NC}"
     warn_config
@@ -382,9 +595,16 @@ check_commands() {
 start_app() {
     select_services start "$@"
     warn_config
+    BACKEND_READY_WAITED=0
     local service
     for service in "${SELECTED_SERVICES[@]}"; do
+        if [ "$service" = "desktop" ]; then
+            ensure_backend_ready_once
+        fi
         start_one "$service"
+        if [ "$service" = "backend" ]; then
+            ensure_backend_ready_once
+        fi
     done
 }
 

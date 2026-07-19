@@ -16,13 +16,15 @@ use crate::{
     features::agent_platform::{
         authz::ResourceAuthzService,
         ferriskey_oidc::{
-            FerrisKeyOidcVerifier, ferriskey_access_token_middleware, get_oidc_config,
+            FerrisKeyOidcVerifier, biwork_trace_id_middleware, ferriskey_access_token_middleware,
+            get_oidc_config,
         },
         internal_auth::internal_token_middleware,
         memory_vector::MemoryVectorClient,
         runtime::AgentRuntimeClient,
         rustfs::RustFsClient,
     },
+    telemetry::http_trace_middleware,
 };
 
 pub fn get_redis_client(redis_settings: RedisSettings) -> Client {
@@ -58,11 +60,18 @@ pub struct AppState {
     pub rustfs_client: RustFsClient,
     pub memory_vector_client: MemoryVectorClient,
     pub internal_shared_token: String,
+    pub audit_partition_cleanup_enabled: bool,
+    pub secret_resolver: agent_platform::secret_resolver::SecretResolver,
+    pub credential_rotation_worker_enabled: bool,
 }
 
 impl Application {
     pub async fn build(configuration: Settings) -> Result<Self, anyhow::Error> {
         let audit_hash_chain_settings = configuration.audit_hash_chain.clone();
+        let audit_archive_settings = configuration.audit_archive.clone();
+        let audit_partition_settings = configuration.audit_partition.clone();
+        let credential_rotation_settings = configuration.credential_rotation.clone();
+        let credential_rotation_worker_enabled = credential_rotation_settings.worker_enabled;
         let connect_pool = get_connection_pool(configuration.database);
         let redis_client = get_redis_client(configuration.redis);
         let address = format!(
@@ -80,6 +89,9 @@ impl Application {
             .shared_token
             .expose_secret()
             .to_string();
+        let audit_partition_cleanup_enabled = audit_partition_settings.cleanup_enabled;
+        let secret_resolver =
+            agent_platform::secret_resolver::SecretResolver::new(configuration.secret_resolver)?;
         let share_state = AppState {
             connect_pool,
             redis_client,
@@ -89,12 +101,32 @@ impl Application {
             rustfs_client,
             memory_vector_client,
             internal_shared_token,
+            audit_partition_cleanup_enabled,
+            secret_resolver,
+            credential_rotation_worker_enabled,
         };
         agent_platform::event_store::spawn_outbox_publisher(share_state.clone());
+        agent_platform::file_store::spawn_file_search_backfill_worker(share_state.clone());
         agent_platform::memory_ingestion::spawn_memory_ingestion_worker(share_state.clone());
         agent_platform::audit_sealing::spawn_audit_hash_chain_sealing_worker(
             share_state.clone(),
             audit_hash_chain_settings,
+        );
+        agent_platform::audit_archiving::spawn_audit_archive_worker(
+            share_state.clone(),
+            audit_archive_settings,
+        );
+        agent_platform::audit_governance::spawn_audit_partition_maintenance_worker(
+            share_state.clone(),
+            audit_partition_settings,
+        );
+        agent_platform::credential_rotation::spawn_credential_rotation_worker(
+            share_state.clone(),
+            credential_rotation_settings,
+        );
+        agent_platform::mcp_health::spawn_mcp_health_worker(
+            share_state.clone(),
+            configuration.mcp_health,
         );
 
         let port = listener.local_addr()?.port();
@@ -112,7 +144,8 @@ impl Application {
                 Method::PATCH,
                 Method::DELETE,
             ])
-            .allow_headers([header::AUTHORIZATION, header::ACCEPT, header::CONTENT_TYPE]);
+            .allow_headers([header::AUTHORIZATION, header::ACCEPT, header::CONTENT_TYPE])
+            .expose_headers([header::HeaderName::from_static("x-trace-id")]);
 
         let auth_router = Router::new().route("/oidc/config", get(get_oidc_config));
 
@@ -124,7 +157,20 @@ impl Application {
             .nest("/auth", auth_router)
             .merge(protected_router);
 
+        let biwork_compat_protected_router = agent_platform::biwork_compat_protected_router()
+            .layer(middleware::from_fn_with_state(
+                share_state.clone(),
+                ferriskey_access_token_middleware,
+            ));
+        let biwork_compat_public_router = agent_platform::biwork_compat_public_router()
+            .layer(middleware::from_fn(biwork_trace_id_middleware));
+        let biwork_compat_router = Router::new()
+            .merge(biwork_compat_public_router)
+            .merge(biwork_compat_protected_router);
+
         let router = Router::new()
+            .route("/ws", get(agent_platform::handlers::biwork_global_ws))
+            .nest("/api", biwork_compat_router)
             .nest("/api/v1", api_router)
             .nest(
                 "/internal",
@@ -134,6 +180,7 @@ impl Application {
                 )),
             )
             .layer(cors)
+            .layer(middleware::from_fn(http_trace_middleware))
             .with_state(share_state);
         let server = Server { listener, router };
         Ok(Self { port, server })

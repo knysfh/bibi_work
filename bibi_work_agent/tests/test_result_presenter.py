@@ -63,12 +63,37 @@ def test_normalize_ui_hints_accepts_renderer_aliases() -> None:
     assert normalize_ui_hints({"x-ui-hints": {"view": "data-grid"}}) == {
         "view": "table"
     }
+    assert normalize_ui_hints({"renderer": "file-diff"}) == {"view": "file_diff"}
+    assert normalize_ui_hints({"artifact": True}) == {"view": "artifact"}
+
+
+def test_normalize_ui_hints_preserves_display_title_metadata() -> None:
+    assert normalize_ui_hints(
+        {
+            "title": "Sales details",
+            "x-ui-hints": {"renderer": "data-grid"},
+        }
+    ) == {"view": "table", "title": "Sales details"}
+    assert normalize_ui_hints({"renderer": {"kind": "artifact", "label": "Full output"}}) == {
+        "view": "artifact",
+        "title": "Full output",
+    }
 
 
 def test_build_tool_result_views_falls_back_to_json() -> None:
     views = build_tool_result_views({"status": "ok", "count": 2})
 
     assert views == [{"kind": "json", "value_preview": {"status": "ok", "count": 2}}]
+
+
+def test_build_tool_result_views_applies_ui_title_to_any_view_kind() -> None:
+    views = build_tool_result_views(
+        [{"name": "alice", "score": 3}],
+        ui_hints={"view": "table", "title": "Leaderboard"},
+    )
+
+    assert views[0]["kind"] == "table"
+    assert views[0]["title"] == "Leaderboard"
 
 
 def test_build_tool_result_views_writes_large_table_artifact() -> None:
@@ -122,3 +147,80 @@ def test_build_tool_result_views_maps_geojson_only_with_artifact_writer() -> Non
             "data_preview": geojson,
         }
     ]
+
+
+def test_build_tool_result_views_maps_file_diff_payload() -> None:
+    views = build_tool_result_views(
+        {
+            "path": "/workspace/report.md",
+            "file_diff": "--- a/report.md\n+++ b/report.md\n@@\n-old\n+new\n",
+        },
+        ui_hints={"view": "file_diff"},
+    )
+
+    assert views == [
+        {
+            "kind": "file_diff",
+            "files": [
+                {
+                    "file_diff": "--- a/report.md\n+++ b/report.md\n@@\n-old\n+new\n",
+                    "file_name": "report.md",
+                    "path": "/workspace/report.md",
+                }
+            ],
+        }
+    ]
+
+
+def test_build_tool_result_views_uses_existing_artifact_ref() -> None:
+    views = build_tool_result_views(
+        {
+            "artifact_ref": {
+                "artifact_id": "artifact-1",
+                "object_reference_id": "00000000-0000-0000-0000-000000000001",
+                "content_type": "application/json",
+                "content_hash": "sha256:abc",
+                "size_bytes": 12,
+            }
+        },
+        ui_hints={"view": "artifact", "title": "Full result"},
+    )
+
+    assert views == [
+        {
+            "kind": "artifact",
+            "title": "Full result",
+            "artifact_ref": {
+                "artifact_id": "artifact-1",
+                "object_reference_id": "00000000-0000-0000-0000-000000000001",
+                "content_type": "application/json",
+                "content_hash": "sha256:abc",
+                "size_bytes": 12,
+            },
+        }
+    ]
+
+
+def test_build_tool_result_views_writes_artifact_view_when_requested() -> None:
+    writes: list[dict] = []
+
+    def writer(**payload: str) -> dict:
+        writes.append(payload)
+        return {
+            "artifact_id": "artifact-1",
+            "object_reference_id": "00000000-0000-0000-0000-000000000001",
+            "content_type": payload["content_type"],
+            "content_hash": "sha256:abc",
+            "size_bytes": len(payload["content"]),
+        }
+
+    views = build_tool_result_views(
+        {"items": [1, 2, 3]},
+        artifact_writer=writer,
+        ui_hints={"view": "artifact"},
+    )
+
+    assert views[0]["kind"] == "artifact"
+    assert views[0]["artifact_ref"]["artifact_id"] == "artifact-1"
+    assert writes[0]["content_type"] == "application/json"
+    assert writes[0]["suffix"] == "artifact.json"

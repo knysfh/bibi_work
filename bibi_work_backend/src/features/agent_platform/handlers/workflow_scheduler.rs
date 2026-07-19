@@ -989,6 +989,7 @@ pub(crate) async fn tick_workflow_run(
             },
         )
         .await?;
+        run_snapshot::ensure_python_dispatch_runtime(&snapshot)?;
         let run_scope_snapshot = snapshot
             .get("workspace")
             .cloned()
@@ -1423,12 +1424,25 @@ fn workflow_node_run_from_row(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc};
 
+    use axum::{
+        Json, Router,
+        body::Body,
+        http::header::CONTENT_TYPE,
+        response::{IntoResponse, Response},
+        routing::post,
+    };
     use redis::Client as RedisClient;
     use secrecy::SecretBox;
     use serde_json::json;
     use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+    use tokio::{
+        net::TcpListener,
+        sync::Semaphore,
+        task::JoinHandle,
+        time::{Duration, Instant, sleep, timeout},
+    };
 
     use crate::{
         configuration::{AgentRuntimeSettings, FerrisKeySettings, MemoryVectorSettings},
@@ -1561,6 +1575,226 @@ mod tests {
         assert!(final_tick.dispatched_runs.is_empty());
         assert_eq!(final_tick.workflow_run.status, "completed");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Postgres/Redis plus live Rust backend, Python API, and Celery worker"]
+    async fn scheduler_dispatches_three_node_dag_through_live_python_runtime()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (model_base_url, model_server) = spawn_fake_openai_server().await?;
+        let state = live_runtime_test_state().await?;
+        let (tenant_id, user_id, conversation_id) = seed_context(&state.connect_pool).await?;
+        let first_agent_version_id = seed_live_agent_version(
+            &state.connect_pool,
+            tenant_id,
+            user_id,
+            "live-root",
+            &model_base_url,
+        )
+        .await?;
+        let second_agent_version_id = seed_live_agent_version(
+            &state.connect_pool,
+            tenant_id,
+            user_id,
+            "live-middle",
+            &model_base_url,
+        )
+        .await?;
+        let third_agent_version_id = seed_live_agent_version(
+            &state.connect_pool,
+            tenant_id,
+            user_id,
+            "live-leaf",
+            &model_base_url,
+        )
+        .await?;
+        let workflow_run_id = seed_workflow_run(
+            &state.connect_pool,
+            tenant_id,
+            user_id,
+            conversation_id,
+            json!({
+                "concurrency_limit": 1,
+                "nodes": [
+                    agent_node_with_instruction("a", first_agent_version_id),
+                    agent_node_with_instruction("b", second_agent_version_id),
+                    agent_node_with_instruction("c", third_agent_version_id)
+                ],
+                "edges": [
+                    {"from": "a", "to": "b"},
+                    {"from": "b", "to": "c"}
+                ]
+            }),
+        )
+        .await?;
+
+        let first_tick = tick_workflow_run(&state, workflow_run_id).await?;
+        if first_tick.dispatched_runs.len() != 1 {
+            return Err("first workflow tick did not dispatch exactly one node".into());
+        }
+
+        wait_for_workflow_terminal(&state.connect_pool, workflow_run_id).await?;
+        let workflow_status: String =
+            sqlx::query_scalar("SELECT status FROM workflow_runs WHERE id = $1")
+                .bind(workflow_run_id)
+                .fetch_one(&state.connect_pool)
+                .await?;
+        if workflow_status != "completed" {
+            return Err(format!("workflow finished with status {workflow_status}").into());
+        }
+
+        let rows = sqlx::query(
+            r#"
+            SELECT node_key, status, input, output, agent_run_id
+            FROM workflow_node_runs
+            WHERE workflow_run_id = $1
+            ORDER BY node_key
+            "#,
+        )
+        .bind(workflow_run_id)
+        .fetch_all(&state.connect_pool)
+        .await?;
+        if rows.len() != 3 {
+            return Err(format!("expected 3 node runs, found {}", rows.len()).into());
+        }
+
+        let mut node_inputs = HashMap::new();
+        for row in rows {
+            let node_key: String = row.try_get("node_key")?;
+            let status: String = row.try_get("status")?;
+            let input: Value = row.try_get("input")?;
+            let output: Value = row.try_get("output")?;
+            let agent_run_id: Option<Uuid> = row.try_get("agent_run_id")?;
+            if status != "completed" || agent_run_id.is_none() {
+                return Err(
+                    format!("node {node_key} did not complete through an agent run").into(),
+                );
+            }
+            if !output.to_string().contains("workflow-node-ok") {
+                return Err(
+                    format!("node {node_key} did not persist the Python final result").into(),
+                );
+            }
+            node_inputs.insert(node_key, input);
+        }
+        if node_inputs["b"].pointer("/upstream_outputs/a").is_none()
+            || node_inputs["c"].pointer("/upstream_outputs/b").is_none()
+        {
+            return Err("downstream node input is missing upstream Python output".into());
+        }
+
+        let event_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM run_events e
+            JOIN runs r ON r.id = e.run_id
+            JOIN workflow_node_runs n ON n.agent_run_id = r.id
+            WHERE n.workflow_run_id = $1
+              AND e.type IN ('run.started', 'message.completed', 'run.completed')
+            "#,
+        )
+        .bind(workflow_run_id)
+        .fetch_one(&state.connect_pool)
+        .await?;
+        if event_count < 9 {
+            return Err(format!(
+                "expected at least 9 cross-process run events, found {event_count}"
+            )
+            .into());
+        }
+
+        cleanup_tenant(&state.connect_pool, tenant_id).await?;
+        model_server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Postgres/Redis plus live Rust backend, Python API, and Celery worker"]
+    async fn workflow_cancel_terminates_blocking_python_task_and_worker_recovers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (slow_model_base_url, slow_model_server, slow_request_started) =
+            spawn_fake_openai_server_with_delay(Duration::from_secs(30)).await?;
+        let state = live_runtime_test_state().await?;
+        let (tenant_id, user_id, conversation_id) = seed_context(&state.connect_pool).await?;
+        let slow_agent_version_id = seed_live_agent_version(
+            &state.connect_pool,
+            tenant_id,
+            user_id,
+            "blocking-live",
+            &slow_model_base_url,
+        )
+        .await?;
+        let slow_workflow_run_id = seed_workflow_run(
+            &state.connect_pool,
+            tenant_id,
+            user_id,
+            conversation_id,
+            json!({
+                "nodes": [agent_node_with_instruction("slow", slow_agent_version_id)],
+                "edges": []
+            }),
+        )
+        .await?;
+
+        tick_workflow_run(&state, slow_workflow_run_id).await?;
+        let started_permit = timeout(Duration::from_secs(10), slow_request_started.acquire())
+            .await
+            .map_err(|_| "blocking model request did not start")??;
+        drop(started_permit);
+
+        let cancelled = cancel_workflow_run(
+            State(state.clone()),
+            Extension(test_platform_context(tenant_id, user_id)),
+            Path(slow_workflow_run_id),
+        )
+        .await?
+        .0;
+        if cancelled.status != "cancelled" {
+            return Err("workflow cancel did not reach the Rust terminal state".into());
+        }
+
+        let (quick_model_base_url, quick_model_server) = spawn_fake_openai_server().await?;
+        let quick_agent_version_id = seed_live_agent_version(
+            &state.connect_pool,
+            tenant_id,
+            user_id,
+            "post-cancel-live",
+            &quick_model_base_url,
+        )
+        .await?;
+        let quick_workflow_run_id = seed_workflow_run(
+            &state.connect_pool,
+            tenant_id,
+            user_id,
+            conversation_id,
+            json!({
+                "nodes": [agent_node_with_instruction("quick", quick_agent_version_id)],
+                "edges": []
+            }),
+        )
+        .await?;
+
+        let recovery_started = Instant::now();
+        tick_workflow_run(&state, quick_workflow_run_id).await?;
+        wait_for_workflow_terminal_with_timeout(
+            &state.connect_pool,
+            quick_workflow_run_id,
+            Duration::from_secs(20),
+        )
+        .await?;
+        let quick_status: String =
+            sqlx::query_scalar("SELECT status FROM workflow_runs WHERE id = $1")
+                .bind(quick_workflow_run_id)
+                .fetch_one(&state.connect_pool)
+                .await?;
+        if quick_status != "completed" || recovery_started.elapsed() >= Duration::from_secs(20) {
+            return Err("Celery worker did not recover promptly after hard cancellation".into());
+        }
+
+        cleanup_tenant(&state.connect_pool, tenant_id).await?;
+        slow_model_server.abort();
+        quick_model_server.abort();
         Ok(())
     }
 
@@ -1776,6 +2010,110 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    #[ignore = "requires local Postgres and the bibi_work schema"]
+    async fn create_workflow_run_denies_node_capability_before_writing_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let state = test_state().await?;
+        let (tenant_id, user_id, conversation_id) =
+            seed_context_with_role(&state.connect_pool, "member").await?;
+        let (agent_id, agent_version_id, skill_id) =
+            seed_skill_bound_agent_version(&state.connect_pool, tenant_id, user_id).await?;
+        let workflow_version_id = seed_workflow_version(
+            &state.connect_pool,
+            tenant_id,
+            user_id,
+            json!({
+                "nodes": [agent_node("capability-gated", agent_version_id)],
+                "edges": []
+            }),
+        )
+        .await?;
+
+        seed_policy_binding(
+            &state.connect_pool,
+            tenant_id,
+            user_id,
+            "workflow",
+            &workflow_version_id.to_string(),
+            "run",
+            "allow",
+        )
+        .await?;
+        seed_policy_binding(
+            &state.connect_pool,
+            tenant_id,
+            user_id,
+            "agent",
+            &agent_id.to_string(),
+            "run",
+            "allow",
+        )
+        .await?;
+        seed_policy_binding(
+            &state.connect_pool,
+            tenant_id,
+            user_id,
+            "skill",
+            &skill_id.to_string(),
+            "use",
+            "deny",
+        )
+        .await?;
+
+        let result = create_workflow_run(
+            State(state.clone()),
+            Extension(test_platform_context(tenant_id, user_id)),
+            Json(CreateWorkflowRunRequest {
+                tenant_id,
+                workflow_version_id,
+                conversation_id: Some(conversation_id),
+                project_id: None,
+                input: Some(json!({"prompt": "must not dispatch"})),
+            }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::PermissionDenied(message)) => {
+                assert!(message.contains("resource=skill:"));
+                assert!(message.contains(&skill_id.to_string()));
+                assert!(message.contains("policy_explicit_deny"));
+            }
+            other => panic!("expected skill capability denial, got {other:?}"),
+        }
+
+        let workflow_run_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM workflow_runs
+            WHERE tenant_id = $1 AND workflow_version_id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(workflow_version_id)
+        .fetch_one(&state.connect_pool)
+        .await?;
+        let node_run_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM workflow_node_runs nr
+            JOIN workflow_runs wr ON wr.id = nr.workflow_run_id
+            WHERE wr.tenant_id = $1 AND wr.workflow_version_id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(workflow_version_id)
+        .fetch_one(&state.connect_pool)
+        .await?;
+
+        assert_eq!(workflow_run_count, 0);
+        assert_eq!(node_run_count, 0);
+
+        cleanup_tenant(&state.connect_pool, tenant_id).await?;
+        Ok(())
+    }
+
     async fn test_state() -> Result<AppState, Box<dyn std::error::Error>> {
         let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
             "postgresql://postgres:password@127.0.0.1:5433/bibi_work".to_string()
@@ -1821,6 +2159,11 @@ mod tests {
                 worker_max_attempts: 1,
             })?,
             internal_shared_token: "test-internal-token".to_string(),
+            audit_partition_cleanup_enabled: false,
+            secret_resolver:
+                crate::features::agent_platform::secret_resolver::SecretResolver::env_only_for_tests(
+                ),
+            credential_rotation_worker_enabled: false,
         })
     }
 
@@ -1833,6 +2176,15 @@ mod tests {
             "node_key": node_key,
             "node_type": "agent_task",
             "agent_version_id": agent_version_id
+        })
+    }
+
+    fn agent_node_with_instruction(node_key: &str, agent_version_id: Uuid) -> serde_json::Value {
+        json!({
+            "node_key": node_key,
+            "node_type": "agent_task",
+            "agent_version_id": agent_version_id,
+            "instruction": format!("Complete workflow node {node_key} and return a short result.")
         })
     }
 
@@ -1853,6 +2205,13 @@ mod tests {
     }
 
     async fn seed_context(pool: &PgPool) -> Result<(Uuid, Uuid, Uuid), sqlx::Error> {
+        seed_context_with_role(pool, "admin").await
+    }
+
+    async fn seed_context_with_role(
+        pool: &PgPool,
+        role: &str,
+    ) -> Result<(Uuid, Uuid, Uuid), sqlx::Error> {
         let suffix = Uuid::new_v4();
         let tenant_id: Uuid = sqlx::query_scalar(
             r#"
@@ -1882,11 +2241,12 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO user_tenant_memberships (tenant_id, user_id, role)
-            VALUES ($1, $2, 'admin')
+            VALUES ($1, $2, $3)
             "#,
         )
         .bind(tenant_id)
         .bind(user_id)
+        .bind(role)
         .execute(pool)
         .await?;
 
@@ -1903,6 +2263,22 @@ mod tests {
         .await?;
 
         Ok((tenant_id, user_id, conversation_id))
+    }
+
+    fn test_platform_context(tenant_id: Uuid, user_id: Uuid) -> PlatformRequestContext {
+        PlatformRequestContext {
+            tenant_id,
+            platform_user_id: user_id,
+            ferriskey_subject: format!("test-subject-{user_id}"),
+            preferred_username: Some(format!("test-user-{user_id}")),
+            email: None,
+            roles: vec!["tenant_member".to_string()],
+            session_id: Uuid::new_v4(),
+            device_id: Uuid::new_v4(),
+            trace_id: format!("trace-{}", Uuid::new_v4()),
+            token_jti: None,
+            token_exp: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        }
     }
 
     async fn cleanup_tenant(pool: &PgPool, tenant_id: Uuid) -> Result<(), sqlx::Error> {
@@ -1954,6 +2330,291 @@ mod tests {
         }))
         .fetch_one(pool)
         .await
+    }
+
+    async fn seed_live_agent_version(
+        pool: &PgPool,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        name: &str,
+        model_base_url: &str,
+    ) -> Result<Uuid, sqlx::Error> {
+        let suffix = Uuid::new_v4();
+        let provider_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO llm_providers (
+                tenant_id, provider_key, display_name, base_url, auth_scheme
+            )
+            VALUES ($1, 'openai-compatible', $2, $3, 'none')
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(format!("Live Workflow Provider {suffix}"))
+        .bind(model_base_url)
+        .fetch_one(pool)
+        .await?;
+        let model_profile_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO llm_model_profiles (
+                tenant_id, provider_id, profile_name, model_name,
+                max_output_tokens, temperature
+            )
+            VALUES ($1, $2, $3, 'workflow-fake-model', 128, 0)
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(provider_id)
+        .bind(format!("live-workflow-profile-{suffix}"))
+        .fetch_one(pool)
+        .await?;
+        let agent_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO agents (tenant_id, owner_user_id, name, status)
+            VALUES ($1, $2, $3, 'active')
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(format!("{name}-{suffix}"))
+        .fetch_one(pool)
+        .await?;
+
+        sqlx::query_scalar(
+            r#"
+            INSERT INTO agent_versions (
+                tenant_id, agent_id, version_label, config_snapshot, status
+            )
+            VALUES ($1, $2, $3, $4, 'published')
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(agent_id)
+        .bind(format!("live-v-{suffix}"))
+        .bind(json!({
+            "model_profile_id": model_profile_id,
+            "agent": {"system_prompt": format!("workflow live test agent {name}")}
+        }))
+        .fetch_one(pool)
+        .await
+    }
+
+    async fn live_runtime_test_state() -> Result<AppState, Box<dyn std::error::Error>> {
+        let mut state = test_state().await?;
+        let base_url = std::env::var("AGENT_RUNTIME_BASE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8371".to_string());
+        let shared_token = std::env::var("BIBI_WORK_INTERNAL_TOKEN")
+            .unwrap_or_else(|_| "local-internal-token".to_string());
+        state.agent_runtime_client = AgentRuntimeClient::new(AgentRuntimeSettings {
+            base_url: Some(base_url),
+            shared_token: secret(&shared_token),
+            timeout_milliseconds: 5_000,
+        })?;
+        state.internal_shared_token = shared_token;
+        Ok(state)
+    }
+
+    async fn spawn_fake_openai_server()
+    -> Result<(String, JoinHandle<()>), Box<dyn std::error::Error>> {
+        let (base_url, server, _) = spawn_fake_openai_server_with_delay(Duration::ZERO).await?;
+        Ok((base_url, server))
+    }
+
+    #[derive(Clone)]
+    struct FakeOpenAiState {
+        delay: Duration,
+        request_started: Arc<Semaphore>,
+    }
+
+    async fn spawn_fake_openai_server_with_delay(
+        delay: Duration,
+    ) -> Result<(String, JoinHandle<()>, Arc<Semaphore>), Box<dyn std::error::Error>> {
+        async fn chat_completions(
+            axum::extract::State(state): axum::extract::State<FakeOpenAiState>,
+            Json(request): Json<Value>,
+        ) -> Response {
+            state.request_started.add_permits(1);
+            if !state.delay.is_zero() {
+                sleep(state.delay).await;
+            }
+            if request.get("stream").and_then(Value::as_bool) == Some(true) {
+                let first = json!({
+                    "id": format!("chatcmpl-{}", Uuid::new_v4()),
+                    "object": "chat.completion.chunk",
+                    "created": 1_751_900_000,
+                    "model": "workflow-fake-model",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": "workflow-node-ok"},
+                        "finish_reason": Value::Null
+                    }]
+                });
+                let final_chunk = json!({
+                    "id": format!("chatcmpl-{}", Uuid::new_v4()),
+                    "object": "chat.completion.chunk",
+                    "created": 1_751_900_000,
+                    "model": "workflow-fake-model",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }]
+                });
+                return Response::builder()
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(format!(
+                        "data: {first}\n\ndata: {final_chunk}\n\ndata: [DONE]\n\n"
+                    )))
+                    .expect("fake OpenAI streaming response");
+            }
+
+            Json(json!({
+                "id": format!("chatcmpl-{}", Uuid::new_v4()),
+                "object": "chat.completion",
+                "created": 1_751_900_000,
+                "model": "workflow-fake-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "workflow-node-ok"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2
+                }
+            }))
+            .into_response()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let request_started = Arc::new(Semaphore::new(0));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(FakeOpenAiState {
+                delay,
+                request_started: request_started.clone(),
+            });
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok((format!("http://{address}/v1"), server, request_started))
+    }
+
+    async fn wait_for_workflow_terminal(
+        pool: &PgPool,
+        workflow_run_id: Uuid,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        wait_for_workflow_terminal_with_timeout(pool, workflow_run_id, Duration::from_secs(60))
+            .await
+    }
+
+    async fn wait_for_workflow_terminal_with_timeout(
+        pool: &PgPool,
+        workflow_run_id: Uuid,
+        wait_timeout: Duration,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let deadline = Instant::now() + wait_timeout;
+        loop {
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM workflow_runs WHERE id = $1")
+                    .bind(workflow_run_id)
+                    .fetch_one(pool)
+                    .await?;
+            if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let statuses = node_statuses(pool, workflow_run_id).await?;
+                return Err(format!(
+                    "workflow did not reach terminal state; workflow={status}, nodes={statuses:?}"
+                )
+                .into());
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn seed_skill_bound_agent_version(
+        pool: &PgPool,
+        tenant_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(Uuid, Uuid, Uuid), sqlx::Error> {
+        let agent_version_id = seed_agent_version(pool, tenant_id, user_id, "skill-bound").await?;
+        let agent_id = agent_id_for_version(pool, agent_version_id).await?;
+        let suffix = Uuid::new_v4();
+        let skill_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO skills (tenant_id, name, status)
+            VALUES ($1, $2, 'active')
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(format!("workflow-capability-skill-{suffix}"))
+        .fetch_one(pool)
+        .await?;
+        let skill_version_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO skill_versions (tenant_id, skill_id, version_label, status)
+            VALUES ($1, $2, $3, 'published')
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(skill_id)
+        .bind(format!("v-{suffix}"))
+        .fetch_one(pool)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO agent_version_skill_bindings (agent_version_id, skill_version_id)
+            VALUES ($1, $2)
+            "#,
+        )
+        .bind(agent_version_id)
+        .bind(skill_version_id)
+        .execute(pool)
+        .await?;
+
+        Ok((agent_id, agent_version_id, skill_id))
+    }
+
+    async fn seed_policy_binding(
+        pool: &PgPool,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        resource_type: &str,
+        resource_id: &str,
+        action: &str,
+        effect: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO resource_policy_bindings (
+                tenant_id, resource_type, resource_id, action,
+                subject_type, subject_id, effect, created_by_user_id
+            )
+            VALUES ($1, $2, $3, $4, 'user', $5, $6, $7)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(resource_type)
+        .bind(resource_id)
+        .bind(action)
+        .bind(user_id.to_string())
+        .bind(effect)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+        Ok(())
     }
 
     async fn agent_id_for_version(
@@ -2132,6 +2793,45 @@ mod tests {
         }
 
         Ok(workflow_run_id)
+    }
+
+    async fn seed_workflow_version(
+        pool: &PgPool,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        compiled_plan: serde_json::Value,
+    ) -> Result<Uuid, Box<dyn std::error::Error>> {
+        let compiled_plan = workflow_compile::compile_plan(pool, tenant_id, &compiled_plan).await?;
+        let workflow_design_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO workflow_designs (tenant_id, owner_user_id, name, design)
+            VALUES ($1, $2, $3, '{}'::jsonb)
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(format!("workflow-{}", Uuid::new_v4()))
+        .fetch_one(pool)
+        .await?;
+
+        let workflow_version_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO workflow_versions (
+                tenant_id, workflow_design_id, version_label, compiled_plan, status
+            )
+            VALUES ($1, $2, $3, $4, 'published')
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(workflow_design_id)
+        .bind(format!("v-{}", Uuid::new_v4()))
+        .bind(&compiled_plan)
+        .fetch_one(pool)
+        .await?;
+
+        Ok(workflow_version_id)
     }
 
     async fn run_snapshot(pool: &PgPool, run_id: Uuid) -> Result<serde_json::Value, sqlx::Error> {

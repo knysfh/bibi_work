@@ -16,6 +16,13 @@ pub async fn get_me(
     State(state): State<AppState>,
     Extension(ctx): Extension<PlatformRequestContext>,
 ) -> Result<Json<MeResponse>, AppError> {
+    Ok(Json(load_current_me(&state, &ctx).await?))
+}
+
+pub(super) async fn load_current_me(
+    state: &AppState,
+    ctx: &PlatformRequestContext,
+) -> Result<MeResponse, AppError> {
     let user_row = sqlx::query(
         r#"
         SELECT id, tenant_id, ferriskey_subject, username, email, display_name,
@@ -98,7 +105,7 @@ pub async fn get_me(
         })
         .collect::<Result<Vec<_>, AppError>>()?;
 
-    Ok(Json(MeResponse {
+    Ok(MeResponse {
         tenant_id: ctx.tenant_id,
         user: MeUserResponse {
             id: user_row.try_get("id")?,
@@ -133,7 +140,7 @@ pub async fn get_me(
             user_agent: session_row.try_get("user_agent")?,
             revoked_at: session_row.try_get("revoked_at")?,
         },
-    }))
+    })
 }
 
 fn effective_roles_for_membership(roles: &[String], membership_role: Option<&str>) -> Vec<String> {

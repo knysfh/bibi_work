@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -19,6 +20,8 @@ DEFAULT_MAX_OUTPUT_BYTES = 1_048_576
 INPUT_SUMMARY_CHARS = 500
 OUTPUT_SUMMARY_CHARS = 1_000
 REDACTED = "[REDACTED]"
+BEARER_TOKEN_PATTERN = re.compile(r"(?i)\b(bearer\s+)[a-z0-9._\-+/=]+")
+AUTH_SCHEMES = {"bearer", "basic", "token", "apikey", "api-key"}
 
 
 def summarize_input(value: Any, *, redact_fields: Sequence[str] | None = None) -> str:
@@ -105,12 +108,39 @@ def redact_inline_secret(text: str, *, redact_fields: Sequence[str]) -> str:
                 redacted = redacted[:value_start] + REDACTED + redacted[value_end:]
                 lower = redacted.lower()
                 start = lower.find(marker, value_start + len(REDACTED))
-    return redacted
+    return BEARER_TOKEN_PATTERN.sub(r"\1" + REDACTED, redacted)
 
 
 def _secret_value_end(text: str, start: int) -> int:
     while start < len(text) and text[start] in {" ", "'", '"'}:
         start += 1
+    scheme_end = start
+    while scheme_end < len(text) and (
+        text[scheme_end].isalnum() or text[scheme_end] in {"-", "_"}
+    ):
+        scheme_end += 1
+    if (
+        text[start:scheme_end].lower() in AUTH_SCHEMES
+        and scheme_end < len(text)
+        and text[scheme_end].isspace()
+    ):
+        token_start = scheme_end
+        while token_start < len(text) and text[token_start].isspace():
+            token_start += 1
+        token_end = token_start
+        while token_end < len(text) and text[token_end] not in {
+            " ",
+            "\n",
+            "\r",
+            "\t",
+            ",",
+            "}",
+            "]",
+            "'",
+            '"',
+        }:
+            token_end += 1
+        return token_end
     end = start
     while end < len(text) and text[end] not in {
         " ",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from bibi_work_agent.tools.io_policy import (
     apply_output_policy,
+    redact_inline_secret,
     summarize_input,
     summarize_output,
 )
@@ -22,6 +23,18 @@ def test_summarize_input_redacts_nested_secrets() -> None:
     assert "secret-token" not in summary
     assert "[REDACTED]" in summary
     assert "/workspace/a.txt" in summary
+
+
+def test_redact_inline_secret_redacts_authorization_bearer_values() -> None:
+    redacted = redact_inline_secret(
+        "provider failed authorization: Bearer raw-secret Bearer standalone-secret",
+        redact_fields=("authorization", "token", "secret", "bearer"),
+    )
+
+    assert "raw-secret" not in redacted
+    assert "standalone-secret" not in redacted
+    assert "authorization:[REDACTED]" in redacted
+    assert "Bearer [REDACTED]" in redacted
 
 
 def test_apply_output_policy_redacts_structured_values() -> None:

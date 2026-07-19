@@ -1,8 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{ops::Range, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use object_store::{
-    GetOptions, ObjectStore,
+    GetOptions, GetRange, GetResult, ObjectStore,
     aws::{AmazonS3, AmazonS3Builder},
     path::Path,
 };
@@ -106,6 +106,32 @@ impl RustFsClient {
         self.get_object_version(object_key, version_id).await
     }
 
+    pub async fn get_file_object_range_version(
+        &self,
+        object_key: &str,
+        version_id: Option<&str>,
+        offset_bytes: u64,
+        limit_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        get_from_store_range(
+            &self.files_store,
+            object_key,
+            version_id,
+            offset_bytes,
+            limit_bytes,
+        )
+        .await
+    }
+
+    pub async fn get_file_object_stream_version(
+        &self,
+        object_key: &str,
+        version_id: Option<&str>,
+        range: Option<Range<u64>>,
+    ) -> Result<Option<GetResult>, AppError> {
+        get_from_store_stream(&self.files_store, object_key, version_id, range).await
+    }
+
     pub async fn get_object(&self, object_key: &str) -> Result<Option<Vec<u8>>, AppError> {
         self.get_object_version(object_key, None).await
     }
@@ -200,6 +226,60 @@ async fn get_from_store(
     Ok(Some(bytes.to_vec()))
 }
 
+async fn get_from_store_range(
+    store: &Option<Arc<AmazonS3>>,
+    object_key: &str,
+    version_id: Option<&str>,
+    offset_bytes: u64,
+    limit_bytes: usize,
+) -> Result<Option<Vec<u8>>, AppError> {
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    if limit_bytes == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let end = offset_bytes
+        .checked_add(u64::try_from(limit_bytes)?)
+        .ok_or_else(|| AppError::InvalidInput("range end is invalid".to_string()))?;
+    let options = GetOptions {
+        version: version_id.map(str::to_string),
+        range: Some(GetRange::Bounded(offset_bytes..end)),
+        ..Default::default()
+    };
+    let bytes = store
+        .get_opts(&Path::from(object_key), options)
+        .await
+        .map_err(object_store_error)?
+        .bytes()
+        .await
+        .map_err(object_store_error)?;
+
+    Ok(Some(bytes.to_vec()))
+}
+
+async fn get_from_store_stream(
+    store: &Option<Arc<AmazonS3>>,
+    object_key: &str,
+    version_id: Option<&str>,
+    range: Option<Range<u64>>,
+) -> Result<Option<GetResult>, AppError> {
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    let options = GetOptions {
+        version: version_id.map(str::to_string),
+        range: range.map(GetRange::Bounded),
+        ..Default::default()
+    };
+    let result = store
+        .get_opts(&Path::from(object_key), options)
+        .await
+        .map_err(object_store_error)?;
+
+    Ok(Some(result))
+}
+
 async fn delete_from_store(
     store: &Option<Arc<AmazonS3>>,
     object_key: &str,
@@ -231,6 +311,17 @@ mod tests {
         assert!(!client.is_enabled());
         assert_eq!(client.files_bucket(), "bibi-work-files");
         assert_eq!(client.audit_bucket(), "bibi-work-audit");
+    }
+
+    #[tokio::test]
+    async fn disabled_client_skips_range_reads() {
+        let client = RustFsClient::disabled_for_tests();
+        let content = client
+            .get_file_object_range_version("missing", None, 0, 10)
+            .await
+            .expect("range read");
+
+        assert_eq!(content, None);
     }
 
     #[tokio::test]

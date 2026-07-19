@@ -54,6 +54,35 @@ class FakeIdempotencyStore:
         self.failed.append(approval_id)
 
 
+def valid_run_snapshot(
+    *,
+    tenant_id: str,
+    conversation_id: str,
+    run_id: str,
+    thread_id: str,
+) -> dict:
+    return {
+        "runtime": {"kind": "deepagents"},
+        "tenant_id": tenant_id,
+        "conversation_id": conversation_id,
+        "run_id": run_id,
+        "thread_id": thread_id,
+        "actor": {"user_id": str(uuid4())},
+        "agent": {
+            "id": str(uuid4()),
+            "model": {
+                "provider": "test",
+                "model_name": "fake-model",
+            },
+        },
+        "tools": [],
+        "skills": [],
+        "mcp_tools": [],
+        "workspace": {"workspace_id": str(uuid4()), "local_mounts": []},
+        "ui": {"client": "biwork"},
+    }
+
+
 def test_real_deepagents_hitl_resume_does_not_repeat_high_risk_tool(
     monkeypatch,
 ) -> None:
@@ -86,14 +115,22 @@ def test_real_deepagents_hitl_resume_does_not_repeat_high_risk_tool(
     )
 
     run_id = str(uuid4())
+    tenant_id = str(uuid4())
+    conversation_id = str(uuid4())
+    thread_id = f"thread-{run_id}"
     payload = {
-        "tenant_id": str(uuid4()),
-        "conversation_id": str(uuid4()),
+        "tenant_id": tenant_id,
+        "conversation_id": conversation_id,
         "run_id": run_id,
         "trace_id": "trace",
-        "thread_id": f"thread-{run_id}",
+        "thread_id": thread_id,
         "input": {"messages": [{"role": "user", "content": "run dangerous tool"}]},
-        "run_config_snapshot": {"agent": {"model": "fake"}},
+        "run_config_snapshot": valid_run_snapshot(
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            run_id=run_id,
+            thread_id=thread_id,
+        ),
     }
 
     monkeypatch.setattr(run_executor, "create_platform_agent", lambda _snapshot: agent)
@@ -136,4 +173,58 @@ def test_real_deepagents_hitl_resume_does_not_repeat_high_risk_tool(
         for batch in fake_rust.emitted_batches
         for event in batch["events"]
     ]
-    assert emitted_types == ["run.started", "message.completed", "run.completed"]
+    assert emitted_types[0] == "run.started"
+    assert emitted_types[-1] == "run.completed"
+    assert emitted_types.count("run.started") == 1
+    assert emitted_types.count("message.completed") == 1
+    assert emitted_types.count("run.completed") == 1
+
+
+def test_real_deepagents_loop_continues_after_retryable_browser_failure() -> None:
+    calls: list[str] = []
+
+    def browser_click(ref: str) -> dict:
+        """Return a recoverable browser failure to the model loop."""
+        calls.append(ref)
+        return {
+            "kind": "browser",
+            "action": "click",
+            "status": "failed",
+            "retryable": True,
+            "error": {
+                "code": "BROWSER_TARGET_NOT_ACTIONABLE",
+                "message": "The previous element ref is no longer actionable.",
+            },
+            "recovery_snapshot": {
+                "url": "https://portal.example.test/login",
+                "elements": [{"ref": "e7", "role": "button", "name": "Login"}],
+            },
+        }
+
+    agent = create_deep_agent(
+        model=ToolCallingFakeModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "browser_click",
+                            "args": {"ref": "e3"},
+                            "id": "call_1",
+                        }
+                    ],
+                ),
+                AIMessage(content="I received the fresh snapshot and can continue."),
+            ]
+        ),
+        tools=[browser_click],
+    )
+
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": "Open attendance"}]}
+    )
+
+    assert calls == ["e3"]
+    assert result["messages"][-1].content == (
+        "I received the fresh snapshot and can continue."
+    )

@@ -1,0 +1,17 @@
+{
+  "promptExamplesHint": "نمونه پرامپت‌ها را امتحان کنید:",
+  "defaultPrompts": {
+    "capabilities": "چه کارهایی می‌توانید برای من انجام دهید؟",
+    "skills": "چه مهارت‌هایی دارید؟",
+    "tools": "چه ابزارهایی دارید؟"
+  },
+  "selectAssistantHint": "یک دستیار برای شروع کار انتخاب کنید",
+  "workspace": {
+    "workInProject": "کار در پروژه",
+    "optional": "اختیاری",
+    "clearWorkspace": "پاک کردن",
+    "specifyWorkspace": "انتخاب پوشه پروژه",
+    "searchPlaceholder": "جستجوی پروژه‌ها…",
+    "noProject": "بدون پروژه"
+  }
+}

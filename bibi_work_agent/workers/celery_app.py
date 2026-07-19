@@ -3,8 +3,10 @@ from __future__ import annotations
 from celery import Celery
 
 from bibi_work_agent.settings import settings
+from bibi_work_agent.telemetry import configure_telemetry
 
 
+configure_telemetry()
 celery_app = Celery(
     "bibi_work_agent",
     broker=settings.celery_broker_url,

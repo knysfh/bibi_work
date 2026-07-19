@@ -1,0 +1,222 @@
+groups:
+  - name: bibi-work-runtime
+    rules:
+      - alert: BibiRunQueueStalled
+        expr: bibi_oldest_queued_run_seconds > 300
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: A run has remained queued for more than five minutes
+
+      - alert: BibiLocalRuntimeQueueStalled
+        expr: bibi_oldest_local_exec_request_seconds > 120
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: A local runtime request has remained queued for more than two minutes
+
+      - alert: BibiEventOutboxStalled
+        expr: bibi_oldest_event_outbox_item_seconds > 120
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: A run event has not been published for more than two minutes
+
+      - alert: BibiCeleryQueueBacklog
+        expr: bibi_celery_queue_depth > 50
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: More than fifty agent tasks have remained queued for ten minutes
+
+      - alert: BibiCeleryWorkerFailure
+        expr: increase(bibi_celery_worker_task_failures_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: An agent worker task failed during the last fifteen minutes
+
+      - alert: BibiRunDispatchP95High
+        expr: |
+          bibi_run_dispatch_duration_seconds_24h_count >= 20
+          and
+          histogram_quantile(0.95, bibi_run_dispatch_duration_seconds_24h_bucket) > 10
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: The 24-hour run dispatch p95 is above ten seconds
+
+      - alert: BibiToolExecutionP95High
+        expr: |
+          bibi_tool_execution_duration_seconds_24h_count >= 20
+          and
+          histogram_quantile(0.95, bibi_tool_execution_duration_seconds_24h_bucket) > 30
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: The 24-hour tool execution p95 is above thirty seconds
+
+      - alert: BibiRunSuccessSloViolation
+        expr: |
+          bibi_runs_completed_24h + bibi_runs_failed_24h >= 20
+          and
+          bibi:slo_run_success_ratio_24h < 0.99
+        for: 15m
+        labels:
+          severity: critical
+          slo: run-success
+        annotations:
+          summary: The 24-hour run success SLO is below 99 percent
+
+      - alert: BibiRunDispatchSloViolation
+        expr: |
+          bibi_run_dispatch_duration_seconds_24h_count >= 20
+          and
+          bibi:slo_run_dispatch_within_10s_ratio_24h < 0.99
+        for: 15m
+        labels:
+          severity: warning
+          slo: run-dispatch
+        annotations:
+          summary: Fewer than 99 percent of runs dispatch within ten seconds
+
+      - alert: BibiToolExecutionSloViolation
+        expr: |
+          bibi_tool_execution_duration_seconds_24h_count >= 20
+          and
+          bibi:slo_tool_execution_within_30s_ratio_24h < 0.99
+        for: 15m
+        labels:
+          severity: warning
+          slo: tool-execution
+        annotations:
+          summary: Fewer than 99 percent of tool calls finish within thirty seconds
+
+  - name: bibi-work-control-plane
+    rules:
+      - alert: BibiFerrisKeyOidcFailureRatioHigh
+        expr: |
+          rate(bibi_ferriskey_oidc_auth_requests_total[10m]) >= 0.05
+          and
+          rate(bibi_ferriskey_oidc_auth_failures_total[10m])
+            / rate(bibi_ferriskey_oidc_auth_requests_total[10m]) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: More than five percent of FerrisKey authentication requests are failing
+
+      - alert: BibiFerrisKeyOidcP95High
+        expr: |
+          rate(bibi_ferriskey_oidc_auth_requests_total[10m]) >= 0.05
+          and
+          histogram_quantile(
+            0.95,
+            rate(bibi_ferriskey_oidc_auth_duration_seconds_bucket[10m])
+          ) > 0.25
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: FerrisKey authentication p95 is above 250 milliseconds
+
+      - alert: BibiFerrisKeyJwksRefreshFailure
+        expr: increase(bibi_ferriskey_jwks_refresh_failures_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: FerrisKey JWKS refresh failed during the last fifteen minutes
+
+      - alert: BibiResourceAuthzInternalFailure
+        expr: increase(bibi_resource_authz_check_failures_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: A resource authorization check failed closed because of an internal error
+
+      - alert: BibiResourceAuthzP95High
+        expr: |
+          rate(bibi_resource_authz_checks_total[10m]) >= 0.1
+          and
+          histogram_quantile(
+            0.95,
+            rate(bibi_resource_authz_check_duration_seconds_bucket[10m])
+          ) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Resource authorization p95 is above 100 milliseconds
+
+      - alert: BibiMcpServerUnhealthy
+        expr: bibi_mcp_servers_unhealthy > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: One or more active MCP servers are unhealthy
+
+      - alert: BibiMcpRequestFailureRatioHigh
+        expr: |
+          rate(bibi_mcp_http_requests_total[10m]) >= 0.05
+          and
+          rate(bibi_mcp_http_request_failures_total[10m])
+            / rate(bibi_mcp_http_requests_total[10m]) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: More than ten percent of MCP HTTP requests are failing
+
+      - alert: BibiMcpRequestP95High
+        expr: |
+          rate(bibi_mcp_http_requests_total[10m]) >= 0.05
+          and
+          histogram_quantile(
+            0.95,
+            rate(bibi_mcp_http_request_duration_seconds_bucket[10m])
+          ) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: MCP HTTP request p95 is above ten seconds
+
+      - alert: BibiBiWorkWebSocketSendP95High
+        expr: |
+          rate(bibi_biwork_ws_messages_sent_total[10m]) >= 0.1
+          and
+          histogram_quantile(
+            0.95,
+            rate(bibi_biwork_ws_send_duration_seconds_bucket[10m])
+          ) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: BiWork WebSocket send p95 indicates sustained client backpressure
+
+      - alert: BibiCredentialRotationFailure
+        expr: bibi_llm_credential_rotation_failures_24h > 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: An LLM credential rotation failed during the last 24 hours
+
+      - alert: BibiAuditArchiveBacklog
+        expr: bibi_audit_archive_segments_pending > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: Audit archive segments have remained pending for thirty minutes

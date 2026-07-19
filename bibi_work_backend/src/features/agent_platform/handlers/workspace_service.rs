@@ -103,6 +103,69 @@ pub async fn list_workspaces(
     Ok(Json(workspaces))
 }
 
+pub async fn update_workspace(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<PlatformRequestContext>,
+    Path(workspace_id): Path<Uuid>,
+    Json(payload): Json<UpdateWorkspaceRequest>,
+) -> Result<Json<WorkspaceResponse>, AppError> {
+    ensure_tenant_member(&state.connect_pool, payload.tenant_id, ctx.platform_user_id).await?;
+    ensure_workspace(&state, payload.tenant_id, workspace_id).await?;
+    require_ferriskey_allow(
+        &state,
+        &ctx,
+        payload.tenant_id,
+        "manage",
+        "workspace",
+        workspace_id.to_string(),
+        None,
+    )
+    .await?;
+    let remote_project_id = match payload.remote_project_id {
+        NullableUuidPatch::Missing => {
+            return Err(AppError::InvalidInput(
+                "remote_project_id is required".to_string(),
+            ));
+        }
+        NullableUuidPatch::Clear => None,
+        NullableUuidPatch::Set(project_id) => {
+            ensure_optional_project(&state, payload.tenant_id, Some(project_id)).await?;
+            Some(project_id)
+        }
+    };
+
+    let row = sqlx::query(
+        r#"
+        UPDATE workspaces
+        SET remote_project_id = $3, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+        RETURNING id, tenant_id, owner_user_id, name, remote_project_id, default_agent_id,
+                  default_agent_version_id, default_model_profile_id, tool_policy, file_policy,
+                  include_globs, exclude_globs, trust_state, metadata, status, created_at, updated_at
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(payload.tenant_id)
+    .bind(remote_project_id)
+    .fetch_one(&state.connect_pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE conversations
+        SET project_id = $3, updated_at = CURRENT_TIMESTAMP
+        WHERE tenant_id = $1 AND workspace_id = $2 AND deleted_at IS NULL
+        "#,
+    )
+    .bind(payload.tenant_id)
+    .bind(workspace_id)
+    .bind(remote_project_id)
+    .execute(&state.connect_pool)
+    .await?;
+
+    Ok(Json(workspace_from_row(row)?))
+}
+
 pub async fn create_local_mount(
     State(state): State<AppState>,
     Extension(ctx): Extension<PlatformRequestContext>,

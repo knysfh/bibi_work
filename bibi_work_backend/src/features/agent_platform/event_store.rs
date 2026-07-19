@@ -9,13 +9,19 @@ use axum::{
 use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgRow};
+use time::OffsetDateTime;
 use tokio::time::{MissedTickBehavior, sleep};
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::{features::core::errors::AppError, startup::AppState};
 
-use super::models::{RunEventInput, StreamEventResponse};
+use super::{
+    ferriskey_oidc::PlatformRequestContext,
+    models::{RunEventInput, RunEventKind, StreamEventResponse},
+};
+
+pub const STREAM_SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 pub async fn insert_event_tx(
     tx: &mut Transaction<'_, Postgres>,
@@ -24,9 +30,16 @@ pub async fn insert_event_tx(
     run_id: Option<Uuid>,
     event: RunEventInput,
 ) -> Result<StreamEventResponse, AppError> {
-    let seq = next_event_seq(tx, conversation_id).await?;
     let event_id = event.event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-    let payload = event.payload.unwrap_or_else(|| json!({}));
+    let (event_type, payload) = normalize_event(event.event_type, event.payload)?;
+
+    if let Some(existing) =
+        find_existing_event_tx(tx, tenant_id, conversation_id, &event_id).await?
+    {
+        return Ok(existing);
+    }
+
+    let seq = next_event_seq(tx, conversation_id).await?;
 
     let row = sqlx::query(
         r#"
@@ -42,7 +55,7 @@ pub async fn insert_event_tx(
     .bind(run_id)
     .bind(seq)
     .bind(event_id)
-    .bind(event.event_type)
+    .bind(event_type)
     .bind(payload)
     .bind(event.trace_id)
     .fetch_one(&mut **tx)
@@ -65,6 +78,51 @@ pub async fn insert_event_tx(
     .await?;
 
     Ok(response)
+}
+
+fn normalize_event(
+    event_type: String,
+    payload: Option<Value>,
+) -> Result<(String, Value), AppError> {
+    let payload = payload.unwrap_or_else(|| json!({}));
+    if let Some(kind) = RunEventKind::parse(&event_type) {
+        kind.validate_payload(&payload)
+            .map_err(AppError::InvalidInput)?;
+        return Ok((event_type, payload));
+    }
+
+    Ok((
+        "activity.raw".to_string(),
+        json!({
+            "original_type": event_type,
+            "payload": payload
+        }),
+    ))
+}
+
+async fn find_existing_event_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    conversation_id: Uuid,
+    event_id: &str,
+) -> Result<Option<StreamEventResponse>, AppError> {
+    let maybe_row = sqlx::query(
+        r#"
+        SELECT id, tenant_id, conversation_id, run_id, seq, event_id, type, payload, trace_id,
+               created_at
+        FROM run_events
+        WHERE tenant_id = $1
+          AND conversation_id = $2
+          AND event_id = $3
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(conversation_id)
+    .bind(event_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    maybe_row.map(event_from_row).transpose()
 }
 
 pub async fn update_run_status_from_event(
@@ -101,7 +159,50 @@ pub async fn update_run_status_from_event(
     .execute(&mut **tx)
     .await?;
 
+    update_scheduled_job_run_status_from_event(tx, Some(run_id), event_type).await?;
+
     Ok(())
+}
+
+pub async fn update_scheduled_job_run_status_from_event(
+    tx: &mut Transaction<'_, Postgres>,
+    run_id: Option<Uuid>,
+    event_type: &str,
+) -> Result<(), AppError> {
+    let Some(run_id) = run_id else {
+        return Ok(());
+    };
+    let Some(status) = scheduled_job_status_from_event(event_type) else {
+        return Ok(());
+    };
+    sqlx::query(
+        r#"
+        UPDATE scheduled_job_runs
+        SET status = $1,
+            completed_at = CASE
+                WHEN $1 IN ('completed', 'failed', 'cancelled')
+                THEN COALESCE(completed_at, CURRENT_TIMESTAMP)
+                ELSE completed_at
+            END
+        WHERE run_id = $2
+          AND status NOT IN ('completed', 'failed', 'cancelled')
+        "#,
+    )
+    .bind(status)
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn scheduled_job_status_from_event(event_type: &str) -> Option<&'static str> {
+    match event_type {
+        "run.started" => Some("running"),
+        "run.completed" => Some("completed"),
+        "run.failed" => Some("failed"),
+        "run.cancelled" => Some("cancelled"),
+        _ => None,
+    }
 }
 
 pub fn is_run_state_event(event_type: &str) -> bool {
@@ -158,9 +259,12 @@ pub fn live_events_to_sse(
     tenant_id: Uuid,
     conversation_id: Uuid,
     after_seq: i64,
+    ctx: PlatformRequestContext,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let output = stream! {
         let mut cursor = after_seq;
+        let mut session_refresh = tokio::time::interval(STREAM_SESSION_REFRESH_INTERVAL);
+        session_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut pubsub = match redis_client.get_async_pubsub().await {
             Ok(pubsub) => Some(pubsub),
             Err(err) => {
@@ -214,6 +318,12 @@ pub fn live_events_to_sse(
 
             loop {
                 tokio::select! {
+                    _ = session_refresh.tick() => {
+                        if let Some(event) = stream_session_validation_event(&pool, &ctx, conversation_id).await {
+                            yield Ok(event);
+                            return;
+                        }
+                    }
                     message = messages.next() => {
                         if message.is_none() {
                             warn!(
@@ -249,15 +359,33 @@ pub fn live_events_to_sse(
             }
         }
 
+        let mut poll_immediately = true;
         loop {
-            let fetched = match fetch_events_after(&pool, conversation_id, cursor).await {
+            if poll_immediately {
+                if let Some(event) = stream_session_validation_event(&pool, &ctx, conversation_id).await {
+                    yield Ok(event);
+                    return;
+                }
+            } else {
+                tokio::select! {
+                    _ = session_refresh.tick() => {
+                        if let Some(event) = stream_session_validation_event(&pool, &ctx, conversation_id).await {
+                            yield Ok(event);
+                            return;
+                        }
+                    }
+                    _ = sleep(Duration::from_secs(1)) => {}
+                }
+            }
+
+            poll_immediately = match fetch_events_after(&pool, conversation_id, cursor).await {
                 Ok((events, next_cursor)) => {
-                    let count = events.len();
+                    let fetched = events.len();
                     cursor = next_cursor;
                     for event in events {
                         yield Ok(event_to_sse(event));
                     }
-                    count
+                    fetched >= 1000
                 }
                 Err(err) => {
                     warn!(
@@ -267,13 +395,9 @@ pub fn live_events_to_sse(
                     yield Ok(Event::default()
                         .event("stream.error")
                         .data(json!({ "message": "failed to fetch events" }).to_string()));
-                    0
+                    false
                 }
             };
-
-            if fetched < 1000 {
-                sleep(Duration::from_secs(1)).await;
-            }
         }
     };
 
@@ -309,6 +433,7 @@ pub async fn handle_conversation_socket(
     tenant_id: Uuid,
     conversation_id: Uuid,
     after_seq: i64,
+    ctx: PlatformRequestContext,
 ) {
     let mut cursor = after_seq;
     if !send_new_socket_events(&mut socket, &pool, conversation_id, &mut cursor).await {
@@ -368,12 +493,19 @@ pub async fn handle_conversation_socket(
     if let Some(mut pubsub) = pubsub {
         let mut messages = pubsub.on_message();
         let mut backfill = tokio::time::interval(Duration::from_secs(30));
+        let mut session_refresh = tokio::time::interval(STREAM_SESSION_REFRESH_INTERVAL);
         let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
         backfill.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        session_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
+                _ = session_refresh.tick() => {
+                    if !refresh_socket_session_or_close(&mut socket, &pool, &ctx, conversation_id).await {
+                        return;
+                    }
+                }
                 message = messages.next() => {
                     if message.is_none() {
                         warn!(
@@ -415,8 +547,10 @@ pub async fn handle_conversation_socket(
     }
 
     let mut poll = tokio::time::interval(Duration::from_secs(1));
+    let mut session_refresh = tokio::time::interval(STREAM_SESSION_REFRESH_INTERVAL);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    session_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
@@ -426,11 +560,182 @@ pub async fn handle_conversation_socket(
                     return;
                 }
             }
+            _ = session_refresh.tick() => {
+                if !refresh_socket_session_or_close(&mut socket, &pool, &ctx, conversation_id).await {
+                    return;
+                }
+            }
             _ = heartbeat.tick() => {
                 if send_socket_heartbeat(&mut socket).await.is_err() {
                     return;
                 }
             }
+        }
+    }
+}
+
+pub async fn refresh_stream_session_state(
+    pool: &PgPool,
+    ctx: &PlatformRequestContext,
+) -> Result<(), AppError> {
+    let row = sqlx::query(
+        r#"
+        SELECT s.revoked_at AS session_revoked_at,
+               d.revoked_at AS device_revoked_at,
+               s.token_exp
+        FROM platform_sessions s
+        JOIN devices d
+          ON d.id = s.device_id
+         AND d.tenant_id = s.tenant_id
+         AND d.user_id = s.user_id
+        WHERE s.id = $1
+          AND s.tenant_id = $2
+          AND s.user_id = $3
+          AND d.id = $4
+        "#,
+    )
+    .bind(ctx.session_id)
+    .bind(ctx.tenant_id)
+    .bind(ctx.platform_user_id)
+    .bind(ctx.device_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Err(AppError::Unauthorized(
+            "platform session projection is missing".to_string(),
+        ));
+    };
+
+    let session_revoked_at: Option<OffsetDateTime> = row.try_get("session_revoked_at")?;
+    let device_revoked_at: Option<OffsetDateTime> = row.try_get("device_revoked_at")?;
+    let token_exp: OffsetDateTime = row.try_get("token_exp")?;
+    classify_stream_session_state(
+        session_revoked_at,
+        device_revoked_at,
+        token_exp,
+        OffsetDateTime::now_utc(),
+    )?;
+
+    sqlx::query(
+        r#"
+        UPDATE platform_sessions
+        SET last_seen_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1
+          AND tenant_id = $2
+          AND user_id = $3
+          AND revoked_at IS NULL
+        "#,
+    )
+    .bind(ctx.session_id)
+    .bind(ctx.tenant_id)
+    .bind(ctx.platform_user_id)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE devices
+        SET last_seen_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1
+          AND tenant_id = $2
+          AND user_id = $3
+          AND revoked_at IS NULL
+        "#,
+    )
+    .bind(ctx.device_id)
+    .bind(ctx.tenant_id)
+    .bind(ctx.platform_user_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+fn classify_stream_session_state(
+    session_revoked_at: Option<OffsetDateTime>,
+    device_revoked_at: Option<OffsetDateTime>,
+    token_exp: OffsetDateTime,
+    now: OffsetDateTime,
+) -> Result<(), AppError> {
+    if session_revoked_at.is_some() {
+        return Err(AppError::Unauthorized(
+            "platform session has been revoked".to_string(),
+        ));
+    }
+    if device_revoked_at.is_some() {
+        return Err(AppError::Unauthorized(
+            "platform device has been revoked".to_string(),
+        ));
+    }
+    if token_exp <= now {
+        return Err(AppError::Unauthorized(
+            "FerrisKey access token has expired".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn stream_session_validation_event(
+    pool: &PgPool,
+    ctx: &PlatformRequestContext,
+    conversation_id: Uuid,
+) -> Option<Event> {
+    match refresh_stream_session_state(pool, ctx).await {
+        Ok(()) => None,
+        Err(AppError::Unauthorized(reason)) => Some(
+            Event::default()
+                .event("auth.revoked")
+                .data(json!({ "reason": reason }).to_string()),
+        ),
+        Err(err) => {
+            warn!(
+                "failed to validate SSE session for conversation {}: {}",
+                conversation_id, err
+            );
+            Some(
+                Event::default()
+                    .event("stream.error")
+                    .data(json!({ "message": "failed to validate session" }).to_string()),
+            )
+        }
+    }
+}
+
+async fn refresh_socket_session_or_close(
+    socket: &mut WebSocket,
+    pool: &PgPool,
+    ctx: &PlatformRequestContext,
+    conversation_id: Uuid,
+) -> bool {
+    match refresh_stream_session_state(pool, ctx).await {
+        Ok(()) => true,
+        Err(AppError::Unauthorized(reason)) => {
+            let _ = socket
+                .send(Message::Text(
+                    json!({ "type": "auth.revoked", "reason": reason })
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            let _ = socket.send(Message::Close(None)).await;
+            false
+        }
+        Err(err) => {
+            warn!(
+                "failed to validate websocket session for conversation {}: {}",
+                conversation_id, err
+            );
+            let _ = socket
+                .send(Message::Text(
+                    json!({ "type": "stream.error", "message": "failed to validate session" })
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            false
         }
     }
 }
@@ -715,9 +1020,16 @@ fn event_to_sse(event: StreamEventResponse) -> Event {
 #[cfg(test)]
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
+    use time::{Duration as TimeDuration, OffsetDateTime};
     use uuid::Uuid;
 
-    use super::{conversation_pubsub_channel, resolve_after_seq, run_pubsub_channel};
+    use crate::features::core::errors::AppError;
+
+    use super::{
+        STREAM_SESSION_REFRESH_INTERVAL, classify_stream_session_state,
+        conversation_pubsub_channel, resolve_after_seq, run_pubsub_channel,
+        scheduled_job_status_from_event,
+    };
 
     #[test]
     fn resolve_after_seq_prefers_explicit_query_value() {
@@ -757,5 +1069,63 @@ mod tests {
             run_pubsub_channel(tenant_id, run_id),
             "pubsub:tenant:00000000-0000-0000-0000-000000000001:run:00000000-0000-0000-0000-000000000003"
         );
+    }
+
+    #[test]
+    fn stream_session_refresh_interval_is_fast_enough_for_revoke() {
+        assert!(STREAM_SESSION_REFRESH_INTERVAL <= std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn scheduled_job_status_tracks_run_terminal_events() {
+        assert_eq!(
+            scheduled_job_status_from_event("run.started"),
+            Some("running")
+        );
+        assert_eq!(
+            scheduled_job_status_from_event("run.completed"),
+            Some("completed")
+        );
+        assert_eq!(
+            scheduled_job_status_from_event("run.failed"),
+            Some("failed")
+        );
+        assert_eq!(
+            scheduled_job_status_from_event("run.cancelled"),
+            Some("cancelled")
+        );
+        assert_eq!(scheduled_job_status_from_event("approval.requested"), None);
+    }
+
+    #[test]
+    fn stream_session_state_allows_active_session() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+
+        assert!(
+            classify_stream_session_state(None, None, now + TimeDuration::seconds(60), now).is_ok()
+        );
+    }
+
+    #[test]
+    fn stream_session_state_rejects_revoked_or_expired_session() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+
+        let session_revoked =
+            classify_stream_session_state(Some(now), None, now + TimeDuration::seconds(60), now)
+                .expect_err("session revoke should fail");
+        assert!(
+            matches!(session_revoked, AppError::Unauthorized(reason) if reason.contains("session"))
+        );
+
+        let device_revoked =
+            classify_stream_session_state(None, Some(now), now + TimeDuration::seconds(60), now)
+                .expect_err("device revoke should fail");
+        assert!(
+            matches!(device_revoked, AppError::Unauthorized(reason) if reason.contains("device"))
+        );
+
+        let expired = classify_stream_session_state(None, None, now, now)
+            .expect_err("expired token should fail");
+        assert!(matches!(expired, AppError::Unauthorized(reason) if reason.contains("expired")));
     }
 }

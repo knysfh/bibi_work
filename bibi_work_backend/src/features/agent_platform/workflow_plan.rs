@@ -7,6 +7,9 @@ use crate::features::core::errors::AppError;
 
 use super::workflow_mapping;
 
+pub const MAX_WORKFLOW_NODES: usize = 500;
+pub const MAX_WORKFLOW_EDGES: usize = 5_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeExecutionPolicy {
     pub max_attempts: i32,
@@ -32,6 +35,16 @@ pub fn validate(plan: &Value) -> Result<(), AppError> {
         return Err(AppError::InvalidInput(
             "compiled workflow must contain at least one node".to_string(),
         ));
+    }
+    if nodes.len() > MAX_WORKFLOW_NODES {
+        return Err(AppError::InvalidInput(format!(
+            "compiled workflow may contain at most {MAX_WORKFLOW_NODES} nodes"
+        )));
+    }
+    if edges.len() > MAX_WORKFLOW_EDGES {
+        return Err(AppError::InvalidInput(format!(
+            "compiled workflow may contain at most {MAX_WORKFLOW_EDGES} edges"
+        )));
     }
 
     let mut node_keys = HashSet::new();
@@ -337,5 +350,73 @@ mod tests {
         });
 
         assert!(validate(&plan).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_maximum_node_count() {
+        let agent_version_id = Uuid::new_v4().to_string();
+        let nodes = (0..MAX_WORKFLOW_NODES)
+            .map(|index| {
+                json!({
+                    "node_key": format!("node-{index}"),
+                    "agent_version_id": agent_version_id
+                })
+            })
+            .collect::<Vec<_>>();
+        let plan = json!({"nodes": nodes, "edges": []});
+
+        validate(&plan).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_workflow_over_node_limit() {
+        let agent_version_id = Uuid::new_v4().to_string();
+        let nodes = (0..=MAX_WORKFLOW_NODES)
+            .map(|index| {
+                json!({
+                    "node_key": format!("node-{index}"),
+                    "agent_version_id": agent_version_id
+                })
+            })
+            .collect::<Vec<_>>();
+        let plan = json!({"nodes": nodes, "edges": []});
+
+        let error = validate(&plan).unwrap_err().to_string();
+        assert!(error.contains("at most 500 nodes"));
+    }
+
+    #[test]
+    fn validate_accepts_maximum_edge_count() {
+        let agent_version_id = Uuid::new_v4().to_string();
+        let edges = (0..MAX_WORKFLOW_EDGES)
+            .map(|_| json!({"from": "a", "to": "b"}))
+            .collect::<Vec<_>>();
+        let plan = json!({
+            "nodes": [
+                {"node_key": "a", "agent_version_id": agent_version_id},
+                {"node_key": "b", "agent_version_id": agent_version_id}
+            ],
+            "edges": edges
+        });
+
+        validate(&plan).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_workflow_over_edge_limit() {
+        let agent_version_id = Uuid::new_v4().to_string();
+        let edges = (0..=MAX_WORKFLOW_EDGES)
+            .map(|_| json!({"from": "a", "to": "b"}))
+            .collect::<Vec<_>>();
+        let plan = json!({
+            "nodes": [
+                {"node_key": "a", "agent_version_id": agent_version_id},
+                {"node_key": "b", "agent_version_id": agent_version_id}
+            ],
+            "edges": edges
+        });
+
+        let error = validate(&plan).unwrap_err().to_string();
+        assert!(error.contains("at most 5000 edges"));
     }
 }

@@ -10,7 +10,7 @@ use crate::{
     features::{
         agent_platform::{
             ferriskey_oidc::PlatformRequestContext, mcp_discovery,
-            mcp_discovery::DiscoveredMcpTool, models::*,
+            mcp_discovery::DiscoveredMcpTool, mcp_http, models::*,
         },
         core::errors::AppError,
     },
@@ -34,7 +34,12 @@ pub async fn list_mcp_servers(
                jsonb_build_object(
                    'transport', transport,
                    'has_config', config <> '{}'::jsonb,
-                   'has_secret_ref', secret_ref IS NOT NULL
+                   'has_secret_ref', secret_ref IS NOT NULL,
+                   'health_status', health_status,
+                   'last_health_check_at', last_health_check_at,
+                   'last_discovered_at', last_discovered_at,
+                   'consecutive_failures', consecutive_failures,
+                   'has_health_error', health_error IS NOT NULL
                ) AS metadata,
                created_at, updated_at
         FROM mcp_servers
@@ -74,7 +79,12 @@ pub async fn get_mcp_server(
                jsonb_build_object(
                    'transport', transport,
                    'has_config', config <> '{}'::jsonb,
-                   'has_secret_ref', secret_ref IS NOT NULL
+                   'has_secret_ref', secret_ref IS NOT NULL,
+                   'health_status', health_status,
+                   'last_health_check_at', last_health_check_at,
+                   'last_discovered_at', last_discovered_at,
+                   'consecutive_failures', consecutive_failures,
+                   'has_health_error', health_error IS NOT NULL
                ) AS metadata,
                created_at, updated_at
         FROM mcp_servers
@@ -110,6 +120,31 @@ pub async fn update_mcp_server(
         }),
     )
     .await?;
+    if let Some(secret_ref) = payload.secret_ref.as_deref() {
+        crate::features::agent_platform::secret_resolver::validate_secret_ref(secret_ref)?;
+    }
+    let current = sqlx::query("SELECT transport, config FROM mcp_servers WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL")
+        .bind(mcp_server_id)
+        .bind(payload.tenant_id)
+        .fetch_optional(&state.connect_pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound("mcp server not found".to_string()))?;
+    let current_transport: String = current.try_get("transport")?;
+    let normalized_transport = payload
+        .transport
+        .as_deref()
+        .map(canonical_mcp_transport)
+        .transpose()?
+        .map(str::to_string);
+    let effective_transport = normalized_transport
+        .as_deref()
+        .unwrap_or(&current_transport);
+    let effective_config = payload
+        .config
+        .as_ref()
+        .map(normalized_mcp_config)
+        .unwrap_or(current.try_get("config")?);
+    validate_mcp_server_configuration(effective_transport, &effective_config)?;
     let row = sqlx::query(
         r#"
         UPDATE mcp_servers
@@ -124,7 +159,12 @@ pub async fn update_mcp_server(
                   jsonb_build_object(
                       'transport', transport,
                       'has_config', config <> '{}'::jsonb,
-                      'has_secret_ref', secret_ref IS NOT NULL
+                      'has_secret_ref', secret_ref IS NOT NULL,
+                      'health_status', health_status,
+                      'last_health_check_at', last_health_check_at,
+                      'last_discovered_at', last_discovered_at,
+                      'consecutive_failures', consecutive_failures,
+                      'has_health_error', health_error IS NOT NULL
                   ) AS metadata,
                   created_at, updated_at
         "#,
@@ -133,8 +173,8 @@ pub async fn update_mcp_server(
     .bind(payload.tenant_id)
     .bind(payload.name)
     .bind(payload.description)
-    .bind(payload.transport)
-    .bind(payload.config)
+    .bind(normalized_transport)
+    .bind(payload.config.as_ref().map(normalized_mcp_config))
     .bind(payload.secret_ref)
     .fetch_optional(&state.connect_pool)
     .await?
@@ -173,7 +213,12 @@ pub async fn disable_mcp_server(
                   jsonb_build_object(
                       'transport', transport,
                       'has_config', config <> '{}'::jsonb,
-                      'has_secret_ref', secret_ref IS NOT NULL
+                      'has_secret_ref', secret_ref IS NOT NULL,
+                      'health_status', health_status,
+                      'last_health_check_at', last_health_check_at,
+                      'last_discovered_at', last_discovered_at,
+                      'consecutive_failures', consecutive_failures,
+                      'has_health_error', health_error IS NOT NULL
                   ) AS metadata,
                   created_at, updated_at
         "#,
@@ -187,6 +232,53 @@ pub async fn disable_mcp_server(
     Ok(Json(resource_from_row(row)?))
 }
 
+pub async fn enable_mcp_server(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<PlatformRequestContext>,
+    Path(mcp_server_id): Path<Uuid>,
+    Json(payload): Json<DisableCatalogResourceRequest>,
+) -> Result<Json<ResourceResponse>, AppError> {
+    ensure_tenant_member(&state.connect_pool, payload.tenant_id, ctx.platform_user_id).await?;
+    require_ferriskey_allow(
+        &state,
+        &ctx,
+        payload.tenant_id,
+        "enable",
+        "mcp_server",
+        mcp_server_id.to_string(),
+        Some(AuthzContext {
+            mcp_server_id: Some(mcp_server_id),
+            ..Default::default()
+        }),
+    )
+    .await?;
+    let row = sqlx::query(
+        r#"
+        UPDATE mcp_servers
+        SET status = 'active', updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+        RETURNING id, tenant_id, name, description, status,
+                  jsonb_build_object(
+                      'transport', transport,
+                      'has_config', config <> '{}'::jsonb,
+                      'has_secret_ref', secret_ref IS NOT NULL,
+                      'health_status', health_status,
+                      'last_health_check_at', last_health_check_at,
+                      'last_discovered_at', last_discovered_at,
+                      'consecutive_failures', consecutive_failures,
+                      'has_health_error', health_error IS NOT NULL
+                  ) AS metadata,
+                  created_at, updated_at
+        "#,
+    )
+    .bind(mcp_server_id)
+    .bind(payload.tenant_id)
+    .fetch_optional(&state.connect_pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("mcp server not found".to_string()))?;
+    Ok(Json(resource_from_row(row)?))
+}
+
 pub async fn create_mcp_server(
     State(state): State<AppState>,
     Extension(ctx): Extension<PlatformRequestContext>,
@@ -194,6 +286,16 @@ pub async fn create_mcp_server(
 ) -> Result<Json<ResourceResponse>, AppError> {
     ensure_tenant_member(&state.connect_pool, payload.tenant_id, ctx.platform_user_id).await?;
     require_tenant_action(&state, &ctx, payload.tenant_id, "create", "mcp_server").await?;
+    if let Some(secret_ref) = payload.secret_ref.as_deref() {
+        crate::features::agent_platform::secret_resolver::validate_secret_ref(secret_ref)?;
+    }
+    let transport = canonical_mcp_transport(payload.transport.as_deref().unwrap_or("http"))?;
+    let config = payload
+        .config
+        .as_ref()
+        .map(normalized_mcp_config)
+        .unwrap_or_else(|| json!({}));
+    validate_mcp_server_configuration(transport, &config)?;
     let row = sqlx::query(
         r#"
         INSERT INTO mcp_servers (
@@ -204,7 +306,12 @@ pub async fn create_mcp_server(
                   jsonb_build_object(
                       'transport', transport,
                       'has_config', config <> '{}'::jsonb,
-                      'has_secret_ref', secret_ref IS NOT NULL
+                      'has_secret_ref', secret_ref IS NOT NULL,
+                      'health_status', health_status,
+                      'last_health_check_at', last_health_check_at,
+                      'last_discovered_at', last_discovered_at,
+                      'consecutive_failures', consecutive_failures,
+                      'has_health_error', health_error IS NOT NULL
                   ) AS metadata,
                   created_at, updated_at
         "#,
@@ -212,8 +319,8 @@ pub async fn create_mcp_server(
     .bind(payload.tenant_id)
     .bind(payload.name)
     .bind(payload.description)
-    .bind(payload.transport.unwrap_or_else(|| "http".to_string()))
-    .bind(payload.config.unwrap_or_else(|| json!({})))
+    .bind(transport)
+    .bind(config)
     .bind(payload.secret_ref)
     .fetch_one(&state.connect_pool)
     .await?;
@@ -473,8 +580,26 @@ pub async fn discover_mcp_tools(
     let config: serde_json::Value = row.try_get("config")?;
     let secret_ref: Option<String> = row.try_get("secret_ref")?;
 
-    let discovered =
-        mcp_discovery::discover_mcp_tools(&transport, &config, secret_ref.as_deref()).await?;
+    let discovered = match mcp_discovery::discover_mcp_tools(
+        &state.secret_resolver,
+        &transport,
+        &config,
+        secret_ref.as_deref(),
+    )
+    .await
+    {
+        Ok(discovered) => discovered,
+        Err(error) => {
+            record_mcp_discovery_failure(
+                &state.connect_pool,
+                payload.tenant_id,
+                mcp_server_id,
+                &error.to_string(),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
     let tools = upsert_discovered_mcp_tools(
         &state.connect_pool,
         payload.tenant_id,
@@ -505,6 +630,85 @@ async fn mcp_tool_server_id(
     .ok_or_else(|| AppError::NotFound("mcp tool not found".to_string()))
 }
 
+fn validate_mcp_server_configuration(
+    transport: &str,
+    config: &serde_json::Value,
+) -> Result<(), AppError> {
+    if !matches!(
+        transport,
+        "stdio" | "http" | "sse" | "streamable-http" | "streamable_http" | "json-rpc"
+    ) {
+        return Err(AppError::InvalidInput(format!(
+            "unsupported MCP transport: {transport}"
+        )));
+    }
+    let object = config
+        .as_object()
+        .ok_or_else(|| AppError::InvalidInput("mcp server config must be an object".to_string()))?;
+    if transport != "stdio" {
+        mcp_http::mcp_endpoint(config)?;
+        return Ok(());
+    }
+    object
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::InvalidInput("MCP stdio command is required".to_string()))?;
+    if let Some(args) = object.get("args") {
+        let args = args
+            .as_array()
+            .ok_or_else(|| AppError::InvalidInput("MCP stdio args must be an array".to_string()))?;
+        if args.len() > 128 || args.iter().any(|value| !value.is_string()) {
+            return Err(AppError::InvalidInput(
+                "MCP stdio args must be a bounded string array".to_string(),
+            ));
+        }
+    }
+    if let Some(env) = object.get("env") {
+        let env = env
+            .as_object()
+            .ok_or_else(|| AppError::InvalidInput("MCP stdio env must be an object".to_string()))?;
+        if env.len() > 128 {
+            return Err(AppError::InvalidInput(
+                "MCP stdio env exceeds the supported entry limit".to_string(),
+            ));
+        }
+        for reference in env.values() {
+            let reference = reference.as_str().ok_or_else(|| {
+                AppError::InvalidInput("MCP stdio env values must be env:// references".to_string())
+            })?;
+            if !reference.starts_with("env://") {
+                return Err(AppError::InvalidInput(
+                    "MCP stdio env values must use env:// references".to_string(),
+                ));
+            }
+            crate::features::agent_platform::secret_resolver::validate_secret_ref(reference)?;
+        }
+    }
+    Ok(())
+}
+
+fn canonical_mcp_transport(transport: &str) -> Result<&'static str, AppError> {
+    match transport {
+        "stdio" => Ok("stdio"),
+        "http" => Ok("http"),
+        "sse" => Ok("sse"),
+        "streamable-http" | "streamable_http" => Ok("streamable-http"),
+        "json-rpc" => Ok("json-rpc"),
+        other => Err(AppError::InvalidInput(format!(
+            "unsupported MCP transport: {other}"
+        ))),
+    }
+}
+
+fn normalized_mcp_config(config: &serde_json::Value) -> serde_json::Value {
+    let mut config = config.as_object().cloned().unwrap_or_default();
+    config.remove("type");
+    config.remove("transport");
+    serde_json::Value::Object(config)
+}
+
 async fn upsert_discovered_mcp_tools(
     pool: &sqlx::PgPool,
     tenant_id: Uuid,
@@ -512,6 +716,17 @@ async fn upsert_discovered_mcp_tools(
     tools: &[DiscoveredMcpTool],
 ) -> Result<Vec<ResourceResponse>, AppError> {
     let mut tx = pool.begin().await?;
+    sqlx::query(
+        r#"
+        UPDATE mcp_tools
+        SET status = 'disabled', updated_at = CURRENT_TIMESTAMP
+        WHERE tenant_id = $1 AND mcp_server_id = $2 AND status <> 'disabled'
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(mcp_server_id)
+    .execute(&mut *tx)
+    .await?;
     let mut responses = Vec::with_capacity(tools.len());
     for tool in tools {
         let row = sqlx::query(
@@ -551,7 +766,12 @@ async fn upsert_discovered_mcp_tools(
     sqlx::query(
         r#"
         UPDATE mcp_servers
-        SET updated_at = CURRENT_TIMESTAMP
+        SET health_status = 'healthy',
+            last_health_check_at = CURRENT_TIMESTAMP,
+            last_discovered_at = CURRENT_TIMESTAMP,
+            consecutive_failures = 0,
+            health_error = NULL,
+            updated_at = CURRENT_TIMESTAMP
         WHERE id = $1 AND tenant_id = $2
         "#,
     )
@@ -564,6 +784,32 @@ async fn upsert_discovered_mcp_tools(
         .await
         .map_err(|_| AppError::DatabaseTransaction)?;
     Ok(responses)
+}
+
+async fn record_mcp_discovery_failure(
+    pool: &sqlx::PgPool,
+    tenant_id: Uuid,
+    mcp_server_id: Uuid,
+    error: &str,
+) -> Result<(), AppError> {
+    let error: String = error.chars().take(2_000).collect();
+    sqlx::query(
+        r#"
+        UPDATE mcp_servers
+        SET health_status = 'unhealthy',
+            last_health_check_at = CURRENT_TIMESTAMP,
+            consecutive_failures = consecutive_failures + 1,
+            health_error = $3,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+        "#,
+    )
+    .bind(mcp_server_id)
+    .bind(tenant_id)
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -584,6 +830,23 @@ mod tests {
         },
     };
 
+    #[test]
+    fn stdio_mcp_configuration_requires_environment_references() {
+        assert!(
+            validate_mcp_server_configuration(
+                "stdio",
+                &json!({"command": "node", "args": ["server.mjs"], "env": {"TOKEN": "env://MCP_TOKEN"}}),
+            )
+            .is_ok()
+        );
+        let error = validate_mcp_server_configuration(
+            "stdio",
+            &json!({"command": "node", "env": {"TOKEN": "inline-secret"}}),
+        )
+        .expect_err("inline stdio env must be rejected");
+        assert!(error.to_string().contains("env://"));
+    }
+
     #[tokio::test]
     #[ignore = "requires local Postgres and the bibi_work schema"]
     async fn discovered_mcp_tools_are_upserted_with_schema_hash()
@@ -603,10 +866,20 @@ mod tests {
             schema: json!({"inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}}}),
             schema_hash: "sha256:second".to_string(),
         };
+        let removed = DiscoveredMcpTool {
+            name: "removed_tool".to_string(),
+            description: Some("Removed on the next discovery".to_string()),
+            schema: json!({"inputSchema": {"type": "object", "properties": {}}}),
+            schema_hash: "sha256:removed".to_string(),
+        };
 
-        let created =
-            upsert_discovered_mcp_tools(&state.connect_pool, tenant_id, mcp_server_id, &[first])
-                .await?;
+        let created = upsert_discovered_mcp_tools(
+            &state.connect_pool,
+            tenant_id,
+            mcp_server_id,
+            &[first, removed],
+        )
+        .await?;
         let updated =
             upsert_discovered_mcp_tools(&state.connect_pool, tenant_id, mcp_server_id, &[second])
                 .await?;
@@ -630,6 +903,39 @@ mod tests {
         .fetch_one(&state.connect_pool)
         .await?;
         assert_eq!(count, 1);
+        let removed_status: String = sqlx::query_scalar(
+            "SELECT status FROM mcp_tools WHERE mcp_server_id = $1 AND name = 'removed_tool'",
+        )
+        .bind(mcp_server_id)
+        .fetch_one(&state.connect_pool)
+        .await?;
+        assert_eq!(removed_status, "disabled");
+        let server_health: String =
+            sqlx::query_scalar("SELECT health_status FROM mcp_servers WHERE id = $1")
+                .bind(mcp_server_id)
+                .fetch_one(&state.connect_pool)
+                .await?;
+        assert_eq!(server_health, "healthy");
+
+        record_mcp_discovery_failure(
+            &state.connect_pool,
+            tenant_id,
+            mcp_server_id,
+            &"x".repeat(3_000),
+        )
+        .await?;
+        let failure_row = sqlx::query(
+            "SELECT health_status, consecutive_failures, char_length(health_error) AS error_length FROM mcp_servers WHERE id = $1",
+        )
+        .bind(mcp_server_id)
+        .fetch_one(&state.connect_pool)
+        .await?;
+        assert_eq!(
+            failure_row.try_get::<String, _>("health_status")?,
+            "unhealthy"
+        );
+        assert_eq!(failure_row.try_get::<i32, _>("consecutive_failures")?, 1);
+        assert_eq!(failure_row.try_get::<i32, _>("error_length")?, 2_000);
 
         cleanup_tenant(&state.connect_pool, tenant_id).await?;
         Ok(())
@@ -689,6 +995,11 @@ mod tests {
                 worker_max_attempts: 1,
             })?,
             internal_shared_token: "test-internal-token".to_string(),
+            audit_partition_cleanup_enabled: false,
+            secret_resolver:
+                crate::features::agent_platform::secret_resolver::SecretResolver::env_only_for_tests(
+                ),
+            credential_rotation_worker_enabled: false,
         })
     }
 

@@ -1,0 +1,29 @@
+{
+  "pageTitle": "BiWork - Iniciar sesión",
+  "brand": "BiWork",
+  "subtitle": "Plataforma de IA para empresas",
+  "username": "Usuario",
+  "usernamePlaceholder": "Ingresa tu usuario",
+  "password": "Contraseña",
+  "passwordPlaceholder": "Ingresa tu contraseña",
+  "rememberMe": "Recordarme",
+  "oidcRedirecting": "Redirigiendo a FerrisKey...",
+  "oidcSubmit": "Continuar con FerrisKey",
+  "oidcSubmitting": "Abriendo FerrisKey...",
+  "submit": "Iniciar sesión",
+  "submitting": "Iniciando sesión...",
+  "success": "¡Sesión iniciada! Redirigiendo...",
+  "showPassword": "Mostrar contraseña",
+  "hidePassword": "Ocultar contraseña",
+  "languageToggle": "Cambiar idioma",
+  "footerPrimary": "Transforma tu IA de línea de comandos",
+  "footerSecondary": "Moderno y eficiente",
+  "errors": {
+    "empty": "Ingresa usuario y contraseña",
+    "invalidCredentials": "Usuario o contraseña inválidos",
+    "tooManyAttempts": "Demasiados intentos, vuelve a intentarlo más tarde",
+    "networkError": "Error de conexión, intenta de nuevo",
+    "serverError": "Error del servidor, intenta más tarde",
+    "unknown": "Error al iniciar sesión, intenta de nuevo"
+  }
+}

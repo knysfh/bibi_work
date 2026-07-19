@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Instant};
 
 use serde_json::Value;
 use sqlx::{PgPool, Row};
@@ -7,6 +7,7 @@ use tracing::warn;
 use super::models::{
     AuthzBatchCheckRequest, AuthzBatchCheckResponse, AuthzCheckRequest, AuthzDecision,
 };
+use super::process_metrics;
 
 const LOCAL_POLICY_VERSION: &str = "local-policy-v1";
 const LOCAL_POLICY_ERROR: &str = "local-policy-error";
@@ -35,7 +36,10 @@ impl ResourceAuthzService {
     }
 
     pub async fn check(&self, request: &AuthzCheckRequest) -> AuthzDecision {
-        match self.check_local(request).await {
+        let started_at = Instant::now();
+        let result = self.check_local(request).await;
+        process_metrics::observe_authz_check(started_at.elapsed(), result.is_ok());
+        match result {
             Ok(decision) => decision,
             Err(err) => {
                 warn!("local authz check failed closed: {}", err);
@@ -383,7 +387,9 @@ fn default_tenant_member_allow(
         | ("read", "project")
         | ("read", "file")
         | ("run", "conversation") => true,
-        ("read" | "update", "memory") => request.resource.id == request.actor.user_id.to_string(),
+        ("read" | "update", "memory" | "user_settings") => {
+            request.resource.id == request.actor.user_id.to_string()
+        }
         _ => false,
     }
 }
@@ -485,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn tenant_member_default_allows_only_own_memory() {
+    fn tenant_member_default_allows_only_own_memory_and_user_settings() {
         let mut req = request("read", "memory", String::new());
         req.resource.id = req.actor.user_id.to_string();
 
@@ -494,6 +500,18 @@ mod tests {
         req.resource.id = Uuid::new_v4().to_string();
 
         assert!(!default_tenant_member_allow(&req, &tenant_member()));
+
+        let mut settings_req = request("update", "user_settings", String::new());
+        settings_req.resource.id = settings_req.actor.user_id.to_string();
+
+        assert!(default_tenant_member_allow(&settings_req, &tenant_member()));
+
+        settings_req.resource.id = Uuid::new_v4().to_string();
+
+        assert!(!default_tenant_member_allow(
+            &settings_req,
+            &tenant_member()
+        ));
     }
 
     #[test]

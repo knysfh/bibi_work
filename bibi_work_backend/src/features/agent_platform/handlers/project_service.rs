@@ -207,6 +207,79 @@ pub async fn list_conversations(
     Ok(Json(conversations))
 }
 
+pub async fn update_conversation(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<PlatformRequestContext>,
+    Path(conversation_id): Path<Uuid>,
+    Json(payload): Json<UpdateConversationRequest>,
+) -> Result<Json<ConversationResponse>, AppError> {
+    ensure_tenant_member(&state.connect_pool, payload.tenant_id, ctx.platform_user_id).await?;
+    let current = sqlx::query(
+        r#"
+        SELECT workspace_id, project_id
+        FROM conversations
+        WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(payload.tenant_id)
+    .fetch_optional(&state.connect_pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("conversation not found".to_string()))?;
+    let workspace_id: Option<Uuid> = current.try_get("workspace_id")?;
+    let current_project_id: Option<Uuid> = current.try_get("project_id")?;
+    require_ferriskey_allow(
+        &state,
+        &ctx,
+        payload.tenant_id,
+        "manage",
+        "conversation",
+        conversation_id.to_string(),
+        Some(AuthzContext {
+            conversation_id: Some(conversation_id),
+            project_id: current_project_id,
+            ..Default::default()
+        }),
+    )
+    .await?;
+
+    let workspace_scope =
+        load_workspace_conversation_defaults(&state, payload.tenant_id, workspace_id).await?;
+    let requested_project_id = match payload.project_id {
+        NullableUuidPatch::Missing => {
+            return Err(AppError::InvalidInput("project_id is required".to_string()));
+        }
+        NullableUuidPatch::Clear => None,
+        NullableUuidPatch::Set(project_id) => {
+            ensure_project_in_tenant(&state, payload.tenant_id, project_id).await?;
+            Some(project_id)
+        }
+    };
+    let project_id = resolve_workspace_project(
+        requested_project_id,
+        workspace_scope
+            .as_ref()
+            .and_then(|scope| scope.remote_project_id),
+    )?;
+
+    let row = sqlx::query(
+        r#"
+        UPDATE conversations
+        SET project_id = $3, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+        RETURNING id, tenant_id, workspace_id, project_id, agent_id, title, status,
+                  metadata, created_at, updated_at
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(payload.tenant_id)
+    .bind(project_id)
+    .fetch_one(&state.connect_pool)
+    .await?;
+
+    Ok(Json(conversation_from_row(row)?))
+}
+
 struct WorkspaceConversationDefaults {
     remote_project_id: Option<Uuid>,
     default_agent_id: Option<Uuid>,
@@ -236,6 +309,33 @@ async fn load_workspace_conversation_defaults(
         remote_project_id: row.try_get("remote_project_id")?,
         default_agent_id: row.try_get("default_agent_id")?,
     }))
+}
+
+async fn ensure_project_in_tenant(
+    state: &AppState,
+    tenant_id: Uuid,
+    project_id: Uuid,
+) -> Result<(), AppError> {
+    let exists: bool = sqlx::query(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM projects
+            WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+        ) AS exists
+        "#,
+    )
+    .bind(project_id)
+    .bind(tenant_id)
+    .fetch_one(&state.connect_pool)
+    .await?
+    .try_get("exists")?;
+    if exists {
+        Ok(())
+    } else {
+        Err(AppError::InvalidInput(
+            "project is not in tenant".to_string(),
+        ))
+    }
 }
 
 fn resolve_workspace_project(

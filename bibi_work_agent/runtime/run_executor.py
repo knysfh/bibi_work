@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import time
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -8,10 +9,14 @@ from uuid import uuid4
 
 from bibi_work_agent.clients.rust_client import RustClient
 from bibi_work_agent.runtime.agent_factory import create_platform_agent
-from bibi_work_agent.runtime.cancellation import is_run_cancelled
+from bibi_work_agent.runtime.cancellation import RunCancelled, is_run_cancelled
 from bibi_work_agent.runtime.event_emitter import EventEmitter
 from bibi_work_agent.runtime.event_normalizer import AgentEventNormalizer
 from bibi_work_agent.runtime.memory_candidates import MemoryCandidateCollector
+from bibi_work_agent.runtime.snapshot_contract import (
+    safe_error_message,
+    validate_run_config_snapshot,
+)
 from bibi_work_agent.tools.wrapper import ToolRequiresApproval
 
 
@@ -19,10 +24,11 @@ WAITING_EVENT_TYPES = {"interrupt.requested", "approval.requested"}
 
 
 def execute_run_payload(worker_task_id: str | None, payload: dict[str, Any]) -> None:
-    tenant_id = payload["tenant_id"]
-    conversation_id = payload["conversation_id"]
-    run_id = payload["run_id"]
-    trace_id = payload["trace_id"]
+    payload = prepare_agent_payload(payload)
+    tenant_id = required_dispatch_field(payload, "tenant_id")
+    conversation_id = required_dispatch_field(payload, "conversation_id")
+    run_id = required_dispatch_field(payload, "run_id")
+    trace_id = payload.get("trace_id")
     started = int(time.time() * 1000)
     rust = RustClient()
     emitter = EventEmitter(
@@ -41,6 +47,22 @@ def execute_run_payload(worker_task_id: str | None, payload: dict[str, Any]) -> 
         )
         return
 
+    try:
+        validate_run_config_snapshot(payload.get("run_config_snapshot"))
+    except Exception as exc:  # noqa: BLE001
+        error = safe_error_message(exc)
+        emitter.emit(
+            [
+                {
+                    "event_id": f"run.failed.{run_id}.{uuid4()}",
+                    "type": "run.failed",
+                    "payload": {"run_id": run_id, "error": error},
+                    "trace_id": trace_id,
+                }
+            ]
+        )
+        raise RuntimeError(error) from None
+
     emitter.emit(
         [
             {
@@ -54,7 +76,21 @@ def execute_run_payload(worker_task_id: str | None, payload: dict[str, Any]) -> 
 
     try:
         memory_candidates = MemoryCandidateCollector()
-        cancelled = run_deepagent(payload, emitter, memory_candidates=memory_candidates)
+        completion_results: list[Any] = []
+        cancelled = run_deepagent(
+            payload,
+            emitter,
+            memory_candidates=memory_candidates,
+            completion_results=completion_results,
+        )
+    except RunCancelled as exc:
+        emit_cancelled(
+            run_id=run_id,
+            trace_id=trace_id,
+            emitter=emitter,
+            reason=exc.reason,
+        )
+        return
     except ToolRequiresApproval as exc:
         emit_approval_requested(
             run_id=run_id,
@@ -65,17 +101,18 @@ def execute_run_payload(worker_task_id: str | None, payload: dict[str, Any]) -> 
         )
         return
     except Exception as exc:  # noqa: BLE001 - worker must report failures to Rust.
+        error = safe_error_message(exc)
         emitter.emit(
             [
                 {
                     "event_id": f"run.failed.{run_id}.{uuid4()}",
                     "type": "run.failed",
-                    "payload": {"run_id": run_id, "error": str(exc)},
+                    "payload": {"run_id": run_id, "error": error},
                     "trace_id": trace_id,
                 }
             ]
         )
-        raise
+        raise RuntimeError(error) from None
 
     if cancelled:
         return
@@ -84,6 +121,8 @@ def execute_run_payload(worker_task_id: str | None, payload: dict[str, Any]) -> 
         "run_id": run_id,
         "duration_ms": int(time.time() * 1000) - started,
     }
+    if completion_results:
+        completion_payload["result"] = completion_results[-1]
     candidates = memory_candidates.candidates()
     if candidates:
         completion_payload["memory_candidates"] = candidates
@@ -105,6 +144,7 @@ def run_deepagent(
     emitter: EventEmitter,
     *,
     memory_candidates: MemoryCandidateCollector | None = None,
+    completion_results: list[Any] | None = None,
 ) -> bool:
     payload = prepare_agent_payload(payload)
     run_id = payload["run_id"]
@@ -117,11 +157,12 @@ def run_deepagent(
 
     snapshot = payload.get("run_config_snapshot", {})
     agent = create_platform_agent(snapshot)
-    input_payload = payload.get("input", {})
+    input_payload = agent_input_payload(payload.get("input", {}), snapshot)
     graph_config = graph_config_for_payload(payload)
     normalizer = AgentEventNormalizer(
         run_id=run_id,
         trace_id=trace_id,
+        message_context=message_context_from_snapshot(snapshot),
     )
 
     emitted_any = False
@@ -138,6 +179,7 @@ def run_deepagent(
                 )
                 return True
             events = normalizer.normalize(raw_event)
+            capture_completion_results(events, completion_results)
             if memory_candidates is not None:
                 for event in events:
                     memory_candidates.observe(event)
@@ -165,20 +207,72 @@ def run_deepagent(
             return True
         emitted_any = True
         completed_event = normalizer.completed_message(result)
+        capture_completion_results([completed_event], completion_results)
+        if memory_candidates is not None:
+            memory_candidates.observe(completed_event)
+        emitter.emit([completed_event])
+
+    completed_event = normalizer.pending_completed_message()
+    if completed_event is not None:
+        emitted_any = True
+        capture_completion_results([completed_event], completion_results)
         if memory_candidates is not None:
             memory_candidates.observe(completed_event)
         emitter.emit([completed_event])
 
     if not emitted_any:
-        emitter.emit(
-            [
-                normalizer.completed_message(
-                    {"message": "agent finished without streamable platform events"}
-                )
-            ]
+        completed_event = (
+            normalizer.platform_tool_result_completed_message()
+            or normalizer.completed_message(
+                {"message": "Run completed without an assistant response."}
+            )
         )
+    if not emitted_any and completed_event is not None:
+        capture_completion_results([completed_event], completion_results)
+        emitter.emit([completed_event])
 
     return False
+
+
+def agent_input_payload(input_payload: Any, snapshot: dict[str, Any]) -> Any:
+    workflow = snapshot.get("workflow")
+    if not isinstance(workflow, dict) or not isinstance(input_payload, dict):
+        return input_payload
+    if isinstance(input_payload.get("messages"), list):
+        return input_payload
+
+    node = input_payload.get("node")
+    instruction = node.get("instruction") if isinstance(node, dict) else None
+    context = input_payload.get("node_input")
+    if context is None:
+        context = {
+            "workflow_input": input_payload.get("workflow_input"),
+            "upstream_outputs": input_payload.get("upstream_outputs", {}),
+        }
+    content_parts = []
+    if isinstance(instruction, str) and instruction.strip():
+        content_parts.append(instruction.strip())
+    content_parts.append(
+        "Workflow node input:\n"
+        + json.dumps(context, ensure_ascii=False, separators=(",", ":"), default=str)
+    )
+    return {
+        **input_payload,
+        "messages": [{"role": "user", "content": "\n\n".join(content_parts)}],
+    }
+
+
+def capture_completion_results(
+    events: Iterable[dict[str, Any]], result_sink: list[Any] | None
+) -> None:
+    if result_sink is None:
+        return
+    for event in events:
+        if event.get("type") != "message.completed":
+            continue
+        payload = event.get("payload")
+        if isinstance(payload, dict) and "result" in payload:
+            result_sink.append(payload["result"])
 
 
 def prepare_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -188,6 +282,8 @@ def prepare_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
         value = prepared.get(key)
         if value is not None:
             snapshot[key] = value
+        elif snapshot.get(key) is not None:
+            prepared[key] = snapshot[key]
 
     thread_id = (
         prepared.get("thread_id") or snapshot.get("thread_id") or prepared.get("run_id")
@@ -197,6 +293,27 @@ def prepare_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
         snapshot["thread_id"] = str(thread_id)
     prepared["run_config_snapshot"] = snapshot
     return prepared
+
+
+def message_context_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    cron = snapshot.get("cron")
+    if not isinstance(cron, dict):
+        return {}
+    context: dict[str, Any] = {}
+    job_id = cron.get("job_id") or cron.get("cron_job_id")
+    if job_id:
+        context["cron_job_id"] = str(job_id)
+    job_name = cron.get("job_name") or cron.get("cron_job_name")
+    if job_name:
+        context["cron_job_name"] = str(job_name)
+    return context
+
+
+def required_dispatch_field(payload: dict[str, Any], key: str) -> str:
+    value = payload.get(key)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        raise RuntimeError(f"{key} is required for agent run dispatch")
+    return str(value)
 
 
 def graph_config_for_payload(payload: dict[str, Any]) -> dict[str, Any]:

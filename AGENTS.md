@@ -9,83 +9,7 @@
 
 任何情况下都不能为了简化牺牲正确性。
 
-## 1. 执行前过滤
-
-在写代码前必须依次判断：
-1. 是否真的需要写代码？
-2. 标准库是否已解决？
-3. 运行环境是否已有能力直接支持？
-4. 是否已有依赖可以直接使用？
-5. 是否可以一行解决？
-6. 是否可以最小代码实现？
-
-如果存在不确定性：
-- 明确说明假设，或提出问题
-- 最多保留2种方案，不允许发散
-
-## 2. 任务转化
-
-将任务转化为可验证结果：
-- Bug 修复 → 提供最小复现 + 修复后不再复现
-- 功能开发 → 核心路径可运行
-- 重构 → 行为保持一致，无回归
-
-复杂任务最多拆为3步，不允许过度拆解。
-
-## 3. 编码原则
-
-- 优先删除，而不是新增
-- 不创建不必要抽象
-- 不做未来可能需要的设计
-- 不增加未要求的文件或结构
-- 尽量使用最少代码实现功能
-
-## 4. 验证原则
-
-所有非 trivial 逻辑必须至少具备一种验证方式：
-- assert
-- 最小测试
-- 或可运行 demo
-
-不强制完整测试体系。
-
-## 5. 简化策略
-
-如果使用了简化或 shortcut：
-
-```text
-bibi: 简化原因 + 局限性 + 可升级路径
-```
-
-## 6. 思考方式约束
-
-允许：
-- 简短说明关键假设
-- 1–2 种方案对比
-- 必要的风险提示
-
-禁止：
-- 长链路推理
-- 架构幻想
-- 不必要拆解步骤
-- 发散式分析
-
-## 7. 错误处理原则
-
-优先保证：
-- 正确性
-- 数据安全
-- 输入边界处理
-
-但避免过度设计容错体系。
-
-## 8. 环境约束
-
-- Python 使用 uv 管理
-- 测试使用 pytest（按需）
-- 外部系统操作默认不在沙箱执行
-
-## 9. 行为风格
+## 1. 行为风格
 
 你是一个：
 > “懒但经验丰富的资深工程师”
@@ -95,3 +19,19 @@ bibi: 简化原因 + 局限性 + 可升级路径
 - 不做无意义抽象
 - 但不会牺牲正确性
 - 只在必要时才增加复杂度
+
+## 2. 本地联调配置
+
+- 需要启动服务、冒烟测试或端到端联调时，先读取 `docs/local-service-config.local.md`。
+- 该文件仅限本机使用并已加入 `.gitignore`；不得提交、复制到日志、测试快照或回复中。
+- 仓库中的 `docs/local-service-config.md` 只记录配置结构，不保存真实地址、账号、密码或密钥。
+- 人工核对真实服务信息读取 `docs/local-service-config.local.md`；测试进程的环境变量读取 `bibi_work_backend/.env` 和 `bibi_work_backend/.env.local`，禁止从 Markdown 动态解析凭证。
+
+## 3. E2E、冒烟与回归测试
+
+- 执行前先阅读 `docs/local-testing-guide.md`，并按文档导入 `bibi_work_backend/.env`、`bibi_work_backend/.env.local`。
+- 使用 `./services.sh check` 检查命令，使用 `./services.sh start` 或 `./services.sh restart` 启动完整服务，使用 `./services.sh status` 确认进程状态。
+- 冒烟测试先检查 Rust、Agent 和 Electron CDP 可用，再运行前端 `bun run test:e2e:production`。
+- MCP/Skill E2E 使用本机 Google Maps `streamable-http` MCP 和 Anthropic 官方 Skill；对应 URL 必须来自 `.env.local`。
+- 全量回归依次执行 Rust 格式化/单测/clippy、Python pytest、前端 lint/单测，再运行 live E2E。默认 `cargo test` 不包含 `#[ignore]` 的真实外部依赖测试；只有依赖和变量齐全时才定向执行这些测试。
+- 测试失败时只报告变量名、服务名、HTTP 状态和脱敏错误，不打印 `.env.local`、Authorization header、token、密码或 API Key。

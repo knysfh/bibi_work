@@ -2,6 +2,12 @@
 application:
   host: 0.0.0.0
   port: 8361
+telemetry:
+  otlp_enabled: false
+  otlp_endpoint: null
+  service_name: bibi-work-backend
+  trace_sample_ratio: 1.0
+  timeout_milliseconds: 5000
 database:
   database_name: bibi_work
   host: 127.0.0.1
@@ -28,6 +34,10 @@ agent_runtime:
   base_url: null
   shared_token: ${APP_INTERNAL__SHARED_TOKEN}
   timeout_milliseconds: 5000
+mcp_health:
+  worker_enabled: true
+  interval_seconds: 60
+  batch_size: 100
 object_store:
   enabled: true
   endpoint: "http://localhost:9004"
@@ -52,3 +62,32 @@ audit_hash_chain:
   worker_interval_milliseconds: 60000
   worker_tenant_batch_size: 20
   segment_max_rows: 1000
+audit_archive:
+  enabled: true
+  worker_interval_milliseconds: 60000
+  segment_batch_size: 20
+  minimum_age_days: 0
+  retention_days: 2555
+  max_attempts: 5
+audit_partition:
+  maintenance_enabled: true
+  worker_interval_milliseconds: 3600000
+  months_ahead: 3
+  cleanup_enabled: false
+secret_resolver:
+  timeout_milliseconds: 5000
+  vault_enabled: false
+  vault_base_url: null
+  vault_token_ref: null
+  vault_namespace: null
+  kms_enabled: false
+  kms_base_url: null
+  kms_auth_token_ref: null
+  rotation_gateway_enabled: false
+  rotation_gateway_base_url: null
+  rotation_gateway_auth_token_ref: null
+credential_rotation:
+  worker_enabled: false
+  worker_interval_milliseconds: 60000
+  batch_size: 10
+  stale_claim_seconds: 900

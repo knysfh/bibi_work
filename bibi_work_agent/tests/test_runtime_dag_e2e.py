@@ -16,6 +16,8 @@ class FakeRust:
 
 class WorkflowNodeAgent:
     def stream(self, input_payload, config=None):  # noqa: ARG002
+        assert input_payload["messages"][0]["role"] == "user"
+        assert "Workflow node input:" in input_payload["messages"][0]["content"]
         node_key = input_payload["node_key"]
         upstream_outputs = input_payload.get("upstream_outputs", {})
         if node_key == "a":
@@ -37,6 +39,42 @@ class WorkflowNodeAgent:
         }
 
 
+def workflow_run_snapshot(
+    *,
+    tenant_id: str,
+    conversation_id: str,
+    run_id: str,
+    thread_id: str,
+    workflow_run_id: str,
+    node_key: str,
+) -> dict:
+    return {
+        "runtime": {"kind": "deepagents"},
+        "tenant_id": tenant_id,
+        "conversation_id": conversation_id,
+        "run_id": run_id,
+        "thread_id": thread_id,
+        "actor": {"user_id": str(uuid4())},
+        "workflow": {
+            "workflow_run_id": workflow_run_id,
+            "node_key": node_key,
+        },
+        "agent": {
+            "id": str(uuid4()),
+            "model": {
+                "provider": "test",
+                "model_name": "fake-model",
+            },
+            "system_prompt": "DAG node",
+        },
+        "tools": [],
+        "skills": [],
+        "mcp_tools": [],
+        "workspace": {"workspace_id": str(uuid4()), "local_mounts": []},
+        "ui": {"client": "biwork"},
+    }
+
+
 def test_runtime_executes_three_workflow_node_payloads_in_dag_order(
     monkeypatch,
 ) -> None:
@@ -54,12 +92,13 @@ def test_runtime_executes_three_workflow_node_payloads_in_dag_order(
 
     for node_key in ("a", "b", "c"):
         run_id = str(uuid4())
+        thread_id = f"workflow:{workflow_run_id}:node:{node_key}:attempt:1"
         payload = {
             "tenant_id": tenant_id,
             "conversation_id": conversation_id,
             "run_id": run_id,
             "trace_id": f"trace-{node_key}",
-            "thread_id": f"workflow:{workflow_run_id}:node:{node_key}:attempt:1",
+            "thread_id": thread_id,
             "input": {
                 "run_id": run_id,
                 "workflow_run_id": workflow_run_id,
@@ -67,21 +106,18 @@ def test_runtime_executes_three_workflow_node_payloads_in_dag_order(
                 "workflow_input": {"seed": True},
                 "upstream_outputs": dict(outputs),
             },
-            "run_config_snapshot": {
-                "tenant_id": tenant_id,
-                "conversation_id": conversation_id,
-                "run_id": run_id,
-                "thread_id": f"workflow:{workflow_run_id}:node:{node_key}:attempt:1",
-                "actor": {"user_id": str(uuid4())},
-                "workflow": {
-                    "workflow_run_id": workflow_run_id,
-                    "node_key": node_key,
-                },
-                "agent": {"model": "fake-model", "system_prompt": "DAG node"},
-            },
+            "run_config_snapshot": workflow_run_snapshot(
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                run_id=run_id,
+                thread_id=thread_id,
+                workflow_run_id=workflow_run_id,
+                node_key=node_key,
+            ),
         }
         run_executor.execute_run_payload(f"task-{node_key}", payload)
         outputs[node_key] = latest_message_result(fake_rust)
+        assert latest_run_completion_result(fake_rust) == outputs[node_key]
 
     assert outputs["a"]["value"] == "a:seed"
     assert outputs["b"]["value"] == "b:a:seed"
@@ -111,3 +147,11 @@ def latest_message_result(fake_rust: FakeRust) -> dict:
             if event["type"] == "message.completed":
                 return event["payload"]["result"]
     raise AssertionError("message.completed event was not emitted")
+
+
+def latest_run_completion_result(fake_rust: FakeRust) -> dict:
+    for batch in reversed(fake_rust.emitted_batches):
+        for event in reversed(batch["events"]):
+            if event["type"] == "run.completed":
+                return event["payload"]["result"]
+    raise AssertionError("run.completed event was not emitted")

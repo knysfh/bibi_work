@@ -7,11 +7,18 @@ use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::features::{agent_platform::rustfs::RustFsClient, core::errors::AppError};
+use crate::features::{
+    agent_platform::{memory_context, rustfs::RustFsClient},
+    core::errors::AppError,
+};
 
-const AUDIT_SEGMENT_CONTENT_TYPE: &str = "application/vnd.bibi-work.audit-segment+json";
+pub(crate) const AUDIT_SEGMENT_CONTENT_TYPE: &str = "application/vnd.bibi-work.audit-segment+json";
 const APPROVAL_EVIDENCE_CONTENT_TYPE: &str = "application/vnd.bibi-work.approval-evidence+json";
 const TOOL_CALL_EVIDENCE_CONTENT_TYPE: &str = "application/vnd.bibi-work.tool-call-evidence+json";
+const AUDIT_SUMMARY_MAX_CHARS: usize = 4_096;
+const AUDIT_EVIDENCE_MAX_DEPTH: usize = 12;
+const AUDIT_EVIDENCE_MAX_ARRAY_ITEMS: usize = 100;
+const AUDIT_EVIDENCE_MAX_OBJECT_FIELDS: usize = 100;
 pub const NO_UNSEALED_AUDIT_ROWS_MESSAGE: &str = "no unsealed audit hash chain rows found";
 
 #[derive(Debug, Clone)]
@@ -60,6 +67,19 @@ pub struct AuditHashChainBreak {
     pub actual_prev_hash: Option<String>,
     pub expected_row_hash: Option<String>,
     pub actual_row_hash: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuditHashBackfillReport {
+    pub tenant_id: Uuid,
+    pub unhashed_rows: i64,
+    pub hashed_rows: i64,
+    pub sealed_segments: i64,
+    pub executable_in_place: bool,
+    pub requires_offline_rechain: bool,
+    pub dry_run: bool,
+    pub updated_rows: i64,
+    pub reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,6 +181,15 @@ pub async fn insert_audit_log_tx(
     tx: &mut Transaction<'_, Postgres>,
     entry: NewAuditLog<'_>,
 ) -> Result<Uuid, AppError> {
+    let sanitized_input_summary = entry.input_summary.map(sanitize_audit_text);
+    let sanitized_output_summary = entry.output_summary.map(sanitize_audit_text);
+    let sanitized_user_agent = entry.user_agent.map(sanitize_audit_text);
+    let entry = NewAuditLog {
+        input_summary: sanitized_input_summary.as_deref(),
+        output_summary: sanitized_output_summary.as_deref(),
+        user_agent: sanitized_user_agent.as_deref(),
+        ..entry
+    };
     lock_tenant_chain(tx, entry.tenant_id).await?;
 
     let previous_hash: Option<String> = sqlx::query(
@@ -265,6 +294,135 @@ pub async fn verify_audit_hash_chain(
     .collect::<Result<Vec<_>, AppError>>()?;
 
     verify_stored_audit_rows(tenant_id, rows)
+}
+
+pub async fn audit_hash_backfill_status(
+    pool: &PgPool,
+    tenant_id: Uuid,
+) -> Result<AuditHashBackfillReport, AppError> {
+    let mut tx = pool.begin().await?;
+    lock_tenant_chain(&mut tx, tenant_id).await?;
+    let report = audit_hash_backfill_report_tx(&mut tx, tenant_id, true, 0).await?;
+    tx.commit().await?;
+    Ok(report)
+}
+
+pub async fn backfill_historical_audit_hashes(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    dry_run: bool,
+) -> Result<AuditHashBackfillReport, AppError> {
+    let mut tx = pool.begin().await?;
+    lock_tenant_chain(&mut tx, tenant_id).await?;
+    let initial = audit_hash_backfill_report_tx(&mut tx, tenant_id, dry_run, 0).await?;
+    if dry_run || initial.unhashed_rows == 0 {
+        tx.commit().await?;
+        return Ok(initial);
+    }
+    if !initial.executable_in_place {
+        return Err(AppError::Conflict(initial.reason));
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT id, tenant_id, actor_user_id, actor_device_id, session_id,
+               resource_type, resource_id, action, decision, policy_version, reason_code,
+               run_id, conversation_id, workflow_run_id, tool_call_id, approval_id,
+               args_hash, input_summary, output_summary, risk_level, ip, user_agent, trace_id,
+               created_at
+        FROM audit_logs
+        WHERE tenant_id = $1 AND row_hash IS NULL
+        ORDER BY created_at, id
+        "#,
+    )
+    .bind(tenant_id)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .map(historical_audit_log_from_row)
+    .collect::<Result<Vec<_>, AppError>>()?;
+    let mut previous_hash: Option<String> = None;
+    let mut updated_rows = 0_i64;
+    for row in rows {
+        let row_hash = compute_audit_row_hash(
+            &row.as_new_audit_log(),
+            row.id,
+            row.created_at,
+            previous_hash.as_deref(),
+        )?;
+        let updated = sqlx::query(
+            r#"
+            UPDATE audit_logs
+            SET prev_hash = $2, row_hash = $3
+            WHERE id = $1 AND tenant_id = $4 AND row_hash IS NULL
+            "#,
+        )
+        .bind(row.id)
+        .bind(previous_hash.as_deref())
+        .bind(&row_hash)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            return Err(AppError::Conflict(
+                "historical audit row changed during backfill".to_string(),
+            ));
+        }
+        previous_hash = Some(row_hash);
+        updated_rows += 1;
+    }
+    let report = audit_hash_backfill_report_tx(&mut tx, tenant_id, false, updated_rows).await?;
+    tx.commit().await?;
+    Ok(report)
+}
+
+async fn audit_hash_backfill_report_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    dry_run: bool,
+    updated_rows: i64,
+) -> Result<AuditHashBackfillReport, AppError> {
+    let counts = sqlx::query(
+        r#"
+        SELECT COUNT(*) FILTER (WHERE row_hash IS NULL) AS unhashed_rows,
+               COUNT(*) FILTER (WHERE row_hash IS NOT NULL) AS hashed_rows
+        FROM audit_logs
+        WHERE tenant_id = $1
+        "#,
+    )
+    .bind(tenant_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let unhashed_rows: i64 = counts.try_get("unhashed_rows")?;
+    let hashed_rows: i64 = counts.try_get("hashed_rows")?;
+    let sealed_segments: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_hash_chain_segments WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    let executable_in_place = unhashed_rows > 0 && hashed_rows == 0 && sealed_segments == 0;
+    let requires_offline_rechain = unhashed_rows > 0 && !executable_in_place;
+    let reason = if unhashed_rows == 0 {
+        "no unhashed historical audit rows".to_string()
+    } else if executable_in_place {
+        "tenant has only unhashed rows and no sealed segments; in-place backfill is safe"
+            .to_string()
+    } else {
+        "tenant has an existing hashed or sealed chain; offline rechain and evidence replacement are required"
+            .to_string()
+    };
+    Ok(AuditHashBackfillReport {
+        tenant_id,
+        unhashed_rows,
+        hashed_rows,
+        sealed_segments,
+        executable_in_place,
+        requires_offline_rechain,
+        dry_run,
+        updated_rows,
+        reason,
+    })
 }
 
 pub async fn seal_audit_hash_chain(
@@ -724,7 +882,7 @@ fn audit_segment_manifest(
     })
 }
 
-fn audit_segment_object_key(
+pub(crate) fn audit_segment_object_key(
     tenant_id: Uuid,
     segment_id: Uuid,
     sealed_at: OffsetDateTime,
@@ -748,8 +906,8 @@ fn approval_evidence_payload(input: &ApprovalEvidenceInput, archived_at: OffsetD
         "run_id": input.run_id,
         "tool_call_id": input.tool_call_id,
         "status": input.status,
-        "request_payload": input.request_payload,
-        "decision_payload": input.decision_payload,
+        "request_payload": sanitize_audit_evidence_value(&input.request_payload),
+        "decision_payload": sanitize_audit_evidence_value(&input.decision_payload),
         "decided_at": input.decided_at.map(|value| value.unix_timestamp_nanos().to_string()),
         "archived_at": archived_at.unix_timestamp_nanos().to_string(),
     })
@@ -784,14 +942,89 @@ fn tool_call_evidence_payload(input: &ToolCallEvidenceInput, archived_at: Offset
         "decision": input.decision,
         "policy_version": input.policy_version,
         "args_hash": input.args_hash,
-        "input_summary": input.input_summary,
-        "output_summary": input.output_summary,
-        "error_summary": input.error_summary,
+        "input_summary": input.input_summary.as_deref().map(sanitize_audit_text),
+        "output_summary": input.output_summary.as_deref().map(sanitize_audit_text),
+        "error_summary": input.error_summary.as_deref().map(sanitize_audit_text),
         "risk_level": input.risk_level,
         "trace_id": input.trace_id,
         "completed_at": input.completed_at.map(|value| value.unix_timestamp_nanos().to_string()),
         "archived_at": archived_at.unix_timestamp_nanos().to_string(),
     })
+}
+
+pub(crate) fn sanitize_audit_text(input: &str) -> String {
+    let redacted = memory_context::redact_sensitive_text(input);
+    truncate_chars(&redacted, AUDIT_SUMMARY_MAX_CHARS)
+}
+
+pub(crate) fn sanitize_audit_evidence_value(value: &Value) -> Value {
+    sanitize_audit_evidence_value_at_depth(value, 0)
+}
+
+fn sanitize_audit_evidence_value_at_depth(value: &Value, depth: usize) -> Value {
+    if depth >= AUDIT_EVIDENCE_MAX_DEPTH {
+        return Value::String("[TRUNCATED_DEPTH]".to_string());
+    }
+    match value {
+        Value::Object(map) => {
+            let mut sanitized = serde_json::Map::new();
+            for (index, (key, item)) in map.iter().enumerate() {
+                if index >= AUDIT_EVIDENCE_MAX_OBJECT_FIELDS {
+                    sanitized.insert(
+                        "_truncated_fields".to_string(),
+                        Value::Number((map.len() - index).into()),
+                    );
+                    break;
+                }
+                if is_sensitive_audit_key(key) {
+                    sanitized.insert(key.clone(), Value::String("[REDACTED]".to_string()));
+                } else {
+                    sanitized.insert(
+                        key.clone(),
+                        sanitize_audit_evidence_value_at_depth(item, depth + 1),
+                    );
+                }
+            }
+            Value::Object(sanitized)
+        }
+        Value::Array(items) => {
+            let mut sanitized = items
+                .iter()
+                .take(AUDIT_EVIDENCE_MAX_ARRAY_ITEMS)
+                .map(|item| sanitize_audit_evidence_value_at_depth(item, depth + 1))
+                .collect::<Vec<_>>();
+            if items.len() > AUDIT_EVIDENCE_MAX_ARRAY_ITEMS {
+                sanitized.push(json!({
+                    "_truncated_items": items.len() - AUDIT_EVIDENCE_MAX_ARRAY_ITEMS
+                }));
+            }
+            Value::Array(sanitized)
+        }
+        Value::String(text) => Value::String(sanitize_audit_text(text)),
+        other => other.clone(),
+    }
+}
+
+fn is_sensitive_audit_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase().replace('-', "_");
+    normalized.contains("authorization")
+        || normalized.contains("api_key")
+        || normalized.contains("apikey")
+        || normalized.contains("access_token")
+        || normalized.contains("refresh_token")
+        || normalized.contains("client_secret")
+        || normalized.contains("password")
+        || normalized.contains("secret")
+        || normalized == "token"
+}
+
+fn truncate_chars(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    let mut truncated = input.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...[TRUNCATED]");
+    truncated
 }
 
 fn tool_call_evidence_object_key(
@@ -809,7 +1042,7 @@ fn tool_call_evidence_object_key(
     )
 }
 
-fn sha256_hex(content: &[u8]) -> String {
+pub(crate) fn sha256_hex(content: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content);
     hex::encode(hasher.finalize())
@@ -1009,6 +1242,37 @@ fn stored_audit_log_from_row(row: PgRow) -> Result<StoredAuditLog, AppError> {
     })
 }
 
+fn historical_audit_log_from_row(row: PgRow) -> Result<StoredAuditLog, AppError> {
+    Ok(StoredAuditLog {
+        id: row.try_get("id")?,
+        tenant_id: row.try_get("tenant_id")?,
+        actor_user_id: row.try_get("actor_user_id")?,
+        actor_device_id: row.try_get("actor_device_id")?,
+        session_id: row.try_get("session_id")?,
+        resource_type: row.try_get("resource_type")?,
+        resource_id: row.try_get("resource_id")?,
+        action: row.try_get("action")?,
+        decision: row.try_get("decision")?,
+        policy_version: row.try_get("policy_version")?,
+        reason_code: row.try_get("reason_code")?,
+        run_id: row.try_get("run_id")?,
+        conversation_id: row.try_get("conversation_id")?,
+        workflow_run_id: row.try_get("workflow_run_id")?,
+        tool_call_id: row.try_get("tool_call_id")?,
+        approval_id: row.try_get("approval_id")?,
+        args_hash: row.try_get("args_hash")?,
+        input_summary: row.try_get("input_summary")?,
+        output_summary: row.try_get("output_summary")?,
+        risk_level: row.try_get("risk_level")?,
+        ip: row.try_get("ip")?,
+        user_agent: row.try_get("user_agent")?,
+        trace_id: row.try_get("trace_id")?,
+        prev_hash: None,
+        row_hash: String::new(),
+        created_at: row.try_get("created_at")?,
+    })
+}
+
 impl StoredAuditLog {
     fn as_new_audit_log(&self) -> NewAuditLog<'_> {
         NewAuditLog {
@@ -1052,7 +1316,8 @@ mod tests {
 
     use super::{
         ApprovalEvidenceInput, NewAuditLog, ToolCallEvidenceInput, archive_approval_evidence_tx,
-        archive_tool_call_evidence_tx, compute_audit_row_hash, insert_audit_log_tx,
+        archive_tool_call_evidence_tx, backfill_historical_audit_hashes, compute_audit_row_hash,
+        insert_audit_log_tx, sanitize_audit_evidence_value, sanitize_audit_text,
         seal_audit_hash_chain, should_archive_tool_call_evidence, tool_call_evidence_object_key,
         tool_call_evidence_payload, verify_audit_hash_chain,
     };
@@ -1122,6 +1387,42 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn audit_text_redacts_credentials_and_caps_length() {
+        let input = format!(
+            "authorization: Bearer raw-token api_key=sk-test password=hunter2 {}",
+            "x".repeat(5_000)
+        );
+
+        let sanitized = sanitize_audit_text(&input);
+
+        assert!(!sanitized.contains("raw-token"));
+        assert!(!sanitized.contains("sk-test"));
+        assert!(!sanitized.contains("hunter2"));
+        assert!(sanitized.contains("[REDACTED]"));
+        assert!(sanitized.ends_with("...[TRUNCATED]"));
+    }
+
+    #[test]
+    fn audit_evidence_recursively_redacts_secret_fields_and_values() {
+        let sanitized = sanitize_audit_evidence_value(&json!({
+            "authorization": "Bearer raw-token",
+            "nested": {
+                "client_secret": "secret-value",
+                "safe": "password=hunter2",
+                "items": [{"apiKey": "sk-test"}]
+            }
+        }));
+
+        assert_eq!(sanitized["authorization"], json!("[REDACTED]"));
+        assert_eq!(sanitized["nested"]["client_secret"], json!("[REDACTED]"));
+        assert_eq!(
+            sanitized["nested"]["items"][0]["apiKey"],
+            json!("[REDACTED]")
+        );
+        assert_eq!(sanitized["nested"]["safe"], json!("password=[REDACTED]"));
     }
 
     #[test]
@@ -1306,6 +1607,102 @@ mod tests {
             invalid.broken_at.as_ref().map(|item| item.audit_id),
             Some(second_id)
         );
+
+        sqlx::query("DELETE FROM tenants WHERE id = $1")
+            .bind(tenant_id)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Postgres and the bibi_work schema"]
+    async fn backfills_only_an_unsealed_unhashed_tenant_chain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pool = test_pool().await?;
+        let tenant_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO tenants (id, name, slug) VALUES ($1, 'Backfill test', $2)")
+            .bind(tenant_id)
+            .bind(format!("audit-backfill-test-{tenant_id}"))
+            .execute(&pool)
+            .await?;
+        for (index, action) in ["legacy-read", "legacy-write"].into_iter().enumerate() {
+            sqlx::query(
+                r#"
+                INSERT INTO audit_logs (
+                    tenant_id, resource_type, resource_id, action, decision,
+                    policy_version, input_summary, created_at
+                )
+                VALUES ($1, 'legacy', $2, $3, 'allow', 'legacy-v1', $4,
+                        CURRENT_TIMESTAMP + ($5 * INTERVAL '1 microsecond'))
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(format!("resource-{index}"))
+            .bind(action)
+            .bind(format!("legacy-{index}"))
+            .bind(i64::try_from(index)?)
+            .execute(&pool)
+            .await?;
+        }
+
+        let dry_run = backfill_historical_audit_hashes(&pool, tenant_id, true).await?;
+        assert!(dry_run.executable_in_place);
+        assert_eq!(dry_run.unhashed_rows, 2);
+        let executed = backfill_historical_audit_hashes(&pool, tenant_id, false).await?;
+        assert_eq!(executed.updated_rows, 2);
+        assert_eq!(executed.unhashed_rows, 0);
+        let verification = verify_audit_hash_chain(&pool, tenant_id, 100).await?;
+        assert!(verification.valid);
+        assert_eq!(verification.rows_checked, 2);
+
+        sqlx::query("DELETE FROM tenants WHERE id = $1")
+            .bind(tenant_id)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Postgres and the bibi_work schema"]
+    async fn backfill_fails_closed_for_a_mixed_existing_chain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pool = test_pool().await?;
+        let tenant_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO tenants (id, name, slug) VALUES ($1, 'Mixed backfill test', $2)")
+            .bind(tenant_id)
+            .bind(format!("audit-mixed-backfill-test-{tenant_id}"))
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO audit_logs (
+                tenant_id, resource_type, resource_id, action, decision, policy_version
+            ) VALUES ($1, 'legacy', 'legacy-1', 'read', 'allow', 'legacy-v1')
+            "#,
+        )
+        .bind(tenant_id)
+        .execute(&pool)
+        .await?;
+        let mut tx = pool.begin().await?;
+        insert_audit_log_tx(&mut tx, audit_entry_for_tenant(tenant_id, "new-write")).await?;
+        tx.commit().await?;
+
+        let report = backfill_historical_audit_hashes(&pool, tenant_id, true).await?;
+        assert!(report.requires_offline_rechain);
+        assert!(!report.executable_in_place);
+        assert!(
+            backfill_historical_audit_hashes(&pool, tenant_id, false)
+                .await
+                .is_err()
+        );
+        let unhashed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_logs WHERE tenant_id = $1 AND row_hash IS NULL",
+        )
+        .bind(tenant_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(unhashed, 1);
 
         sqlx::query("DELETE FROM tenants WHERE id = $1")
             .bind(tenant_id)
