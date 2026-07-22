@@ -153,12 +153,11 @@ describe('ClientFactory', () => {
 
     it('passes rotating options to client', async () => {
       await ClientFactory.createRotatingClient(mockProvider, {
-        rotatingOptions: { maxRetries: 5, retryDelay: 2000 },
+        rotatingOptions: { maxRetries: 5 },
       });
       const calls = (OpenAIRotatingClient as any).mock.calls;
       const rotatingOpts = calls[0][2];
       expect(rotatingOpts.maxRetries).toBe(5);
-      expect(rotatingOpts.retryDelay).toBe(2000);
     });
 
     it('adds default HTTP-Referer and X-Title headers for OpenAI', async () => {

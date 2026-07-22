@@ -19,6 +19,7 @@ import {
   RuntimeSelectorMenuDivider,
   renderThoughtLevelMenuGroup,
 } from '@/renderer/components/agent/runtimeSelectorOptions';
+import { findConfiguredModelDisplayName } from '@/renderer/utils/model/modelDisplayName';
 
 type GuidModelSelectorProps = {
   currentAcpCachedModelInfo: AcpModelInfo | null;
@@ -42,16 +43,18 @@ const GuidModelSelector: React.FC<GuidModelSelectorProps> = ({
   const { data: modelConfig } = useProvidersQuery();
 
   const acpSelectedLabel = React.useMemo(() => {
+    const selectedReference = selectedAcpModel || currentAcpCachedModelInfo?.current_model_id;
     return (
-      currentAcpCachedModelInfo?.available_models?.find((m) => m.id === selectedAcpModel)?.label ||
+      findConfiguredModelDisplayName(modelConfig, selectedReference) ||
+      currentAcpCachedModelInfo?.available_models?.find((m) => m.id === selectedReference)?.label ||
       currentAcpCachedModelInfo?.current_model_label ||
-      currentAcpCachedModelInfo?.current_model_id ||
       ''
     );
   }, [
     currentAcpCachedModelInfo?.available_models,
     currentAcpCachedModelInfo?.current_model_id,
     currentAcpCachedModelInfo?.current_model_label,
+    modelConfig,
     selectedAcpModel,
   ]);
 
@@ -116,7 +119,7 @@ const GuidModelSelector: React.FC<GuidModelSelectorProps> = ({
                           selected={model.id === selectedAcpModel}
                           description={model.description}
                         >
-                          {model.label}
+                          {findConfiguredModelDisplayName(modelConfig, model.id) || model.label}
                         </RuntimeSelectorCheckedItem>
                       </div>
                     </Menu.Item>

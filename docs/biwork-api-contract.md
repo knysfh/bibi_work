@@ -340,6 +340,14 @@ Response:
 }
 ```
 
+#### `POST /api/auth/session/activity`
+
+Owner: `RUST`
+
+Electron renderer 只在已认证状态下，将 `pointerdown`、`keydown`、`touchstart`、滚动和窗口重新获得焦点等真实用户操作节流上报给 main process；main process 再调用本接口。后台 HTTP、WebSocket 心跳、Agent 输出和定时同步不得调用本接口。
+
+桌面 session 默认连续 30 分钟没有用户活动即失效。每次成功调用会更新 `last_user_activity_at` 和 `idle_expires_at`；HTTP、WebSocket 与 SSE 对 desktop session 校验同一 `idle_expires_at`。WebUI session 不应用桌面空闲策略。
+
 #### WebUI Credential Compatibility
 
 Owner: `RUST`

@@ -247,4 +247,26 @@ describe('AuthContext OIDC bootstrap', () => {
     expect(mocks.setAccessToken).toHaveBeenCalledWith('access-refreshed');
     expect(result.current.status).toBe('authenticated');
   });
+
+  it('reports meaningful desktop activity through the main-process bridge', async () => {
+    const recordDesktopAuthActivity = vi.fn().mockResolvedValue(true);
+    Object.defineProperty(window, 'electronAPI', {
+      configurable: true,
+      value: { recordDesktopAuthActivity },
+    });
+    mocks.httpRequest.mockImplementation(async (method: string, path: string) => {
+      if (method === 'GET' && path === '/api/auth/oidc/config') return oidcConfig;
+      if (method === 'GET' && path === '/api/auth/user') {
+        return { success: true, user: { id: 'user-alon', username: 'alon' } };
+      }
+      throw new Error(`unexpected request: ${method} ${path}`);
+    });
+
+    const { result } = renderHook(() => useAuth(), { wrapper });
+    await waitFor(() => expect(result.current.status).toBe('authenticated'));
+
+    act(() => window.dispatchEvent(new Event('pointerdown')));
+
+    await waitFor(() => expect(recordDesktopAuthActivity).toHaveBeenCalledOnce());
+  });
 });

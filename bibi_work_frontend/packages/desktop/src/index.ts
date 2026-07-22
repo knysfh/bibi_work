@@ -53,6 +53,7 @@ import { BrowserSessionManager } from './process/browser/browserSessionManager';
 import { startBrowserWorker } from './process/browser/browserWorker';
 import { startDesktopAcpWorker } from './process/agent/acp/worker';
 import { DesktopOidcController } from './process/auth/desktopOidcController';
+import { DesktopIdleSessionManager } from './process/auth/desktopIdleSessionManager';
 import { DesktopRefreshTokenStore } from './process/auth/desktopRefreshTokenStore';
 import {
   initializeDesktopTelemetry,
@@ -271,7 +272,29 @@ const desktopRefreshTokenStore = new DesktopRefreshTokenStore(
   },
   (message, error) => console.warn(message, error)
 );
-const desktopOidcController = new DesktopOidcController({
+let desktopOidcController!: DesktopOidcController;
+const desktopIdleSessionManager = new DesktopIdleSessionManager({
+  onIdleTimeout: async () => {
+    const accessToken = desktopOidcController.getAccessToken();
+    if (accessToken) {
+      await fetch(desktopAuthApiUrl('/api/auth/logout'), {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'content-type': 'application/json',
+          'x-biwork-client-kind': 'desktop',
+        },
+        body: '{}',
+      }).catch((error) => {
+        console.warn('[auth] failed to revoke idle platform session', error);
+      });
+    }
+    await desktopOidcController.logout('idle_timeout', true).catch((error) => {
+      console.warn('[auth] failed to revoke idle OIDC session', error);
+    });
+  },
+});
+desktopOidcController = new DesktopOidcController({
   apiUrl: (endpoint) => desktopAuthApiUrl(endpoint),
   emitAccessTokenChanged: (accessToken) => ipcBridge.auth.accessTokenChanged.emit({ accessToken }),
   emitLoginCompleted: (accessToken) => ipcBridge.auth.loginCompleted.emit({ accessToken, authenticated: true }),
@@ -279,6 +302,8 @@ const desktopOidcController = new DesktopOidcController({
   emitSessionExpired: (reason) => ipcBridge.auth.sessionExpired.emit({ reason }),
   getLoopbackPort: () => desktopGatewayController?.oidcLoopbackPort ?? null,
   getStoredAccessToken: peekMainAccessToken,
+  onSessionCleared: () => desktopIdleSessionManager.stopSession(),
+  onSessionEstablished: () => desktopIdleSessionManager.startSession(),
   openExternal: (url) => shell.openExternal(url),
   refreshTokenStore: desktopRefreshTokenStore,
   setStoredAccessToken: setMainAccessToken,
@@ -365,6 +390,13 @@ if (process.env.BIWORK_E2E_TEST === '1') {
 
 ipcMain.handle('auth:session:logout', () => desktopOidcController.logout());
 ipcMain.handle('auth:session:invalidate', () => desktopOidcController.invalidateSession());
+ipcMain.handle('auth:session:activity', () => {
+  if (!desktopIdleSessionManager.recordActivity()) return false;
+  void httpRequest('POST', '/api/auth/session/activity', {}).catch((error) => {
+    console.warn('[auth] failed to record desktop session activity', error);
+  });
+  return true;
+});
 
 ipcMain.handle('auth:oidc-login:start', async () => desktopOidcController.startLogin());
 
@@ -378,6 +410,7 @@ function registerCronResumeBridge(backendPort: number): void {
   disposeCronResumeListener?.();
 
   const onResume = () => {
+    desktopIdleSessionManager.evaluate();
     void httpRequest('POST', '/api/cron/internal/system-resume', {
       source: 'electron.powerMonitor.resume',
       backendPort,
@@ -449,6 +482,7 @@ function forwardedBackendHeaders(
   if (!hasAuthorizationHeader && accessToken) {
     headers.Authorization = `Bearer ${accessToken}`;
   }
+  headers['x-biwork-client-kind'] = 'desktop';
   return injectDesktopTraceHeaders(headers);
 }
 

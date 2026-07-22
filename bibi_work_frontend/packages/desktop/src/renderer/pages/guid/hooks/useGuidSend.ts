@@ -101,6 +101,11 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
       return;
     }
 
+    const selectedModel = selectedAcpModel || currentAcpCachedModelInfo?.current_model_id;
+    if (!selectedModel) {
+      throw new Error('Select a model before starting the conversation');
+    }
+
     const isCustomWorkspace = !!dir;
     const finalWorkspace = dir || '';
 
@@ -133,7 +138,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
             .filter((server) => (defaultSelectedMcpServerIds ?? []).includes(server.id))
             .map((server) => toSessionMcpServer(server));
 
-    const assistantOverrideModel = selectedAcpModel || currentAcpCachedModelInfo?.current_model_id || undefined;
+    const assistantOverrideModel = selectedModel;
     const assistantOverrides = {
       model: assistantOverrideModel,
       permission: selectedMode || undefined,
@@ -246,7 +251,11 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
   ]);
 
   // Calculate button disabled state
-  const isButtonDisabled = loading || !input.trim() || !selectedAssistantId;
+  const isButtonDisabled =
+    loading ||
+    !input.trim() ||
+    !selectedAssistantId ||
+    !(selectedAcpModel || currentAcpCachedModelInfo?.current_model_id);
 
   return {
     handleSend,

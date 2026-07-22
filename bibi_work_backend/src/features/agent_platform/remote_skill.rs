@@ -18,6 +18,7 @@ const MAX_REMOTE_ATTEMPTS: usize = 3;
 const MAX_REMOTE_SKILLS: usize = 64;
 const MAX_REMOTE_TREE_ENTRIES: usize = 10_000;
 const MAX_ARCHIVE_ENTRIES: usize = 2_048;
+const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 pub const MAX_SKILL_FILE_BYTES: usize = 1024 * 1024;
 pub const MAX_SKILL_TOTAL_BYTES: usize = 10 * 1024 * 1024;
 
@@ -382,7 +383,7 @@ async fn read_bounded_response(
 fn remote_client() -> Result<Client, AppError> {
     Client::builder()
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
+        .timeout(REMOTE_REQUEST_TIMEOUT)
         .redirect(Policy::none())
         .build()
         .map_err(|_| code_error("SKILL_IMPORT_REMOTE_FAILED"))
@@ -459,17 +460,25 @@ async fn github_json<T: for<'de> Deserialize<'de>>(
     client: &Client,
     url: &str,
 ) -> Result<T, AppError> {
-    let response = github_request(client, url)
-        .send()
-        .await
-        .map_err(|_| code_error("SKILL_IMPORT_REMOTE_LOOKUP_FAILED"))?;
-    if !response.status().is_success() {
-        return Err(code_error("SKILL_IMPORT_REMOTE_LOOKUP_FAILED"));
+    for attempt in 0..MAX_REMOTE_ATTEMPTS {
+        match github_request(client, url).send().await {
+            Ok(response) if response.status().is_success() => match response.json::<T>().await {
+                Ok(value) => return Ok(value),
+                Err(_) if attempt + 1 < MAX_REMOTE_ATTEMPTS => {}
+                Err(_) => return Err(code_error("SKILL_IMPORT_REMOTE_LOOKUP_FAILED")),
+            },
+            Ok(response)
+                if (response.status().is_server_error()
+                    || response.status() == StatusCode::TOO_MANY_REQUESTS)
+                    && attempt + 1 < MAX_REMOTE_ATTEMPTS => {}
+            Ok(_) => return Err(code_error("SKILL_IMPORT_REMOTE_LOOKUP_FAILED")),
+            Err(_) if attempt + 1 < MAX_REMOTE_ATTEMPTS => {}
+            Err(_) => return Err(code_error("SKILL_IMPORT_REMOTE_LOOKUP_FAILED")),
+        }
+        let delay_ms = 250_u64.saturating_mul(1_u64 << attempt);
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
-    response
-        .json::<T>()
-        .await
-        .map_err(|_| code_error("SKILL_IMPORT_REMOTE_LOOKUP_FAILED"))
+    Err(code_error("SKILL_IMPORT_REMOTE_LOOKUP_FAILED"))
 }
 
 fn github_request(client: &Client, url: &str) -> reqwest::RequestBuilder {

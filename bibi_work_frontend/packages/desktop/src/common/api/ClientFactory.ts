@@ -64,7 +64,7 @@ export class ClientFactory {
     options: ClientOptions = {}
   ): Promise<RotatingClient> {
     const authType = getProviderAuthType(provider);
-    const rotatingOptions = options.rotatingOptions || { maxRetries: 3, retryDelay: 1000 };
+    const rotatingOptions = options.rotatingOptions || { maxRetries: 3 };
 
     // 对 new-api 网关进行 URL 规范化 / Normalize URL for new-api gateway
     const isNewApi = isNewApiPlatform(provider.platform);

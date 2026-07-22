@@ -26,6 +26,7 @@ export interface CreateProviderRequest {
   base_url: string;
   api_key: string;
   models?: string[];
+  model_labels?: Record<string, string>;
   enabled?: boolean;
   capabilities?: ModelCapability[];
   context_limit?: number;
@@ -46,6 +47,7 @@ export interface UpdateProviderRequest {
   base_url?: string;
   api_key?: string;
   models?: string[];
+  model_labels?: Record<string, string>;
   enabled?: boolean;
   capabilities?: ModelCapability[];
   context_limit?: number;

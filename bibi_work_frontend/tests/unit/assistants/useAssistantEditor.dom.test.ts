@@ -517,7 +517,7 @@ describe('useAssistantEditor', () => {
 
     expect(ipcBridge.assistants.update.invoke).toHaveBeenCalledWith({
       id: 'builtin-1',
-      agent_id: 'agent-gemini',
+      runtime_id: 'agent-gemini',
       defaults: {
         model: { mode: 'fixed', value: 'gemini-2.5-pro' },
         permission: { mode: 'fixed', value: 'default' },

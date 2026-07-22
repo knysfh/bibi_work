@@ -500,6 +500,15 @@ impl FerrisKeyOidcVerifier {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        let client_kind = if headers
+            .get("x-biwork-client-kind")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("desktop"))
+        {
+            "desktop"
+        } else {
+            "web"
+        };
         // A bearer token may legitimately traverse the Electron renderer, main
         // process, and local API clients with different User-Agent values. Bind
         // the projected device to the stable OIDC session instead of mutable
@@ -585,7 +594,7 @@ impl FerrisKeyOidcVerifier {
 
         if let Some(row) = sqlx::query(
             r#"
-            SELECT revoked_at
+            SELECT revoked_at, idle_expires_at, client_kind
             FROM platform_sessions
             WHERE tenant_id = $1
               AND user_id = $2
@@ -604,6 +613,32 @@ impl FerrisKeyOidcVerifier {
                     "platform session has been revoked".to_string(),
                 ));
             }
+            let idle_expires_at: OffsetDateTime = row.try_get("idle_expires_at")?;
+            let stored_client_kind: String = row.try_get("client_kind")?;
+            if stored_client_kind == "desktop" && idle_expires_at <= OffsetDateTime::now_utc() {
+                sqlx::query(
+                    r#"
+                    UPDATE platform_sessions
+                    SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP),
+                        revocation_reason = 'idle_timeout',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE tenant_id = $1
+                      AND user_id = $2
+                      AND ferriskey_session_state = $3
+                    "#,
+                )
+                .bind(tenant_id)
+                .bind(platform_user_id)
+                .bind(&session_key)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit()
+                    .await
+                    .map_err(|_| AppError::DatabaseTransaction)?;
+                return Err(AppError::Unauthorized(
+                    "platform session idle timeout expired".to_string(),
+                ));
+            }
         }
 
         let session_row = sqlx::query(
@@ -611,9 +646,14 @@ impl FerrisKeyOidcVerifier {
             INSERT INTO platform_sessions (
                 tenant_id, user_id, device_id, ferriskey_subject, ferriskey_session_state,
                 token_jti, token_exp, roles_snapshot, token_hash, last_seen_at,
+                last_user_activity_at, idle_expires_at,
                 source_ip, user_agent, client_kind
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP, $10, $11, 'desktop')
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + INTERVAL '30 minutes',
+                $10, $11, $12
+            )
             ON CONFLICT (tenant_id, user_id, ferriskey_session_state)
             DO UPDATE SET
                 device_id = EXCLUDED.device_id,
@@ -622,9 +662,23 @@ impl FerrisKeyOidcVerifier {
                 roles_snapshot = EXCLUDED.roles_snapshot,
                 token_hash = EXCLUDED.token_hash,
                 last_seen_at = CURRENT_TIMESTAMP,
+                last_user_activity_at = CASE
+                    WHEN platform_sessions.client_kind <> 'desktop' AND EXCLUDED.client_kind = 'desktop'
+                    THEN CURRENT_TIMESTAMP
+                    ELSE platform_sessions.last_user_activity_at
+                END,
+                idle_expires_at = CASE
+                    WHEN platform_sessions.client_kind <> 'desktop' AND EXCLUDED.client_kind = 'desktop'
+                    THEN CURRENT_TIMESTAMP + INTERVAL '30 minutes'
+                    ELSE platform_sessions.idle_expires_at
+                END,
                 source_ip = EXCLUDED.source_ip,
                 user_agent = EXCLUDED.user_agent,
-                client_kind = EXCLUDED.client_kind,
+                client_kind = CASE
+                    WHEN platform_sessions.client_kind = 'desktop' OR EXCLUDED.client_kind = 'desktop'
+                    THEN 'desktop'
+                    ELSE 'web'
+                END,
                 updated_at = CURRENT_TIMESTAMP
             RETURNING id
             "#,
@@ -640,6 +694,7 @@ impl FerrisKeyOidcVerifier {
         .bind(token_hash)
         .bind(source_ip)
         .bind(user_agent)
+        .bind(client_kind)
         .fetch_one(&mut *tx)
         .await?;
         let session_id: Uuid = session_row.try_get("id")?;

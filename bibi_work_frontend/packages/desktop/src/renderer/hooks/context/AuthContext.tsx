@@ -40,6 +40,7 @@ interface AuthContextValue {
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
 const AUTH_USER_ENDPOINT = '/api/auth/user';
+const DESKTOP_ACTIVITY_REPORT_INTERVAL_MS = 30_000;
 
 async function fetchOidcConfig(): Promise<OidcConfig> {
   return httpRequest<OidcConfig>('GET', '/api/auth/oidc/config');
@@ -180,6 +181,36 @@ export const AuthProvider: React.FC<React.PropsWithChildren> = ({ children }) =>
       clearOidcLoginState();
     });
   }, []);
+
+  useEffect(() => {
+    const recordActivity = window.electronAPI?.recordDesktopAuthActivity;
+    if (status !== 'authenticated' || !recordActivity) return;
+
+    let lastReportedAt = 0;
+    const reportActivity = () => {
+      const now = Date.now();
+      if (now - lastReportedAt < DESKTOP_ACTIVITY_REPORT_INTERVAL_MS) return;
+      lastReportedAt = now;
+      void recordActivity().catch((error) => {
+        console.warn('Failed to record desktop auth activity:', error);
+      });
+    };
+
+    const eventOptions: AddEventListenerOptions = { capture: true, passive: true };
+    window.addEventListener('pointerdown', reportActivity, eventOptions);
+    window.addEventListener('keydown', reportActivity, eventOptions);
+    window.addEventListener('touchstart', reportActivity, eventOptions);
+    window.addEventListener('wheel', reportActivity, eventOptions);
+    window.addEventListener('focus', reportActivity);
+
+    return () => {
+      window.removeEventListener('pointerdown', reportActivity, eventOptions);
+      window.removeEventListener('keydown', reportActivity, eventOptions);
+      window.removeEventListener('touchstart', reportActivity, eventOptions);
+      window.removeEventListener('wheel', reportActivity, eventOptions);
+      window.removeEventListener('focus', reportActivity);
+    };
+  }, [status]);
 
   useEffect(() => {
     return ipcBridge.deepLink.received.on(async (payload) => {

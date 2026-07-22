@@ -31,6 +31,9 @@ export interface Assistant {
   avatar?: string;
   enabled: boolean;
   sort_order: number;
+  /** Canonical execution runtime binding. */
+  runtime_id?: string;
+  /** @deprecated Compatibility alias for runtime_id. */
   agent_id: string;
   agent?: AssistantAgent;
   enabled_skills: string[];
@@ -64,6 +67,8 @@ export interface AssistantState {
 }
 
 export interface AssistantEngine {
+  runtime_id?: string;
+  /** @deprecated Compatibility alias for runtime_id. */
   agent_id: string;
   agent?: AssistantAgent;
 }
@@ -142,6 +147,8 @@ export interface CreateAssistantRequest {
   name: string;
   description?: string;
   avatar?: string;
+  runtime_id?: string;
+  /** @deprecated Compatibility alias for runtime_id. */
   agent_id?: string;
   enabled_skills?: string[];
   custom_skill_names?: string[];

@@ -31,14 +31,13 @@ const EditModeModal = ModalHOC<{ data?: IProvider; onChange(data: IProvider): vo
     const bedrockAuthMethod = Form.useWatch('bedrockAuthMethod', form);
     const isBedrock = data?.platform === 'bedrock';
 
-    // Watch the live form values so editing the Base URL (or API key) re-keys the
+    // Watch the live form values so editing the Base URL (or replacement key) re-keys the
     // model-list SWR cache. Without this the list would keep fetching from the
     // provider's original base_url and a Base URL edit could never refresh it.
-    // Fall back to the initial provider value until the form is populated.
     const watchedBaseUrl = Form.useWatch('base_url', form);
-    const watchedApiKey = Form.useWatch('api_key', form);
+    const watchedApiKey = Form.useWatch('api_key_replacement', form);
     const effectiveBaseUrl = watchedBaseUrl ?? data?.base_url;
-    const effectiveApiKey = watchedApiKey ?? data?.api_key;
+    const effectiveApiKey = watchedApiKey ?? '';
 
     // 获取供应商 Logo / Get provider logo
     const providerLogo = useMemo(() => {
@@ -76,7 +75,7 @@ const EditModeModal = ModalHOC<{ data?: IProvider; onChange(data: IProvider): vo
       if (isFullUrl || isBedrock) return;
 
       const nextBaseUrl = form.getFieldValue('base_url') as string | undefined;
-      const apiKey = (form.getFieldValue('api_key') as string | undefined) ?? '';
+      const apiKey = (form.getFieldValue('api_key_replacement') as string | undefined)?.trim() ?? '';
       // Backend requires an api_key for non-bedrock platforms; without one a
       // fetch would just return empty — skip and clear any stale hint.
       if (!apiKey) {
@@ -136,6 +135,7 @@ const EditModeModal = ModalHOC<{ data?: IProvider; onChange(data: IProvider): vo
           bedrockAccessKeyId: data.bedrock_config?.access_key_id || '',
           bedrockSecretAccessKey: data.bedrock_config?.secret_access_key || '',
           bedrockProfile: data.bedrock_config?.profile || '',
+          api_key_replacement: '',
         });
       }
     }, [data, form]);
@@ -155,11 +155,13 @@ const EditModeModal = ModalHOC<{ data?: IProvider; onChange(data: IProvider): vo
         onOk={async () => {
           try {
             const values = await form.validate();
+            const { api_key_replacement: apiKeyReplacement, model, ...providerValues } = values;
             const updatedProvider: IProvider = {
               ...data,
-              ...values,
+              ...providerValues,
+              api_key: typeof apiKeyReplacement === 'string' ? apiKeyReplacement.trim() : '',
               // Ensure models is always an array
-              models: Array.isArray(values.model) ? values.model : [values.model],
+              models: Array.isArray(model) ? model : [model],
             };
 
             // Add Bedrock configuration if platform is Bedrock
@@ -230,15 +232,49 @@ const EditModeModal = ModalHOC<{ data?: IProvider; onChange(data: IProvider): vo
               </div>
             )}
 
+            {!isBedrock && data?.api_key_mask && (
+              <div className='mb-16px'>
+                <div className='mb-8px text-14px text-t-primary'>
+                  {t('settings.currentApiKey', { defaultValue: 'Current API Key' })}
+                </div>
+                <div
+                  data-testid='current-api-key-mask'
+                  className='rd-6px border border-solid px-12px py-8px font-mono text-14px text-t-secondary'
+                  style={{ borderColor: 'var(--color-border-2)', userSelect: 'none' }}
+                  draggable={false}
+                  onCopy={(event) => event.preventDefault()}
+                  onCut={(event) => event.preventDefault()}
+                  onContextMenu={(event) => event.preventDefault()}
+                >
+                  {data.api_key_mask}
+                </div>
+              </div>
+            )}
+
             <Form.Item
               hidden={isBedrock}
-              label={t('settings.apiKey')}
-              required={!isBedrock}
-              rules={[{ required: !isBedrock }]}
-              field={'api_key'}
-              extra={<div className='text-11px text-t-secondary mt-2'>💡 {t('settings.multiApiKeyEditTip')}</div>}
+              label={t('settings.replaceApiKey', { defaultValue: 'Replace API Key' })}
+              required={!isBedrock && !data?.api_key_mask}
+              rules={[{ required: !isBedrock && !data?.api_key_mask }]}
+              field='api_key_replacement'
+              extra={
+                <div className='text-11px text-t-secondary mt-2'>
+                  {t('settings.replaceApiKeyTip', {
+                    defaultValue:
+                      'Leave blank to keep the current key. A saved key cannot be viewed or copied; entering a value replaces it completely.',
+                  })}
+                </div>
+              }
             >
-              <Input.TextArea rows={4} placeholder={t('settings.apiKeyPlaceholder')} />
+              <Input.Password
+                data-testid='api-key-replacement'
+                visibilityToggle={false}
+                autoComplete='new-password'
+                placeholder={t('settings.replaceApiKeyPlaceholder', { defaultValue: 'Enter a complete new API key' })}
+                onCopy={(event) => event.preventDefault()}
+                onCut={(event) => event.preventDefault()}
+                onContextMenu={(event) => event.preventDefault()}
+              />
             </Form.Item>
 
             {/* AWS Bedrock Authentication Method */}

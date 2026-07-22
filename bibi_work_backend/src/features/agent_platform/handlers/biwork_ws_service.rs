@@ -1678,17 +1678,31 @@ fn confirmation_payload(event: &StreamEventResponse) -> Value {
 
 fn run_failed_stream_payload(event: &StreamEventResponse) -> Value {
     let detail = run_failed_detail(event);
+    let mut raw_error = event
+        .payload
+        .get("rawError")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "message": event.payload.get("detail").and_then(Value::as_str).unwrap_or(&detail),
+                "code": event.payload.get("code").and_then(Value::as_str),
+            })
+        });
+    if let Some(raw_error) = raw_error.as_object_mut() {
+        raw_error.insert("traceId".to_string(), json!(event.trace_id));
+    }
     json!({
         "type": "error",
         "data": {
             "message": detail,
             "code": event.payload.get("code").and_then(Value::as_str),
+            "ownership": event.payload.get("ownership").and_then(Value::as_str),
+            "detail": event.payload.get("detail").and_then(Value::as_str),
             "retryable": event.payload.get("retryable").and_then(Value::as_bool).unwrap_or(true),
-            "rawError": {
-                "message": detail,
-                "code": event.payload.get("code").and_then(Value::as_str),
-                "traceId": event.trace_id,
-            },
+            "feedback_recommended": event.payload.get("feedback_recommended").and_then(Value::as_bool),
+            "resolution": event.payload.get("resolution").filter(|value| value.is_object()),
+            "rawError": raw_error,
         },
         "msg_id": event.payload.get("message_id")
             .and_then(Value::as_str)
@@ -2136,9 +2150,19 @@ Use this skill for daily reports.
             "run.failed",
             json!({
                 "run_id": run_id,
-                "error": "model provider timeout",
-                "code": "MODEL_TIMEOUT",
+                "error": "The model service did not respond in time. Please try again later.",
+                "detail": "model provider timeout after 4 attempts",
+                "code": "USER_LLM_PROVIDER_TIMEOUT",
+                "ownership": "user_llm_provider",
                 "retryable": true,
+                "feedback_recommended": false,
+                "resolution": {"kind": "retry"},
+                "rawError": {
+                    "name": "APITimeoutError",
+                    "message": "model provider timeout",
+                    "code": "USER_LLM_PROVIDER_TIMEOUT",
+                    "status": 408,
+                },
             }),
         );
         event.run_id = Some(run_id);
@@ -2161,11 +2185,32 @@ Use this skill for daily reports.
                 .1
                 .pointer("/data/message")
                 .and_then(Value::as_str),
-            Some("model provider timeout")
+            Some("The model service did not respond in time. Please try again later.")
         );
         assert_eq!(
             error_stream.1.pointer("/data/code").and_then(Value::as_str),
-            Some("MODEL_TIMEOUT")
+            Some("USER_LLM_PROVIDER_TIMEOUT")
+        );
+        assert_eq!(
+            error_stream
+                .1
+                .pointer("/data/ownership")
+                .and_then(Value::as_str),
+            Some("user_llm_provider")
+        );
+        assert_eq!(
+            error_stream
+                .1
+                .pointer("/data/detail")
+                .and_then(Value::as_str),
+            Some("model provider timeout after 4 attempts")
+        );
+        assert_eq!(
+            error_stream
+                .1
+                .pointer("/data/resolution/kind")
+                .and_then(Value::as_str),
+            Some("retry")
         );
         assert_eq!(
             error_stream
@@ -2179,7 +2224,14 @@ Use this skill for daily reports.
                 .1
                 .pointer("/data/rawError/code")
                 .and_then(Value::as_str),
-            Some("MODEL_TIMEOUT")
+            Some("USER_LLM_PROVIDER_TIMEOUT")
+        );
+        assert_eq!(
+            error_stream
+                .1
+                .pointer("/data/rawError/status")
+                .and_then(Value::as_u64),
+            Some(408)
         );
         assert_eq!(
             error_stream.1.get("status").and_then(Value::as_str),
@@ -2191,7 +2243,7 @@ Use this skill for daily reports.
         );
         assert_eq!(
             turn_completed.1.get("detail").and_then(Value::as_str),
-            Some("model provider timeout")
+            Some("The model service did not respond in time. Please try again later.")
         );
         assert_eq!(
             turn_completed

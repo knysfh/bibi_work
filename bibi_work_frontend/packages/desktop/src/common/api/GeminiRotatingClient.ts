@@ -35,6 +35,9 @@ export class GeminiRotatingClient extends RotatingApiClient<GoogleGenAI> {
       const clientConfig: GoogleGenAIOptions = {
         apiKey: cleanedApiKey === '' ? undefined : cleanedApiKey,
         vertexai: authType === AuthType.USE_VERTEX_AI,
+        httpOptions: {
+          retryOptions: { attempts: 1 },
+        },
       };
       if (config.baseURL) {
         clientConfig.httpOptions = {

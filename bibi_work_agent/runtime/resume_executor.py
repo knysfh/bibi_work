@@ -11,6 +11,7 @@ from bibi_work_agent.runtime.agent_factory import create_platform_agent
 from bibi_work_agent.runtime.cancellation import RunCancelled, is_run_cancelled
 from bibi_work_agent.runtime.event_emitter import EventEmitter
 from bibi_work_agent.runtime.event_normalizer import AgentEventNormalizer
+from bibi_work_agent.runtime.error_reporting import run_failure_payload
 from bibi_work_agent.runtime.memory_candidates import MemoryCandidateCollector
 from bibi_work_agent.runtime.resume_idempotency import ResumeIdempotencyStore
 from bibi_work_agent.runtime.snapshot_contract import (
@@ -111,6 +112,7 @@ def resume_run_payload(
         return
     except Exception as exc:  # noqa: BLE001
         error = safe_error_message(exc)
+        failure = run_failure_payload(exc)
         emitter.emit(
             [
                 {
@@ -121,7 +123,7 @@ def resume_run_payload(
                         "approval_id": approval_id,
                         "worker_task_id": worker_task_id,
                         "error_type": exc.__class__.__name__,
-                        "error": error,
+                        **failure,
                     },
                     "trace_id": payload.get("trace_id"),
                 }

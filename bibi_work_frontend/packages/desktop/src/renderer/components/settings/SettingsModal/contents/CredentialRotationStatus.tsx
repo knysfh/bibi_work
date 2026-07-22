@@ -77,7 +77,9 @@ const CredentialRotationStatus: React.FC = () => {
   };
 
   const health = overview?.health;
-  const activeCredentials = (overview?.credentials || []).filter((credential) => credential.status !== 'revoked');
+  const activeCredentials = (overview?.credentials || []).filter(
+    (credential) => credential.status !== 'revoked' && credential.metadata.resolver_scheme !== 'local'
+  );
 
   return (
     <div

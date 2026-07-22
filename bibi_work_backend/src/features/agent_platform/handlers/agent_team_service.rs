@@ -475,6 +475,7 @@ pub(super) async fn create_and_dispatch_agent_team_run(
                 requested_agent_id: Some(member.agent_id),
                 agent_version_id: member.agent_version_id,
                 project_id,
+                selected_model_profile_id: None,
                 selected_mcp_server_ids: Vec::new(),
                 thread_id: member_thread_id.clone(),
                 client_snapshot: Some(client_snapshot),

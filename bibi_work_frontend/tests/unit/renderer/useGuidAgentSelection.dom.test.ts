@@ -44,7 +44,9 @@ vi.mock('@/renderer/hooks/agent/useManagedAgents', () => ({
 
 describe('useGuidAssistantSelection', () => {
   beforeEach(() => {
-    configGetMock.mockReturnValue(undefined);
+    configGetMock.mockImplementation((key: string) =>
+      key === 'guid.lastAssistantId' ? mockAssistants[0]?.id : undefined
+    );
     configSetMock.mockResolvedValue(undefined);
     mockManagedAgents = [];
     mockAssistants = [
@@ -72,6 +74,22 @@ describe('useGuidAssistantSelection', () => {
     ];
   });
 
+  it('starts without an assistant or model when the user has no saved choice', async () => {
+    configGetMock.mockReturnValue(undefined);
+
+    const { result } = renderHook(() =>
+      useGuidAssistantSelection({
+        resetAssistant: false,
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.selectedAssistantId).toBeNull();
+    });
+    expect(result.current.selectedAcpModel).toBeNull();
+    expect(result.current.defaultAssistantId).toBeNull();
+  });
+
   it('derives availability and model info from assistant catalog data', async () => {
     const { result } = renderHook(() =>
       useGuidAssistantSelection({
@@ -84,10 +102,10 @@ describe('useGuidAssistantSelection', () => {
     });
 
     expect(result.current.selectedAssistantAvailable).toBe(true);
-    expect(result.current.selectedAcpModel).toBe('claude-opus');
+    expect(result.current.selectedAcpModel).toBeNull();
     expect(result.current.currentAcpCachedModelInfo).toEqual({
-      current_model_id: 'claude-opus',
-      current_model_label: 'claude-opus',
+      current_model_id: null,
+      current_model_label: null,
       available_models: [
         { id: 'claude-opus', label: 'claude-opus' },
         { id: 'claude-sonnet', label: 'claude-sonnet' },
@@ -159,7 +177,7 @@ describe('useGuidAssistantSelection', () => {
     expect(configSetMock).toHaveBeenCalledWith('guid.lastAssistantId', 'assistant-claude');
   });
 
-  it('falls back to the default assistant when the persisted guid assistant no longer exists', async () => {
+  it('returns to an unselected state when the persisted guid assistant no longer exists', async () => {
     mockAssistants = [
       assistantFixture({ id: 'bare-codex', runtimeKey: 'codex', source: 'generated', sortOrder: 1 }),
       assistantFixture({ id: 'assistant-claude', runtimeKey: 'claude', source: 'builtin', sortOrder: 2 }),
@@ -175,7 +193,7 @@ describe('useGuidAssistantSelection', () => {
     );
 
     await waitFor(() => {
-      expect(result.current.selectedAssistantId).toBe('bare-codex');
+      expect(result.current.selectedAssistantId).toBeNull();
     });
   });
 
@@ -697,8 +715,8 @@ describe('assistant model helpers', () => {
 
   it('builds ACP model info from assistant models', () => {
     expect(buildAssistantModelInfo(['claude-opus', 'claude-sonnet'])).toEqual({
-      current_model_id: 'claude-opus',
-      current_model_label: 'claude-opus',
+      current_model_id: null,
+      current_model_label: null,
       available_models: [
         { id: 'claude-opus', label: 'claude-opus' },
         { id: 'claude-sonnet', label: 'claude-sonnet' },
@@ -708,8 +726,8 @@ describe('assistant model helpers', () => {
 
   it('builds Codex ACP model info from assistant models', () => {
     expect(buildAssistantModelInfo(['gpt-5.5', 'gpt-5.4'])).toEqual({
-      current_model_id: 'gpt-5.5',
-      current_model_label: 'gpt-5.5',
+      current_model_id: null,
+      current_model_label: null,
       available_models: [
         { id: 'gpt-5.5', label: 'gpt-5.5' },
         { id: 'gpt-5.4', label: 'gpt-5.4' },
@@ -717,8 +735,8 @@ describe('assistant model helpers', () => {
     });
   });
 
-  it('defaults to the first assistant model when no assistant preference has been applied yet', () => {
-    expect(resolveInitialAssistantModel(['claude-opus', 'claude-sonnet'])).toBe('claude-opus');
+  it('does not select the first assistant model before the user chooses one', () => {
+    expect(resolveInitialAssistantModel(['claude-opus', 'claude-sonnet'])).toBeNull();
   });
 
   it('does not synthesize Codex models when the assistant catalog has none', () => {

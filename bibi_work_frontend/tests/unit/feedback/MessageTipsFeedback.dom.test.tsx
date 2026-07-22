@@ -449,7 +449,8 @@ describe('MessageTips — FeedbackButton wiring', () => {
     expect(screen.queryByText(/openclaw gateway start/)).not.toBeInTheDocument();
   });
 
-  it('renders ACP protocol errors with agent attribution and technical details only', () => {
+  it('renders ACP protocol errors with agent attribution and collapsed technical details', async () => {
+    const user = userEvent.setup();
     render(
       <MessageTips
         message={buildTips('error', 'backend protocol fallback', {
@@ -468,11 +469,16 @@ describe('MessageTips — FeedbackButton wiring', () => {
     expect(screen.getByText(/reported that an ACP\/JSON-RPC message could not be parsed/)).toBeInTheDocument();
     expect(screen.queryByText(/Suggestion:/)).not.toBeInTheDocument();
     expect(screen.queryByText('settings.oneClickFeedback')).not.toBeInTheDocument();
+    const detailsToggle = screen.getByRole('button', { name: /common.technical_details/ });
+    expect(detailsToggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText(/USER_AGENT_PROTOCOL_PARSE_ERROR/)).not.toBeInTheDocument();
+    await user.click(detailsToggle);
     expect(screen.getByText(/USER_AGENT_PROTOCOL_PARSE_ERROR/)).toBeInTheDocument();
     expect(screen.queryByText('backend protocol fallback')).not.toBeInTheDocument();
   });
 
-  it('expands classified error technical details by default', () => {
+  it('keeps classified error technical details collapsed by default', async () => {
+    const user = userEvent.setup();
     render(
       <MessageTips
         message={buildTips('error', 'raw provider 401', {
@@ -487,7 +493,9 @@ describe('MessageTips — FeedbackButton wiring', () => {
     );
 
     const detailsToggle = screen.getByRole('button', { name: /common.technical_details/ });
-    expect(detailsToggle).toHaveAttribute('aria-expanded', 'true');
+    expect(detailsToggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText(/Provider returned 401/)).not.toBeInTheDocument();
+    await user.click(detailsToggle);
     expect(screen.getByText(/Provider returned 401/)).toBeInTheDocument();
   });
 });

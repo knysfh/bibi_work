@@ -6,7 +6,18 @@
 
 import { ipcBridge } from '@/common';
 import type { IProvider } from '@/common/config/storage';
-import { Button, Divider, Message, Popconfirm, Collapse, Tag, Switch, Tooltip } from '@arco-design/web-react';
+import {
+  Button,
+  Divider,
+  Input,
+  Message,
+  Modal,
+  Popconfirm,
+  Collapse,
+  Tag,
+  Switch,
+  Tooltip,
+} from '@arco-design/web-react';
 import { DeleteFour, Info, Minus, Plus, Write, Heartbeat } from '@icon-park/react';
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -58,9 +69,9 @@ const getNextProtocol = (current: string): string => {
 };
 
 // Calculate API Key count
-const getApiKeyCount = (api_key: string): number => {
-  if (!api_key) return 0;
-  return api_key.split(/[,\n]/).filter((k) => k.trim().length > 0).length;
+const getApiKeyCount = (provider: IProvider): number => {
+  if (typeof provider.api_key_count === 'number') return provider.api_key_count;
+  return provider.api_key?.trim() ? 1 : 0;
 };
 
 /**
@@ -101,6 +112,8 @@ const ModelModalContent: React.FC = () => {
   const isPageMode = viewMode === 'page';
   const [collapseKey, setCollapseKey] = useState<Record<string, boolean>>({});
   const [healthCheckLoading, setHealthCheckLoading] = useState<Record<string, boolean>>({});
+  const [editingModel, setEditingModel] = useState<{ platform: IProvider; model: string } | null>(null);
+  const [editingModelName, setEditingModelName] = useState('');
   const { data, mutate } = useProvidersQuery();
   const [message, messageContext] = Message.useMessage();
 
@@ -120,9 +133,12 @@ const ModelModalContent: React.FC = () => {
 
   const updatePlatform = (platform: IProvider, success: () => void) => {
     const existing = (data || []).find((item) => item.id === platform.id);
+    // The plaintext key is request-only. Never retain it in the renderer's
+    // provider cache, even during the optimistic update window.
+    const optimisticPlatform = { ...platform, api_key: '' };
     const nextArray = existing
-      ? (data || []).map((item) => (item.id === platform.id ? { ...item, ...platform } : item))
-      : [...(data || []), platform];
+      ? (data || []).map((item) => (item.id === platform.id ? { ...item, ...optimisticPlatform } : item))
+      : [...(data || []), optimisticPlatform];
 
     // Optimistic update
     void mutate(nextArray, false);
@@ -189,6 +205,26 @@ const ModelModalContent: React.FC = () => {
     };
 
     updatePlatform(updated, () => {});
+  };
+
+  const openModelNameEditor = (platform: IProvider, model: string) => {
+    setEditingModel({ platform, model });
+    setEditingModelName(platform.model_labels?.[model]?.trim() || model);
+  };
+
+  const saveModelDisplayName = () => {
+    if (!editingModel) return;
+    const displayName = editingModelName.trim() || editingModel.model;
+    updatePlatform(
+      {
+        ...editingModel.platform,
+        model_labels: {
+          ...editingModel.platform.model_labels,
+          [editingModel.model]: displayName,
+        },
+      },
+      () => setEditingModel(null)
+    );
   };
 
   // Execute provider/model health check without creating a conversation.
@@ -368,6 +404,28 @@ const ModelModalContent: React.FC = () => {
       {addPlatformModalContext}
       {editModalContext}
       {addModelModalContext}
+      <Modal
+        visible={editingModel !== null}
+        title={t('settings.modelName')}
+        okText={t('common.confirm')}
+        cancelText={t('common.cancel')}
+        onOk={saveModelDisplayName}
+        onCancel={() => setEditingModel(null)}
+        unmountOnExit
+      >
+        <div className='flex flex-col gap-8px'>
+          <Input
+            value={editingModelName}
+            onChange={setEditingModelName}
+            maxLength={120}
+            autoFocus
+            placeholder={editingModel?.model}
+          />
+          {editingModel && editingModelName.trim() !== editingModel.model ? (
+            <div className='text-12px text-t-secondary break-all'>{editingModel.model}</div>
+          ) : null}
+        </div>
+      </Modal>
 
       {isPageMode ? (
         <SettingsPageHeader
@@ -462,11 +520,11 @@ const ModelModalContent: React.FC = () => {
                               className='cursor-pointer hover:text-t-primary transition-colors'
                               onClick={() => editModalCtrl.open({ data: platform })}
                             >
-                              {t('settings.apiKeyCount')}（{getApiKeyCount(platform.api_key)}）
+                              {t('settings.apiKeyCount')}（{getApiKeyCount(platform)}）
                             </span>
                           </span>
                           <span className='text-12px text-t-secondary whitespace-nowrap md:hidden'>
-                            {(platform.models ?? []).length} / {getApiKeyCount(platform.api_key)}
+                            {(platform.models ?? []).length} / {getApiKeyCount(platform)}
                           </span>
                           {/* 供应商启用开关 / Provider enable switch */}
                           <Switch
@@ -545,7 +603,15 @@ const ModelModalContent: React.FC = () => {
                                 </Tooltip>
                               )}
 
-                              <span className='text-14px text-t-primary'>{model}</span>
+                              <div className='min-w-0'>
+                                <div className='text-14px text-t-primary truncate'>
+                                  {platform.model_labels?.[model]?.trim() || model}
+                                </div>
+                                {platform.model_labels?.[model]?.trim() &&
+                                platform.model_labels?.[model]?.trim() !== model ? (
+                                  <div className='text-11px text-t-secondary truncate'>{model}</div>
+                                ) : null}
+                              </div>
 
                               {/* New API 协议标签（点击循环切换）/ New API protocol badge (click to cycle) */}
                               {isNewApiProvider && (
@@ -573,6 +639,15 @@ const ModelModalContent: React.FC = () => {
                             </div>
 
                             <div className='flex items-center gap-6px shrink-0'>
+                              <Tooltip content={t('settings.modelName')}>
+                                <Button
+                                  size='mini'
+                                  className='!w-28px !h-28px !min-w-28px !bg-[var(--color-bg-1)] text-t-secondary hover:text-t-primary hover:!bg-[var(--fill-0)]'
+                                  icon={<Write theme='outline' size='16' />}
+                                  onClick={() => openModelNameEditor(platform, model)}
+                                />
+                              </Tooltip>
+
                               {/* 心跳检测按钮 / Health check button */}
                               <Tooltip content={t('settings.healthCheck')}>
                                 <Button
@@ -593,9 +668,11 @@ const ModelModalContent: React.FC = () => {
                                   const newProtocols = { ...platform.model_protocols };
                                   const newModelEnabled = { ...platform.model_enabled };
                                   const newModelHealth = { ...platform.model_health };
+                                  const newModelLabels = { ...platform.model_labels };
                                   delete newProtocols[model];
                                   delete newModelEnabled[model];
                                   delete newModelHealth[model];
+                                  delete newModelLabels[model];
 
                                   updatePlatform(
                                     {
@@ -605,6 +682,7 @@ const ModelModalContent: React.FC = () => {
                                       model_enabled:
                                         Object.keys(newModelEnabled).length > 0 ? newModelEnabled : undefined,
                                       model_health: Object.keys(newModelHealth).length > 0 ? newModelHealth : undefined,
+                                      model_labels: Object.keys(newModelLabels).length > 0 ? newModelLabels : undefined,
                                     },
                                     () => {}
                                   );

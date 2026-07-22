@@ -30,6 +30,7 @@ export class AnthropicRotatingClient extends RotatingApiClient<Anthropic> {
 
       const clientConfig: AnthropicClientOptions_ = {
         apiKey: cleanedApiKey,
+        maxRetries: 0,
       };
 
       if (config.baseURL) {

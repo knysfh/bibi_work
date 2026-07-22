@@ -203,7 +203,7 @@ function compactPlan(content: string): string {
 }
 
 test('real model keeps five turns, previews a generated Python plan, and restores history', async () => {
-  test.setTimeout(600_000);
+  test.setTimeout(900_000);
   let browser: Browser | null = null;
   let page: Page | null = null;
   let token: string | null = null;
@@ -223,15 +223,18 @@ test('real model keeps five turns, previews a generated Python plan, and restore
       socket.on('framereceived', (event) => frames.push(event.payload));
     });
 
-    token = await ferrisKeyPasswordToken();
-    await page.evaluate(
-      async (accessToken) => (window.electronAPI as DesktopElectronApi).setAuthAccessToken(accessToken),
-      token
-    );
-    await page.reload({ waitUntil: 'domcontentloaded' });
-    await expect
-      .poll(() => page!.evaluate(() => (window.electronAPI as DesktopElectronApi).getAuthAccessToken()))
-      .toBe(token);
+    const refreshDesktopAuth = async () => {
+      token = await ferrisKeyPasswordToken();
+      await page!.evaluate(
+        async (accessToken) => (window.electronAPI as DesktopElectronApi).setAuthAccessToken(accessToken),
+        token
+      );
+      await page!.reload({ waitUntil: 'domcontentloaded' });
+      await expect
+        .poll(() => page!.evaluate(() => (window.electronAPI as DesktopElectronApi).getAuthAccessToken()))
+        .toBe(token);
+    };
+    await refreshDesktopAuth();
 
     const me = await rustApi<{
       tenant_id: string;
@@ -298,9 +301,17 @@ test('real model keeps five turns, previews a generated Python plan, and restore
       token,
       `/api/v1/agents/${agent!.id}/versions?${new URLSearchParams({ tenant_id: tenantId, status: 'published' })}`
     );
-    const modelProfileId = versions
-      .map((version) => version.snapshot.model_profile_id)
-      .find((candidate): candidate is string => typeof candidate === 'string');
+    const activeModelProfiles = await rustApi<CatalogResource[]>(
+      token,
+      `/api/v1/llm-model-profiles?${new URLSearchParams({ tenant_id: tenantId, status: 'active' })}`
+    );
+    const activeModelProfileIds = new Set(activeModelProfiles.map((profile) => profile.id));
+    const modelProfileId =
+      versions
+        .map((version) => version.snapshot.model_profile_id)
+        .find(
+          (candidate): candidate is string => typeof candidate === 'string' && activeModelProfileIds.has(candidate)
+        ) ?? activeModelProfiles[0]?.id;
     expect(modelProfileId).toBeTruthy();
     const version = await rustApi<{ id: string }>(token, `/api/v1/agents/${agent!.id}/versions`, {
       method: 'POST',
@@ -347,8 +358,10 @@ test('real model keeps five turns, previews a generated Python plan, and restore
     const input = page.getByTestId('sendbox-input');
     const send = page.getByTestId('sendbox-send-btn');
     const assistantMessages = page.getByTestId('message-text-left').getByTestId('message-text-content');
-    const turn = (prompt: string) =>
-      sendTurn({
+    const turn = async (prompt: string) => {
+      await refreshDesktopAuth();
+      await expect(page!).toHaveURL(new RegExp(`#/conversation/${conversationId}$`));
+      return sendTurn({
         frames,
         input,
         messages: assistantMessages,
@@ -359,6 +372,7 @@ test('real model keeps five turns, previews a generated Python plan, and restore
         token: token!,
         conversationId: conversationId!,
       });
+    };
 
     const firstPrompt =
       'This is turn one. Write three short points about reliable regression testing, then end with FRUIT: and one English fruit.';
@@ -413,7 +427,9 @@ test('real model keeps five turns, previews a generated Python plan, and restore
     if (chineseCount(plan) > 300) plan = compactPlan(plan);
     expect(chineseCount(plan)).toBeGreaterThanOrEqual(140);
     expect(chineseCount(plan)).toBeLessThanOrEqual(300);
+    console.log('production-conversation-e2e: multi-turn and plan complete');
 
+    await refreshDesktopAuth();
     workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), 'biwork-production-journey-'));
     await fs.mkdir(path.join(workspacePath, 'docs'), { recursive: true });
     const fileName = `python-plan-${Date.now()}.md`;
@@ -481,7 +497,9 @@ test('real model keeps five turns, previews a generated Python plan, and restore
     await expect(preview).toContainText('Python 学习计划', { timeout: 30_000 });
     await expect(preview).toContainText('验收标准');
     await page.screenshot({ path: path.join(SCREENSHOT_DIR, '24-project-file-preview.png'), fullPage: true });
+    console.log('production-conversation-e2e: project preview complete');
 
+    await refreshDesktopAuth();
     await page.evaluate((id) => {
       window.location.hash = `#/conversation/${id}`;
     }, conversationId);
@@ -539,7 +557,9 @@ test('real model keeps five turns, previews a generated Python plan, and restore
     await expect(restoredAssistantMessages.filter({ hasText: 'Python 学习计划' }).last()).toContainText('验收标准', {
       timeout: 30_000,
     });
+    console.log('production-conversation-e2e: history restore complete');
 
+    await refreshDesktopAuth();
     const browserToolCallId = crypto.randomUUID();
     const browserUrl =
       'https://www.math.pku.edu.cn/teachers/a-very-long-browser-result-path-that-must-wrap-without-horizontal-overflow';

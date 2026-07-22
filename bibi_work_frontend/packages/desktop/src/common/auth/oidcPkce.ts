@@ -162,7 +162,11 @@ export function buildOidcAuthorizationUrl(input: {
   url.searchParams.set('client_id', requiredString(input.config.client_id, 'client_id'));
   url.searchParams.set('redirect_uri', requiredString(input.redirectUri, 'redirect_uri'));
   url.searchParams.set('response_type', 'code');
-  url.searchParams.set('scope', scopes(input.config));
+  const requestedScopes = scopes(input.config);
+  url.searchParams.set('scope', requestedScopes);
+  if (requestedScopes.split(/\s+/).includes('offline_access')) {
+    url.searchParams.set('prompt', 'consent');
+  }
   url.searchParams.set('state', input.state);
   url.searchParams.set('code_challenge', input.codeChallenge);
   url.searchParams.set('code_challenge_method', 'S256');

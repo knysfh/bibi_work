@@ -85,7 +85,7 @@ pub use biwork_assistant_service::{
 pub use biwork_auth_service::{
     biwork_auth_status, biwork_auth_user, biwork_change_webui_username, biwork_exchange_oidc_token,
     biwork_generate_webui_qr_token, biwork_get_oidc_config, biwork_get_system_user, biwork_logout,
-    biwork_revoke_oidc_token, biwork_seed_system_user_credentials,
+    biwork_record_session_activity, biwork_revoke_oidc_token, biwork_seed_system_user_credentials,
     biwork_webui_password_auth_unsupported,
 };
 pub use biwork_channel_service::{

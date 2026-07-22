@@ -89,6 +89,7 @@ pub(super) async fn create_and_dispatch_conversation_run(
             requested_agent_id,
             agent_version_id: requested_agent_version_id,
             project_id,
+            selected_model_profile_id: conversation_scope.selected_model_profile_id,
             selected_mcp_server_ids: conversation_scope.selected_mcp_server_ids.clone(),
             thread_id: payload.thread_id.clone(),
             client_snapshot: payload.run_config_snapshot,
@@ -350,6 +351,7 @@ struct ConversationRunScope {
     remote_project_id: Option<Uuid>,
     default_agent_id: Option<Uuid>,
     default_agent_version_id: Option<Uuid>,
+    selected_model_profile_id: Option<Uuid>,
     selected_mcp_server_ids: Vec<Uuid>,
 }
 
@@ -404,6 +406,8 @@ async fn load_conversation_run_scope(
     )
     .await?;
     let selected_mcp_server_ids = conversation_selected_mcp_server_ids(&metadata)?;
+    let selected_model_profile_id =
+        conversation_selected_model_profile_id(state, tenant_id, &metadata).await?;
     Ok(ConversationRunScope {
         workspace_id,
         project_id: row.try_get("project_id")?,
@@ -412,8 +416,39 @@ async fn load_conversation_run_scope(
         remote_project_id: row.try_get("remote_project_id")?,
         default_agent_id: row.try_get("default_agent_id")?,
         default_agent_version_id: row.try_get("default_agent_version_id")?,
+        selected_model_profile_id,
         selected_mcp_server_ids,
     })
+}
+
+async fn conversation_selected_model_profile_id(
+    state: &AppState,
+    tenant_id: Uuid,
+    metadata: &Value,
+) -> Result<Option<Uuid>, AppError> {
+    if let Some(value) = metadata
+        .pointer("/biwork/model_profile_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Uuid::parse_str(value).map(Some).map_err(|_| {
+            AppError::InvalidInput("conversation model_profile_id must be a UUID".to_string())
+        });
+    }
+    let reference = metadata
+        .pointer("/biwork/assistant/conversation_overrides/model")
+        .or_else(|| metadata.pointer("/biwork/model/use_model"))
+        .or_else(|| metadata.pointer("/biwork/model/model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    run_snapshot::resolve_active_model_profile_reference(&state.connect_pool, tenant_id, reference)
+        .await
+        .map(Some)
 }
 
 async fn resolve_conversation_agent_version(

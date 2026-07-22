@@ -26,6 +26,7 @@ export interface ElectronBridgeAPI {
   getAuthAccessToken?: (forceRefresh?: boolean) => Promise<string | null>;
   invalidateDesktopAuth?: () => Promise<void>;
   logoutDesktopAuth?: () => Promise<void>;
+  recordDesktopAuthActivity?: () => Promise<boolean>;
   startDesktopOidcLogin?: () => Promise<{ authorizationUrl: string }>;
 }
 

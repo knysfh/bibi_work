@@ -101,6 +101,7 @@ async fn claim_due_rotations(
             WHERE credential.auto_rotation_enabled
               AND credential.revoked_at IS NULL
               AND credential.rotation_status = 'active'
+              AND credential.secret_ref NOT LIKE 'local://%'
               AND (
                   credential.next_rotation_at <= CURRENT_TIMESTAMP
                   OR (

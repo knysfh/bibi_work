@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef } from 'react';
 import useSWR, { type SWRConfiguration } from 'swr';
 import { useGoogleAuthModels } from './useGoogleAuthModels';
 import { hasSpecificModelCapability } from '@/renderer/utils/model/modelCapabilities';
+import { getConfiguredModelDisplayName } from '@/renderer/utils/model/modelDisplayName';
 
 export interface ModelProviderListResult {
   providers: IProvider[];
@@ -93,10 +94,11 @@ export const useModelProviderList = (): ModelProviderListResult => {
     return list.filter((p) => getAvailableModels(p).length > 0);
   }, [getAvailableModels, isGoogleAuth, modelConfig]);
 
-  const formatModelLabel = useCallback((_provider: { platform?: string } | undefined, modelName?: string) => {
-    if (!modelName) return '';
-    return modelName;
-  }, []);
+  const formatModelLabel = useCallback(
+    (_provider: { platform?: string } | undefined, modelName?: string) =>
+      getConfiguredModelDisplayName(modelConfig, modelName),
+    [modelConfig]
+  );
 
   return { providers, getAvailableModels, formatModelLabel };
 };

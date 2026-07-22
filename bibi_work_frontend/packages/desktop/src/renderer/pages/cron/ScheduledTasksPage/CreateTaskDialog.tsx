@@ -265,7 +265,7 @@ const CreateTaskDialog: React.FC<CreateTaskDialogProps> = ({
   const selectedAssistantModels = selectedAssistant?.models ?? [];
   const resolveAutoApproveModeFromAgentMetadata = useCallback(
     (assistant: (typeof presetAssistants)[number]): string => {
-      const agent = managedAgentRuntimeCatalog.find((item) => item.id === assistant.agent_id);
+      const agent = managedAgentRuntimeCatalog.find((item) => item.id === (assistant.runtime_id || assistant.agent_id));
       return agent?.yolo_id || 'yolo';
     },
     [managedAgentRuntimeCatalog]

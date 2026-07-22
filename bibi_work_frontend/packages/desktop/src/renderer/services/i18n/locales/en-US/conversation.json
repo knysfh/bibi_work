@@ -145,7 +145,7 @@
       },
       "BIWORK_INTERNAL_ERROR": {
         "title": "Request failed in the app",
-        "body": "The request failed while the app was processing it. Please retry once; if it repeats, send feedback."
+        "body": "The request could not be completed. Contact your administrator; technical details have been retained for troubleshooting."
       },
       "BIWORK_CONVERSATION_BUSY": {
         "title": "Conversation is busy",
@@ -229,7 +229,7 @@
       },
       "USER_LLM_PROVIDER_AUTH_FAILED": {
         "title": "Model provider authentication failed",
-        "body": "The selected provider rejected the API key or account credentials. Check the provider settings and try again."
+        "body": "The selected provider rejected the API key or account credentials. Contact your administrator to check the model configuration."
       },
       "USER_LLM_PROVIDER_AWS_SSO_EXPIRED": {
         "title": "AWS SSO session expired",
@@ -237,7 +237,7 @@
       },
       "USER_LLM_PROVIDER_CONFIG_ERROR": {
         "title": "Model provider configuration is invalid",
-        "body": "The provider request could not be built from the current settings. Check credentials, region, Base URL, and provider-specific configuration before retrying."
+        "body": "The model configuration is invalid. Contact your administrator to check credentials, region, Base URL, and provider-specific settings."
       },
       "USER_LLM_PROVIDER_MODEL_NOT_FOUND": {
         "title": "The selected model was not found",
@@ -261,7 +261,7 @@
       },
       "USER_LLM_PROVIDER_PERMISSION_DENIED": {
         "title": "Model provider permission denied",
-        "body": "The provider account does not have permission for this model or operation. Check account permissions or choose another model."
+        "body": "The provider account does not have permission for this model or operation. Contact your administrator to check account permissions."
       },
       "USER_LLM_PROVIDER_BILLING_REQUIRED": {
         "title": "Model provider billing is required",

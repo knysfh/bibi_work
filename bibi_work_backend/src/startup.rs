@@ -144,7 +144,12 @@ impl Application {
                 Method::PATCH,
                 Method::DELETE,
             ])
-            .allow_headers([header::AUTHORIZATION, header::ACCEPT, header::CONTENT_TYPE])
+            .allow_headers([
+                header::AUTHORIZATION,
+                header::ACCEPT,
+                header::CONTENT_TYPE,
+                header::HeaderName::from_static("x-biwork-client-kind"),
+            ])
             .expose_headers([header::HeaderName::from_static("x-trace-id")]);
 
         let auth_router = Router::new().route("/oidc/config", get(get_oidc_config));

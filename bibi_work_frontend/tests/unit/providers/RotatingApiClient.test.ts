@@ -58,10 +58,11 @@ describe('RotatingApiClient', () => {
   });
 
   describe('error handling', () => {
-    it('identifies 401 as retryable', () => {
+    it('does not retry a single invalid credential', () => {
       const client = new TestRotatingApiClient('key', AuthType.USE_OPENAI);
       const error = { status: 401 };
-      expect((client as any).isRetryableError(error)).toBe(true);
+      expect((client as any).isRetryableError(error)).toBe(false);
+      expect((client as any).isKeyRotationError(error)).toBe(true);
     });
 
     it('identifies 429 as retryable', () => {
@@ -128,6 +129,7 @@ describe('RotatingApiClient', () => {
 
     it('retries on retryable error', async () => {
       const client = new TestRotatingApiClient('key', AuthType.USE_OPENAI, { maxRetries: 3 });
+      vi.spyOn(client as any, 'delay').mockResolvedValue(undefined);
       const operation = vi.fn().mockRejectedValueOnce({ status: 429 }).mockResolvedValue('success');
 
       const result = await client.executeWithRetry(operation);
@@ -138,10 +140,11 @@ describe('RotatingApiClient', () => {
 
     it('exhausts retries and throws last error', async () => {
       const client = new TestRotatingApiClient('key', AuthType.USE_OPENAI, { maxRetries: 2 });
+      vi.spyOn(client as any, 'delay').mockResolvedValue(undefined);
       const operation = vi.fn().mockRejectedValue({ status: 503 });
 
       await expect(client.executeWithRetry(operation)).rejects.toEqual({ status: 503 });
-      expect(operation).toHaveBeenCalledTimes(2);
+      expect(operation).toHaveBeenCalledTimes(3);
     });
 
     it('stops retrying on non-retryable error', async () => {
@@ -155,6 +158,7 @@ describe('RotatingApiClient', () => {
     it('rotates key on retryable error with multiple keys (integration test)', async () => {
       // Use real ApiKeyManager with multiple keys
       const client = new TestRotatingApiClient('key1,key2,key3', AuthType.USE_OPENAI, { maxRetries: 3 });
+      vi.spyOn(client as any, 'delay').mockResolvedValue(undefined);
       let attemptCount = 0;
       const operation = vi.fn().mockImplementation(() => {
         attemptCount++;
@@ -174,36 +178,40 @@ describe('RotatingApiClient', () => {
       expect(status.blacklisted.length).toBeGreaterThan(0);
     });
 
-    it('does not rotate key on last attempt', async () => {
+    it('rotates once before the final attempt', async () => {
       // Use real ApiKeyManager with multiple keys
       const client = new TestRotatingApiClient('key1,key2', AuthType.USE_OPENAI, { maxRetries: 1 });
+      vi.spyOn(client as any, 'delay').mockResolvedValue(undefined);
       const operation = vi.fn().mockRejectedValue({ status: 429 });
 
       await expect(client.executeWithRetry(operation)).rejects.toEqual({ status: 429 });
-      expect(operation).toHaveBeenCalledTimes(1);
-      // No rotation should happen on last attempt
+      expect(operation).toHaveBeenCalledTimes(2);
       const status = client.getKeyStatus();
       expect(status).toBeTruthy();
-      // Blacklist should still be empty because it's the last attempt
-      expect(status.blacklisted.length).toBe(0);
+      expect(status.blacklisted.length).toBe(1);
+    });
+
+    it('uses the bounded 5s, 15s, 30s retry schedule', async () => {
+      const client = new TestRotatingApiClient('key', AuthType.USE_OPENAI, { maxRetries: 3 });
+      const delay = vi.spyOn(client as any, 'delay').mockResolvedValue(undefined);
+      const operation = vi.fn().mockRejectedValue({ status: 429 });
+
+      await expect(client.executeWithRetry(operation)).rejects.toEqual({ status: 429 });
+
+      expect(operation).toHaveBeenCalledTimes(4);
+      expect(delay.mock.calls.map(([milliseconds]) => milliseconds)).toEqual([5000, 15000, 30000]);
     });
   });
 
   describe('options', () => {
-    it('uses default maxRetries and retryDelay', () => {
+    it('uses three retries by default', () => {
       const client = new TestRotatingApiClient('key', AuthType.USE_OPENAI);
       expect((client as any).options.maxRetries).toBe(3);
-      expect((client as any).options.retryDelay).toBe(1000);
     });
 
     it('accepts custom maxRetries', () => {
       const client = new TestRotatingApiClient('key', AuthType.USE_OPENAI, { maxRetries: 5 });
       expect((client as any).options.maxRetries).toBe(5);
-    });
-
-    it('accepts custom retryDelay', () => {
-      const client = new TestRotatingApiClient('key', AuthType.USE_OPENAI, { retryDelay: 2000 });
-      expect((client as any).options.retryDelay).toBe(2000);
     });
   });
 });

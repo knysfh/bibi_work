@@ -35,6 +35,8 @@ export type DesktopOidcControllerOptions = {
   emitSessionExpired?: (reason: string) => void;
   getLoopbackPort: () => number | null;
   getStoredAccessToken: () => string | null;
+  onSessionCleared?: () => void;
+  onSessionEstablished?: () => void;
   openExternal: (url: string) => Promise<unknown>;
   refreshTokenStore: DesktopRefreshTokenStoreLike;
   setStoredAccessToken: (accessToken: string | null) => void;
@@ -115,6 +117,8 @@ export class DesktopOidcController {
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private refreshToken: string | null = null;
   private refreshTokenLoaded = false;
+  private sessionEstablished = false;
+  private sessionGeneration = 0;
 
   constructor(private readonly options: DesktopOidcControllerOptions) {}
 
@@ -139,7 +143,10 @@ export class DesktopOidcController {
 
   setAccessToken(accessToken: string | null): void {
     this.setAccessTokenState(accessToken);
-    if (accessToken) this.scheduleRefresh();
+    if (accessToken) {
+      this.ensureSessionEstablished();
+      this.scheduleRefresh();
+    }
   }
 
   async startLogin(): Promise<{ authorizationUrl: string }> {
@@ -177,7 +184,7 @@ export class DesktopOidcController {
     }
   }
 
-  async logout(): Promise<void> {
+  async logout(reason = 'user_logout', notifyRenderer = false): Promise<void> {
     await this.loadRefreshToken();
     const refreshToken = this.refreshToken;
     try {
@@ -190,7 +197,7 @@ export class DesktopOidcController {
         });
       }
     } finally {
-      await this.clearSession(false);
+      await this.clearSession(notifyRenderer, reason);
     }
   }
 
@@ -237,13 +244,20 @@ export class DesktopOidcController {
     this.accessTokenRefreshAt = this.accessTokenExpiresAt - lead;
   }
 
-  private async applyTokenSet(tokenSet: TokenSet, notifyRenderer: boolean): Promise<string> {
+  private async applyTokenSet(
+    tokenSet: TokenSet,
+    notifyRenderer: boolean,
+    expectedGeneration = this.sessionGeneration
+  ): Promise<string | null> {
+    if (expectedGeneration !== this.sessionGeneration) return null;
     if (tokenSet.refreshToken) {
       this.refreshToken = tokenSet.refreshToken;
       this.refreshTokenLoaded = true;
       await this.options.refreshTokenStore.save(tokenSet.refreshToken);
     }
+    if (expectedGeneration !== this.sessionGeneration) return null;
     this.setAccessTokenState(tokenSet.accessToken, tokenSet.expiresInSeconds);
+    this.ensureSessionEstablished();
     this.scheduleRefresh();
     if (notifyRenderer) this.options.emitAccessTokenChanged?.(tokenSet.accessToken);
     return tokenSet.accessToken;
@@ -284,7 +298,9 @@ export class DesktopOidcController {
   }
 
   private async performRefresh(): Promise<string | null> {
+    const generation = this.sessionGeneration;
     await this.loadRefreshToken();
+    if (generation !== this.sessionGeneration) return null;
     if (!this.refreshToken) return this.getAccessToken();
     const config = await this.fetchConfig();
     const response = await (this.options.fetchImpl ?? fetch)(this.options.apiUrl('/api/auth/oidc/token'), {
@@ -306,16 +322,27 @@ export class DesktopOidcController {
     }
     const tokenSet = tokenSetFromResponse(body);
     if (!tokenSet) throw new Error('OIDC refresh response is missing access_token');
-    return this.applyTokenSet(tokenSet, true);
+    return this.applyTokenSet(tokenSet, true, generation);
   }
 
   private async clearSession(notifyRenderer: boolean, reason = 'session_expired'): Promise<void> {
+    this.sessionGeneration += 1;
     this.clearRefreshTimer();
     this.setAccessTokenState(null);
     this.refreshToken = null;
     this.refreshTokenLoaded = true;
     await this.options.refreshTokenStore.clear();
+    if (this.sessionEstablished) {
+      this.sessionEstablished = false;
+      this.options.onSessionCleared?.();
+    }
     if (notifyRenderer) this.options.emitSessionExpired?.(reason);
+  }
+
+  private ensureSessionEstablished(): void {
+    if (this.sessionEstablished) return;
+    this.sessionEstablished = true;
+    this.options.onSessionEstablished?.();
   }
 
   private async exchangeCallback(callback: OidcLoopbackCallback): Promise<void> {
@@ -365,6 +392,7 @@ export class DesktopOidcController {
       throw new Error('OIDC token response is missing access_token');
     }
     const accessToken = await this.applyTokenSet(tokenSet, false);
+    if (!accessToken) throw new Error('OIDC login session was cleared before completion');
     this.loginState = null;
     this.options.emitLoginCompleted(accessToken);
   }
