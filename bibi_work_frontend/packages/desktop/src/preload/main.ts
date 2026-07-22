@@ -57,6 +57,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     : {}),
   invalidateDesktopAuth: () => ipcRenderer.invoke('auth:session:invalidate'),
   logoutDesktopAuth: () => ipcRenderer.invoke('auth:session:logout'),
+  recordDesktopAuthActivity: () => ipcRenderer.invoke('auth:session:activity'),
   startDesktopOidcLogin: () => ipcRenderer.invoke('auth:oidc-login:start'),
 });
 

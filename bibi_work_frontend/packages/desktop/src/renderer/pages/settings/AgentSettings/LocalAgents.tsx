@@ -167,7 +167,7 @@ const LocalAgents: React.FC = () => {
     <div data-testid='agent-management-page' className='flex flex-col gap-16px py-16px px-16px'>
       <SettingsPageHeader
         data-testid='agent-management-header'
-        title={t('settings.agents', { defaultValue: 'Agents' })}
+        title={t('settings.agents', { defaultValue: 'Runtimes' })}
         description={
           <>
             <span>{t('settings.agentManagement.localAgentsDescription')} </span>

@@ -110,9 +110,16 @@ test('Agent-bound universal MCP is discoverable and callable after conversation 
       token,
       `/api/v1/agents/${agent!.id}/versions?${new URLSearchParams({ tenant_id: tenantId, status: 'published' })}`
     );
-    const modelProfileId = publishedVersions
-      .map((version) => version.snapshot.model_profile_id)
-      .find((value): value is string => typeof value === 'string');
+    const activeModelProfiles = await rustApi<CatalogResource[]>(
+      token,
+      `/api/v1/llm-model-profiles?${new URLSearchParams({ tenant_id: tenantId, status: 'active' })}`
+    );
+    const activeModelProfileIds = new Set(activeModelProfiles.map((profile) => profile.id));
+    const modelProfileId =
+      publishedVersions
+        .map((version) => version.snapshot.model_profile_id)
+        .find((value): value is string => typeof value === 'string' && activeModelProfileIds.has(value)) ??
+      activeModelProfiles[0]?.id;
     expect(modelProfileId).toBeTruthy();
 
     const version = await rustApi<{ id: string }>(token, `/api/v1/agents/${agent!.id}/versions`, {

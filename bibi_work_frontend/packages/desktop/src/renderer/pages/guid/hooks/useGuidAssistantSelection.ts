@@ -51,19 +51,15 @@ export type GuidAssistantSelectionResult = {
   ) => void;
 };
 
-export function resolveInitialAssistantModel(models: string[]): string | null {
-  if (models.length > 0) {
-    return models[0];
-  }
-
+export function resolveInitialAssistantModel(_models: string[]): string | null {
   return null;
 }
 
 export function buildAssistantModelInfo(models: string[]): AcpModelInfo | null {
   if (models.length > 0) {
     return {
-      current_model_id: models[0],
-      current_model_label: models[0],
+      current_model_id: null,
+      current_model_label: null,
       available_models: models.map((model) => ({ id: model, label: model })),
     } satisfies AcpModelInfo;
   }
@@ -102,9 +98,8 @@ function persistGuidAssistantSelectionKey(assistantId: string): void {
 }
 
 export function pickDefaultAssistantSelectionKey(assistants: Assistant[]): string | null {
-  const enabledAssistants = assistants.filter((assistant) => assistant.enabled !== false);
-  const preferred = enabledAssistants.find((assistant) => assistant.source === 'generated') ?? enabledAssistants[0];
-  return preferred?.id ?? null;
+  void assistants;
+  return null;
 }
 
 type UseGuidAssistantSelectionOptions = {
@@ -186,8 +181,7 @@ export const useGuidAssistantSelection = ({
 
     if (resetAssistant) {
       resetHandledRef.current = true;
-      const fallbackId =
-        readPersistedGuidAssistantSelectionKey(assistants) ?? pickDefaultAssistantSelectionKey(assistants);
+      const fallbackId = readPersistedGuidAssistantSelectionKey(assistants) ?? null;
       _setSelectedAssistantId(fallbackId);
     }
   }, [assistants, preselectAssistantId, resetAssistant]);
@@ -197,9 +191,7 @@ export const useGuidAssistantSelection = ({
     if (resetAssistant) return;
     if (preselectAssistantId && resolveAssistantSelectionKey(preselectAssistantId, assistants)) return;
     if (!selectedAssistantIdState || !assistants.some((assistant) => assistant.id === selectedAssistantIdState)) {
-      _setSelectedAssistantId(
-        readPersistedGuidAssistantSelectionKey(assistants) ?? pickDefaultAssistantSelectionKey(assistants)
-      );
+      _setSelectedAssistantId(readPersistedGuidAssistantSelectionKey(assistants) ?? null);
     }
   }, [assistants, preselectAssistantId, resetAssistant, selectedAssistantIdState]);
 
@@ -213,10 +205,12 @@ export const useGuidAssistantSelection = ({
   const selectedAssistantModels = selectedAssistant?.models ?? [];
   const selectedManagedAgentRuntimeCatalog = useMemo(
     () =>
-      selectedAssistant?.agent_id
-        ? managedAgentRuntimeCatalog.find((agent) => agent.id === selectedAssistant.agent_id)
+      selectedAssistant?.runtime_id || selectedAssistant?.agent_id
+        ? managedAgentRuntimeCatalog.find(
+            (agent) => agent.id === (selectedAssistant.runtime_id || selectedAssistant.agent_id)
+          )
         : undefined,
-    [managedAgentRuntimeCatalog, selectedAssistant?.agent_id]
+    [managedAgentRuntimeCatalog, selectedAssistant?.runtime_id, selectedAssistant?.agent_id]
   );
   const selectedAgentRuntimeModelInfo = useMemo(
     () => buildAgentRuntimeModelInfo(selectedManagedAgentRuntimeCatalog),
@@ -249,11 +243,8 @@ export const useGuidAssistantSelection = ({
 
   const modelSelectionScopeRef = useRef<string | null>(null);
   useEffect(() => {
-    const runtimeModelId =
-      selectedAgentRuntimeModelInfo?.current_model_id || selectedAgentRuntimeModelInfo?.available_models[0]?.id;
-    const fallbackModelId =
-      runtimeModelId ||
-      (selectedAssistantModels.length > 0 ? resolveInitialAssistantModel(selectedAssistantModels) : null);
+    const runtimeModelId = selectedAgentRuntimeModelInfo?.current_model_id;
+    const fallbackModelId = runtimeModelId || resolveInitialAssistantModel(selectedAssistantModels);
     const availableModelIds = new Set(
       selectedAgentRuntimeModelInfo?.available_models.map((model) => model.id) ?? selectedAssistantModels
     );

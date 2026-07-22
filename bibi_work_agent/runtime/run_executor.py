@@ -12,6 +12,7 @@ from bibi_work_agent.runtime.agent_factory import create_platform_agent
 from bibi_work_agent.runtime.cancellation import RunCancelled, is_run_cancelled
 from bibi_work_agent.runtime.event_emitter import EventEmitter
 from bibi_work_agent.runtime.event_normalizer import AgentEventNormalizer
+from bibi_work_agent.runtime.error_reporting import run_failure_payload
 from bibi_work_agent.runtime.memory_candidates import MemoryCandidateCollector
 from bibi_work_agent.runtime.snapshot_contract import (
     safe_error_message,
@@ -51,12 +52,13 @@ def execute_run_payload(worker_task_id: str | None, payload: dict[str, Any]) -> 
         validate_run_config_snapshot(payload.get("run_config_snapshot"))
     except Exception as exc:  # noqa: BLE001
         error = safe_error_message(exc)
+        failure = run_failure_payload(exc)
         emitter.emit(
             [
                 {
                     "event_id": f"run.failed.{run_id}.{uuid4()}",
                     "type": "run.failed",
-                    "payload": {"run_id": run_id, "error": error},
+                    "payload": {"run_id": run_id, **failure},
                     "trace_id": trace_id,
                 }
             ]
@@ -102,12 +104,13 @@ def execute_run_payload(worker_task_id: str | None, payload: dict[str, Any]) -> 
         return
     except Exception as exc:  # noqa: BLE001 - worker must report failures to Rust.
         error = safe_error_message(exc)
+        failure = run_failure_payload(exc)
         emitter.emit(
             [
                 {
                     "event_id": f"run.failed.{run_id}.{uuid4()}",
                     "type": "run.failed",
-                    "payload": {"run_id": run_id, "error": error},
+                    "payload": {"run_id": run_id, **failure},
                     "trace_id": trace_id,
                 }
             ]

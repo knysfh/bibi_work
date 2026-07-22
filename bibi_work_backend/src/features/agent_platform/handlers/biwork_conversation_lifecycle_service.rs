@@ -9,7 +9,9 @@ use uuid::Uuid;
 
 use crate::{
     features::{
-        agent_platform::{ferriskey_oidc::PlatformRequestContext, models::AuthzContext},
+        agent_platform::{
+            ferriskey_oidc::PlatformRequestContext, models::AuthzContext, run_snapshot,
+        },
         core::errors::AppError,
     },
     startup::AppState,
@@ -69,11 +71,36 @@ pub async fn biwork_create_conversation(
     }
     let agent_version_id =
         latest_published_agent_version_id(&state.connect_pool, ctx.tenant_id, agent_id).await?;
+    let selected_model_reference = payload
+        .pointer("/assistant/conversation_overrides/model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let selected_model_profile_id = if let Some(reference) = selected_model_reference {
+        Some(
+            run_snapshot::resolve_active_model_profile_reference(
+                &state.connect_pool,
+                ctx.tenant_id,
+                reference,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    validate_conversation_assistant_model(
+        &state,
+        ctx.tenant_id,
+        agent_version_id,
+        selected_model_profile_id,
+    )
+    .await?;
     let metadata = json!({
         "biwork": {
             "type": payload.get("type").and_then(Value::as_str).unwrap_or("acp"),
             "assistant": payload.get("assistant").cloned().unwrap_or(Value::Null),
             "agent_version_id": agent_version_id,
+            "model_profile_id": selected_model_profile_id,
             "model": payload.get("model").cloned().unwrap_or(Value::Null),
         },
         "extra": extra,
@@ -121,6 +148,60 @@ pub async fn biwork_create_conversation(
     .await?;
 
     Ok(ok(conversation_from_row(&state, ctx.tenant_id, &row).await?))
+}
+
+async fn validate_conversation_assistant_model(
+    state: &AppState,
+    tenant_id: Uuid,
+    agent_version_id: Option<Uuid>,
+    selected_model_profile_id: Option<Uuid>,
+) -> Result<(), AppError> {
+    if selected_model_profile_id.is_some() {
+        return Ok(());
+    }
+    let Some(agent_version_id) = agent_version_id else {
+        return Ok(());
+    };
+    let snapshot: Value = sqlx::query_scalar(
+        r#"
+        SELECT config_snapshot
+        FROM agent_versions
+        WHERE id = $1 AND tenant_id = $2 AND status = 'published'
+        "#,
+    )
+    .bind(agent_version_id)
+    .bind(tenant_id)
+    .fetch_optional(&state.connect_pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("assistant version not found".to_string()))?;
+    if snapshot
+        .pointer("/defaults/model/mode")
+        .and_then(Value::as_str)
+        == Some("auto")
+    {
+        return Err(AppError::InvalidInput(
+            "assistant uses automatic model selection; select a model in New Chat".to_string(),
+        ));
+    }
+    let profile_id = snapshot
+        .get("model_profile_id")
+        .or_else(|| snapshot.pointer("/agent/model_profile_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AppError::InvalidInput(
+                "assistant has no fixed model; select a model in New Chat or edit the assistant"
+                    .to_string(),
+            )
+        })?;
+    run_snapshot::resolve_active_model_profile_reference(&state.connect_pool, tenant_id, profile_id)
+        .await
+        .map(|_| ())
+        .map_err(|_| {
+            AppError::InvalidInput(
+            "assistant fixed model is no longer active; select another model or edit the assistant"
+                .to_string(),
+        )
+        })
 }
 
 pub async fn biwork_clone_conversation(

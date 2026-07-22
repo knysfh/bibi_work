@@ -32,14 +32,13 @@ export interface UnifiedChatCompletionResponse {
 }
 
 export interface RotatingApiClientOptions {
+  /** Number of retries after the original request. */
   maxRetries?: number;
-  retryDelay?: number;
 }
 
 // Constants for better maintainability
 const DEFAULT_MAX_RETRIES = 3;
-const DEFAULT_RETRY_DELAY = 1000;
-const _RETRYABLE_STATUS_CODES = new Set([401, 429, 503]); // Reserved for future use
+const RETRY_DELAYS_MS = [5000, 15000, 30000] as const;
 
 export interface ApiError extends Error {
   status?: number;
@@ -63,7 +62,6 @@ export abstract class RotatingApiClient<T> {
     this.createClientFn = createClientFn;
     this.options = {
       maxRetries: options.maxRetries ?? DEFAULT_MAX_RETRIES,
-      retryDelay: options.retryDelay ?? DEFAULT_RETRY_DELAY,
     };
 
     if (api_keys && (api_keys.includes(',') || api_keys.includes('\n'))) {
@@ -122,8 +120,16 @@ export abstract class RotatingApiClient<T> {
     const apiError = error as ApiError;
     const status = apiError.status || apiError.code;
 
-    // Retry on 401 (unauthorized), 429 (rate limit), 503 (service unavailable), and 5xx errors
-    return status === 401 || status === 429 || status === 503 || (status >= 500 && status < 600);
+    // Authentication errors do not recover by waiting. They may still rotate to
+    // another configured key, but a single invalid key must fail immediately.
+    return status === 408 || status === 409 || status === 429 || (status >= 500 && status < 600);
+  }
+
+  protected isKeyRotationError(error: unknown): boolean {
+    if (!error || typeof error !== 'object') return false;
+    const apiError = error as ApiError;
+    const status = apiError.status || apiError.code;
+    return status === 401 || this.isRetryableError(error);
   }
 
   protected delay(ms: number): Promise<void> {
@@ -137,18 +143,18 @@ export abstract class RotatingApiClient<T> {
 
     let lastError: unknown;
 
-    for (let attempt = 0; attempt < this.options.maxRetries; attempt++) {
+    for (let attempt = 0; attempt <= this.options.maxRetries; attempt++) {
       try {
         return await operation(this.client);
       } catch (error) {
         lastError = error;
 
-        const isLastAttempt = attempt === this.options.maxRetries - 1;
-        const canRotateKey = this.apiKeyManager?.hasMultipleKeys() && this.isRetryableError(error) && !isLastAttempt;
+        const isLastAttempt = attempt === this.options.maxRetries;
+        const canRotateKey = this.apiKeyManager?.hasMultipleKeys() && this.isKeyRotationError(error) && !isLastAttempt;
 
         if (canRotateKey && this.apiKeyManager.rotateKey()) {
           this.initializeClient();
-          await this.delay(this.options.retryDelay * (attempt + 1));
+          await this.delay(RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)]);
           continue;
         }
 
@@ -157,7 +163,7 @@ export abstract class RotatingApiClient<T> {
         }
 
         // Regular retry with delay
-        await this.delay(this.options.retryDelay * (attempt + 1));
+        await this.delay(RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)]);
       }
     }
 

@@ -13,11 +13,13 @@ import type { AcpConfigOptionDto, AcpModelInfo } from '@/common/types/platform/a
 import { useAcpModelInfo } from '@/renderer/hooks/agent/useAcpModelInfo';
 import { resetEnsureConversationRuntimeStateForTests } from '@/renderer/pages/conversation/utils/ensureConversationRuntime';
 
-const { ensureRuntimeInvokeMock, setConfigOptionInvokeMock, responseStreamHandlers } = vi.hoisted(() => ({
-  ensureRuntimeInvokeMock: vi.fn(),
-  setConfigOptionInvokeMock: vi.fn(),
-  responseStreamHandlers: [] as Array<(message: IResponseMessage) => void>,
-}));
+const { ensureRuntimeInvokeMock, listProvidersInvokeMock, setConfigOptionInvokeMock, responseStreamHandlers } =
+  vi.hoisted(() => ({
+    ensureRuntimeInvokeMock: vi.fn(),
+    listProvidersInvokeMock: vi.fn(),
+    setConfigOptionInvokeMock: vi.fn(),
+    responseStreamHandlers: [] as Array<(message: IResponseMessage) => void>,
+  }));
 
 vi.mock('@/common', () => ({
   ipcBridge: {
@@ -35,6 +37,9 @@ vi.mock('@/common', () => ({
           };
         }),
       },
+    },
+    mode: {
+      listProviders: { invoke: listProvidersInvokeMock },
     },
   },
 }));
@@ -116,8 +121,10 @@ describe('useAcpModelInfo', () => {
     responseStreamHandlers.length = 0;
     resetEnsureConversationRuntimeStateForTests();
     ensureRuntimeInvokeMock.mockReset();
+    listProvidersInvokeMock.mockReset();
     setConfigOptionInvokeMock.mockReset();
     ensureRuntimeInvokeMock.mockResolvedValue({ recovered: true, config_options: buildConfigOptions(), runtime: null });
+    listProvidersInvokeMock.mockResolvedValue([]);
     setConfigOptionInvokeMock.mockResolvedValue({
       confirmation: 'observed',
       config_options: buildConfigOptions('opus-4'),
@@ -143,6 +150,45 @@ describe('useAcpModelInfo', () => {
     expect(result.current.model_info?.available_models.map((model) => model.id)).toEqual(['sonnet-4', 'opus-4']);
     expect(result.current.canSwitch).toBe(true);
     expect(ensureRuntimeInvokeMock).toHaveBeenCalledWith({ conversation_id: 'conv-1' });
+  });
+
+  it('shows the configured display name instead of a bound model profile UUID', async () => {
+    const profileId = '11111111-1111-1111-1111-111111111111';
+    listProvidersInvokeMock.mockResolvedValue([
+      {
+        id: 'provider-1',
+        platform: 'openai',
+        name: 'Luna',
+        base_url: 'https://example.test/v1',
+        api_key: '',
+        models: ['gpt-wire-name'],
+        model_labels: { 'gpt-wire-name': 'Luna Chat' },
+        model_profile_ids: { 'gpt-wire-name': profileId },
+      },
+    ]);
+    ensureRuntimeInvokeMock.mockResolvedValue({
+      recovered: true,
+      config_options: [
+        {
+          id: 'model',
+          category: 'model',
+          type: 'select',
+          current_value: profileId,
+          options: [{ value: profileId, label: profileId }],
+        },
+      ],
+      runtime: null,
+    });
+
+    const { result } = renderUseAcpModelInfo({
+      conversation_id: 'conv-uuid-model',
+      backend: 'deepagents',
+    });
+
+    await waitFor(() => {
+      expect(result.current.model_info?.current_model_label).toBe('Luna Chat');
+    });
+    expect(result.current.model_info?.available_models[0]?.label).toBe('Luna Chat');
   });
 
   it('preserves model option descriptions from config options', async () => {

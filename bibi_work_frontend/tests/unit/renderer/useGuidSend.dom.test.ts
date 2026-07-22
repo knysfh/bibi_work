@@ -222,6 +222,22 @@ describe('useGuidSend', () => {
     expect(createConversationInvokeMock).not.toHaveBeenCalled();
   });
 
+  it('requires an explicit model before an auto assistant can start a conversation', async () => {
+    const deps = createDeps();
+    deps.selectedAcpModel = null;
+    deps.currentAcpCachedModelInfo = null;
+
+    const { result } = renderHook(() => useGuidSend(deps));
+
+    expect(result.current.isButtonDisabled).toBe(true);
+    await expect(
+      act(async () => {
+        await result.current.handleSend();
+      })
+    ).rejects.toThrow('Select a model before starting the conversation');
+    expect(createConversationInvokeMock).not.toHaveBeenCalled();
+  });
+
   it('fails explicitly when the conversation bridge returns no conversation id', async () => {
     createConversationInvokeMock.mockResolvedValueOnce(null);
     const deps = createDeps();

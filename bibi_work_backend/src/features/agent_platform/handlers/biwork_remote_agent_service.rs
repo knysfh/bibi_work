@@ -34,7 +34,7 @@ pub async fn biwork_list_remote_agents(
     let rows = sqlx::query(
         r#"
         SELECT id, name, description, status, metadata, draft_config, created_at, updated_at
-        FROM agents
+        FROM agent_runtimes
         WHERE tenant_id = $1
           AND owner_user_id = $2
           AND deleted_at IS NULL
@@ -63,7 +63,7 @@ pub async fn biwork_get_remote_agent(
     let row = sqlx::query(
         r#"
         SELECT id, name, description, status, metadata, draft_config, created_at, updated_at
-        FROM agents
+        FROM agent_runtimes
         WHERE id = $1
           AND tenant_id = $2
           AND owner_user_id = $3
@@ -86,23 +86,51 @@ pub async fn biwork_create_remote_agent(
     Json(payload): Json<RemoteAgentPayload>,
 ) -> Result<Json<Value>, AppError> {
     let docs = remote_agent_documents_for_create(payload)?;
+    let runtime_id = Uuid::new_v4();
+    let assistant_config = generated_assistant_config(runtime_id);
+    let assistant_metadata = docs.metadata.clone();
+    let mut tx = state.connect_pool.begin().await?;
     let row = sqlx::query(
         r#"
-        INSERT INTO agents (
-            tenant_id, owner_user_id, name, description, draft_config, metadata, status
+        INSERT INTO agent_runtimes (
+            id, tenant_id, owner_user_id, name, description, runtime_kind, source,
+            draft_config, metadata, status
         )
-        VALUES ($1, $2, $3, $4, $5, $6, 'active')
+        VALUES ($1, $2, $3, $4, $5, 'remote', 'remote', $6, $7, 'active')
         RETURNING id, name, description, status, metadata, draft_config, created_at, updated_at
         "#,
     )
+    .bind(runtime_id)
     .bind(ctx.tenant_id)
     .bind(ctx.platform_user_id)
-    .bind(docs.name)
-    .bind(docs.description)
-    .bind(docs.config)
-    .bind(docs.metadata)
-    .fetch_one(&state.connect_pool)
+    .bind(&docs.name)
+    .bind(&docs.description)
+    .bind(&docs.config)
+    .bind(&docs.metadata)
+    .fetch_one(&mut *tx)
     .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO assistants (
+            id, tenant_id, owner_user_id, runtime_id, name, description,
+            draft_config, metadata, status
+        )
+        VALUES ($1, $2, $3, $1, $4, $5, $6, $7, 'draft')
+        "#,
+    )
+    .bind(runtime_id)
+    .bind(ctx.tenant_id)
+    .bind(ctx.platform_user_id)
+    .bind(&docs.name)
+    .bind(&docs.description)
+    .bind(assistant_config)
+    .bind(assistant_metadata)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|_| AppError::DatabaseTransaction)?;
 
     Ok(ok(remote_agent_from_row(&row)?))
 }
@@ -116,7 +144,7 @@ pub async fn biwork_update_remote_agent(
     let current = sqlx::query(
         r#"
         SELECT name, description, metadata, draft_config
-        FROM agents
+        FROM agent_runtimes
         WHERE id = $1
           AND tenant_id = $2
           AND owner_user_id = $3
@@ -132,9 +160,10 @@ pub async fn biwork_update_remote_agent(
     .ok_or_else(|| AppError::NotFound("remote agent not found".to_string()))?;
 
     let docs = remote_agent_documents_for_update(&current, payload)?;
+    let mut tx = state.connect_pool.begin().await?;
     let row = sqlx::query(
         r#"
-        UPDATE agents
+        UPDATE agent_runtimes
         SET name = $4,
             description = $5,
             draft_config = $6,
@@ -151,13 +180,39 @@ pub async fn biwork_update_remote_agent(
     .bind(agent_id)
     .bind(ctx.tenant_id)
     .bind(ctx.platform_user_id)
-    .bind(docs.name)
-    .bind(docs.description)
-    .bind(docs.config)
-    .bind(docs.metadata)
-    .fetch_optional(&state.connect_pool)
+    .bind(&docs.name)
+    .bind(&docs.description)
+    .bind(&docs.config)
+    .bind(&docs.metadata)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| AppError::NotFound("remote agent not found".to_string()))?;
+
+    sqlx::query(
+        r#"
+        UPDATE assistants
+        SET name = $4,
+            description = $5,
+            metadata = metadata || $6,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1
+          AND tenant_id = $2
+          AND owner_user_id = $3
+          AND runtime_id = $1
+          AND deleted_at IS NULL
+        "#,
+    )
+    .bind(agent_id)
+    .bind(ctx.tenant_id)
+    .bind(ctx.platform_user_id)
+    .bind(&docs.name)
+    .bind(&docs.description)
+    .bind(&docs.metadata)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|_| AppError::DatabaseTransaction)?;
 
     Ok(ok(remote_agent_from_row(&row)?))
 }
@@ -167,9 +222,49 @@ pub async fn biwork_delete_remote_agent(
     Extension(ctx): Extension<PlatformRequestContext>,
     Path(agent_id): Path<Uuid>,
 ) -> Result<Json<Value>, AppError> {
+    let dependent_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM assistants
+        WHERE tenant_id = $1
+          AND runtime_id = $2
+          AND id <> $2
+          AND deleted_at IS NULL
+        "#,
+    )
+    .bind(ctx.tenant_id)
+    .bind(agent_id)
+    .fetch_one(&state.connect_pool)
+    .await?;
+    if dependent_count > 0 {
+        return Err(AppError::InvalidInput(
+            "runtime is still referenced by one or more assistants".to_string(),
+        ));
+    }
+
+    let mut tx = state.connect_pool.begin().await?;
+    sqlx::query(
+        r#"
+        UPDATE assistants
+        SET deleted_at = CURRENT_TIMESTAMP,
+            status = 'disabled',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1
+          AND tenant_id = $2
+          AND owner_user_id = $3
+          AND runtime_id = $1
+          AND deleted_at IS NULL
+        "#,
+    )
+    .bind(agent_id)
+    .bind(ctx.tenant_id)
+    .bind(ctx.platform_user_id)
+    .execute(&mut *tx)
+    .await?;
+
     let result = sqlx::query(
         r#"
-        UPDATE agents
+        UPDATE agent_runtimes
         SET deleted_at = CURRENT_TIMESTAMP,
             status = 'disabled',
             updated_at = CURRENT_TIMESTAMP
@@ -183,8 +278,11 @@ pub async fn biwork_delete_remote_agent(
     .bind(agent_id)
     .bind(ctx.tenant_id)
     .bind(ctx.platform_user_id)
-    .execute(&state.connect_pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit()
+        .await
+        .map_err(|_| AppError::DatabaseTransaction)?;
 
     Ok(ok(json!(result.rows_affected() > 0)))
 }
@@ -226,7 +324,7 @@ pub async fn biwork_remote_agent_handshake(
         r#"
         SELECT EXISTS (
             SELECT 1
-            FROM agents
+            FROM agent_runtimes
             WHERE id = $1
               AND tenant_id = $2
               AND owner_user_id = $3
@@ -427,6 +525,21 @@ fn build_remote_agent_documents(input: RemoteAgentDocumentInput) -> RemoteAgentD
             "status": status,
         }),
     }
+}
+
+fn generated_assistant_config(runtime_id: Uuid) -> Value {
+    json!({
+        "engine_agent_id": runtime_id,
+        "acp_backend": "remote",
+        "runtime": { "kind": "remote" },
+        "defaults": {
+            "model": { "mode": "inherit" },
+            "permission": { "mode": "inherit" },
+            "thought_level": { "mode": "inherit" },
+            "skills": { "mode": "replace", "value": [] },
+            "mcps": { "mode": "replace", "value": [] }
+        }
+    })
 }
 
 fn remote_agent_from_row(row: &sqlx::postgres::PgRow) -> Result<Value, AppError> {

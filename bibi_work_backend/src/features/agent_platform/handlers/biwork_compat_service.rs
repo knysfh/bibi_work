@@ -952,7 +952,7 @@ Body text.
         assert_eq!(metadata["assistant_source"], "user");
         assert_eq!(metadata["biwork_id"], "writer-assistant");
         assert_eq!(metadata["avatar"], "pen");
-        assert_eq!(config["engine_agent_id"], "managed-agent-1");
+        assert_eq!(config["engine_agent_id"], agent_id.to_string());
         assert_eq!(config["skills"], json!(["summarize"]));
         assert_eq!(config["custom_skill_names"], json!(["draft"]));
         assert_eq!(config["disabled_builtin_skills"], json!(["web"]));

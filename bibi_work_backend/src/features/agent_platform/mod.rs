@@ -88,8 +88,8 @@ use self::handlers::{
     biwork_mcp_agent_configs, biwork_mcp_oauth_check_status, biwork_mcp_oauth_login,
     biwork_mcp_oauth_logout, biwork_openclaw_runtime, biwork_pause_team_agent_run,
     biwork_publish_agent_mcp_capabilities, biwork_read_assistant_rule, biwork_read_builtin_rule,
-    biwork_read_builtin_skill, biwork_read_skill_info, biwork_refresh_custom_agents,
-    biwork_reject_channel_pairing, biwork_remote_agent_handshake,
+    biwork_read_builtin_skill, biwork_read_skill_info, biwork_record_session_activity,
+    biwork_refresh_custom_agents, biwork_reject_channel_pairing, biwork_remote_agent_handshake,
     biwork_remove_skill_external_path, biwork_remove_team_agent, biwork_rename_team,
     biwork_rename_team_agent, biwork_report_mcp_local_discovery, biwork_request_channel_pairing,
     biwork_reset_conversation, biwork_revoke_channel_user, biwork_revoke_oidc_token,
@@ -171,6 +171,10 @@ pub fn biwork_compat_protected_router() -> Router<AppState> {
     Router::new()
         .route("/auth/user", get(biwork_auth_user))
         .route("/auth/logout", post(biwork_logout))
+        .route(
+            "/auth/session/activity",
+            post(biwork_record_session_activity),
+        )
         .route("/me", get(get_me))
         .route(
             "/webui/change-password",

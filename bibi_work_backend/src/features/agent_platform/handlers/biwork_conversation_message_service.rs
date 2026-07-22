@@ -895,6 +895,9 @@ fn biwork_history_error_content(detail: &str, payload: &Value) -> Value {
     if let Some(resolution) = payload.get("resolution").filter(|value| value.is_object()) {
         error.insert("resolution".to_string(), resolution.clone());
     }
+    if let Some(raw_error) = payload.get("rawError").filter(|value| value.is_object()) {
+        error.insert("rawError".to_string(), raw_error.clone());
+    }
 
     json!({
         "content": detail,
@@ -1298,8 +1301,12 @@ mod tests {
             "provider rejected request".to_string(),
             &json!({
                 "code": "USER_LLM_PROVIDER_AUTH_FAILED",
+                "detail": "provider returned HTTP 401",
+                "ownership": "user_llm_provider",
                 "retryable": false,
                 "feedback_recommended": false,
+                "resolution": {"kind": "check_provider_credentials", "target": "provider_settings"},
+                "rawError": {"name": "AuthenticationError", "status": 401},
             }),
             created_at,
         );
@@ -1321,6 +1328,19 @@ mod tests {
         );
         assert_eq!(message["content"]["error"]["retryable"], false);
         assert_eq!(message["content"]["error"]["feedback_recommended"], false);
+        assert_eq!(
+            message["content"]["error"]["detail"],
+            "provider returned HTTP 401"
+        );
+        assert_eq!(
+            message["content"]["error"]["ownership"],
+            "user_llm_provider"
+        );
+        assert_eq!(
+            message["content"]["error"]["resolution"]["kind"],
+            "check_provider_credentials"
+        );
+        assert_eq!(message["content"]["error"]["rawError"]["status"], 401);
         assert_eq!(message["created_at"], 13_000);
         assert_eq!(message["position"], "center");
         assert_eq!(message["status"], "error");

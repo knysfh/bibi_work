@@ -582,7 +582,9 @@ pub async fn refresh_stream_session_state(
         r#"
         SELECT s.revoked_at AS session_revoked_at,
                d.revoked_at AS device_revoked_at,
-               s.token_exp
+               s.token_exp,
+               s.idle_expires_at,
+               s.client_kind
         FROM platform_sessions s
         JOIN devices d
           ON d.id = s.device_id
@@ -610,10 +612,13 @@ pub async fn refresh_stream_session_state(
     let session_revoked_at: Option<OffsetDateTime> = row.try_get("session_revoked_at")?;
     let device_revoked_at: Option<OffsetDateTime> = row.try_get("device_revoked_at")?;
     let token_exp: OffsetDateTime = row.try_get("token_exp")?;
+    let idle_expires_at: OffsetDateTime = row.try_get("idle_expires_at")?;
+    let client_kind: String = row.try_get("client_kind")?;
     classify_stream_session_state(
         session_revoked_at,
         device_revoked_at,
         token_exp,
+        (client_kind == "desktop").then_some(idle_expires_at),
         OffsetDateTime::now_utc(),
     )?;
 
@@ -658,6 +663,7 @@ fn classify_stream_session_state(
     session_revoked_at: Option<OffsetDateTime>,
     device_revoked_at: Option<OffsetDateTime>,
     token_exp: OffsetDateTime,
+    idle_expires_at: Option<OffsetDateTime>,
     now: OffsetDateTime,
 ) -> Result<(), AppError> {
     if session_revoked_at.is_some() {
@@ -673,6 +679,11 @@ fn classify_stream_session_state(
     if token_exp <= now {
         return Err(AppError::Unauthorized(
             "FerrisKey access token has expired".to_string(),
+        ));
+    }
+    if idle_expires_at.is_some_and(|expires_at| expires_at <= now) {
+        return Err(AppError::Unauthorized(
+            "platform session idle timeout expired".to_string(),
         ));
     }
     Ok(())
@@ -1102,7 +1113,14 @@ mod tests {
         let now = OffsetDateTime::UNIX_EPOCH;
 
         assert!(
-            classify_stream_session_state(None, None, now + TimeDuration::seconds(60), now).is_ok()
+            classify_stream_session_state(
+                None,
+                None,
+                now + TimeDuration::seconds(60),
+                Some(now + TimeDuration::seconds(60)),
+                now,
+            )
+            .is_ok()
         );
     }
 
@@ -1110,22 +1128,53 @@ mod tests {
     fn stream_session_state_rejects_revoked_or_expired_session() {
         let now = OffsetDateTime::UNIX_EPOCH;
 
-        let session_revoked =
-            classify_stream_session_state(Some(now), None, now + TimeDuration::seconds(60), now)
-                .expect_err("session revoke should fail");
+        let session_revoked = classify_stream_session_state(
+            Some(now),
+            None,
+            now + TimeDuration::seconds(60),
+            Some(now + TimeDuration::seconds(60)),
+            now,
+        )
+        .expect_err("session revoke should fail");
         assert!(
             matches!(session_revoked, AppError::Unauthorized(reason) if reason.contains("session"))
         );
 
-        let device_revoked =
-            classify_stream_session_state(None, Some(now), now + TimeDuration::seconds(60), now)
-                .expect_err("device revoke should fail");
+        let device_revoked = classify_stream_session_state(
+            None,
+            Some(now),
+            now + TimeDuration::seconds(60),
+            Some(now + TimeDuration::seconds(60)),
+            now,
+        )
+        .expect_err("device revoke should fail");
         assert!(
             matches!(device_revoked, AppError::Unauthorized(reason) if reason.contains("device"))
         );
 
-        let expired = classify_stream_session_state(None, None, now, now)
-            .expect_err("expired token should fail");
+        let expired = classify_stream_session_state(
+            None,
+            None,
+            now,
+            Some(now + TimeDuration::seconds(60)),
+            now,
+        )
+        .expect_err("expired token should fail");
         assert!(matches!(expired, AppError::Unauthorized(reason) if reason.contains("expired")));
+
+        let idle_expired = classify_stream_session_state(
+            None,
+            None,
+            now + TimeDuration::seconds(60),
+            Some(now),
+            now,
+        )
+        .expect_err("idle timeout should fail");
+        assert!(matches!(idle_expired, AppError::Unauthorized(reason) if reason.contains("idle")));
+
+        assert!(
+            classify_stream_session_state(None, None, now + TimeDuration::seconds(60), None, now,)
+                .is_ok()
+        );
     }
 }

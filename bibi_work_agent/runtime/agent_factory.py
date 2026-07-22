@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, AsyncIterator, Iterator
 
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_openai import ChatOpenAI
@@ -11,6 +11,12 @@ from bibi_work_agent.backends.platform_composite_backend import PlatformComposit
 from bibi_work_agent.clients.rust_client import RustClient
 from bibi_work_agent.runtime.checkpointer import PlatformCheckpointer
 from bibi_work_agent.runtime.memory_retrieval import append_memory_context
+from bibi_work_agent.runtime.llm_retry import (
+    retry_llm_call,
+    retry_llm_call_async,
+    retry_llm_stream,
+    retry_llm_stream_async,
+)
 from bibi_work_agent.runtime.snapshot_contract import validate_run_config_snapshot
 from bibi_work_agent.tools.platform_adapters import PlatformToolAdapters
 from bibi_work_agent.tools.result_presenter import normalize_ui_hints
@@ -81,6 +87,35 @@ class OpenAICompatibleChatModel(ChatOpenAI):
             if isinstance(reasoning_content, str) and reasoning_content:
                 request_message["reasoning_content"] = reasoning_content
         return payload
+
+    def _generate(self, *args: Any, **kwargs: Any) -> Any:
+        return retry_llm_call(
+            lambda: super(OpenAICompatibleChatModel, self)._generate(
+                *args, **kwargs
+            )
+        )
+
+    async def _agenerate(self, *args: Any, **kwargs: Any) -> Any:
+        return await retry_llm_call_async(
+            lambda: super(OpenAICompatibleChatModel, self)._agenerate(
+                *args, **kwargs
+            )
+        )
+
+    def _stream(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
+        yield from retry_llm_stream(
+            lambda: super(OpenAICompatibleChatModel, self)._stream(
+                *args, **kwargs
+            )
+        )
+
+    async def _astream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        async for item in retry_llm_stream_async(
+            lambda: super(OpenAICompatibleChatModel, self)._astream(
+                *args, **kwargs
+            )
+        ):
+            yield item
 
 
 def create_platform_agent(snapshot: dict[str, Any]) -> Any:
@@ -180,7 +215,7 @@ def build_runtime_chat_model(model: Any) -> Any:
         return model
 
     provider = str(model.get("provider") or "").replace("_", "-").lower()
-    if provider not in {"openai", "openai-compatible"}:
+    if provider not in {"openai", "openai-compatible", "custom"}:
         raise RuntimeError(f"unsupported llm provider: {provider or '<missing>'}")
 
     model_name = str(model.get("model") or model.get("model_name") or "").strip()
@@ -190,7 +225,9 @@ def build_runtime_chat_model(model: Any) -> Any:
     if auth_scheme not in {"bearer", "api_key_header", "none"}:
         raise RuntimeError(f"unsupported llm auth_scheme: {auth_scheme}")
 
-    kwargs: dict[str, Any] = {"model": model_name}
+    # The Agent runtime owns retries so provider SDK defaults cannot multiply
+    # attempts behind the platform policy.
+    kwargs: dict[str, Any] = {"model": model_name, "max_retries": 0}
     if model.get("api_key"):
         kwargs["api_key"] = model["api_key"]
     elif auth_scheme == "none":
@@ -243,10 +280,22 @@ def build_system_prompt(snapshot: dict[str, Any]) -> str:
     )
     system_prompt = append_workspace_filesystem_context(system_prompt, snapshot)
     system_prompt = append_browser_context(system_prompt, snapshot)
+    system_prompt = append_error_handling_context(system_prompt)
     memory_context = snapshot.get("memory_context") or agent_snapshot.get(
         "memory_context"
     )
     return append_memory_context(system_prompt, memory_context)
+
+
+def append_error_handling_context(prompt: str) -> str:
+    guidance = "\n".join(
+        [
+            "When a tool returns an error and you can still respond, explain the problem in plain language and give the user a concrete next step.",
+            "Do not copy stack traces, raw provider responses, credentials, tokens, request headers, or other technical diagnostics into the chat response.",
+            "Technical diagnostics are retained by the platform in the tool or error details for professional troubleshooting.",
+        ]
+    )
+    return f"{prompt.rstrip()}\n\n{guidance}" if prompt.strip() else guidance
 
 
 def append_browser_context(prompt: str, snapshot: dict[str, Any]) -> str:

@@ -405,8 +405,16 @@ export interface IProvider {
   platform: string;
   name: string;
   base_url: string;
+  /** Backend-generated, non-sensitive mask. The plaintext key is never returned. */
+  api_key_mask?: string | null;
+  /** Number of active keys. Compatibility providers currently support exactly one. */
+  api_key_count?: number;
   api_key: string;
   models: string[];
+  /** User-facing labels keyed by the provider model identifier. */
+  model_labels?: Record<string, string>;
+  /** Backend model-profile UUIDs keyed by the provider model identifier. */
+  model_profile_ids?: Record<string, string>;
   /**
    * 模型能力标签列表。打了标签就是支持，没打就是不支持
    */
@@ -495,10 +503,7 @@ export interface IMcpServerTransportStreamableHTTP {
 }
 
 export type IMcpServerTransport =
-  | IMcpServerTransportStdio
-  | IMcpServerTransportSSE
-  | IMcpServerTransportHTTP
-  | IMcpServerTransportStreamableHTTP;
+  IMcpServerTransportStdio | IMcpServerTransportSSE | IMcpServerTransportHTTP | IMcpServerTransportStreamableHTTP;
 
 export interface IMcpServer {
   id: string;

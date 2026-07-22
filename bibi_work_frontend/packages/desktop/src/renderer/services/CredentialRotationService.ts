@@ -25,6 +25,7 @@ export type ManagedLlmCredential = {
   metadata: {
     provider_id?: string;
     provider_name?: string;
+    resolver_scheme?: 'local' | 'env' | 'vault' | 'kms';
     auto_rotation_enabled?: boolean;
     rotation_interval_seconds?: number | null;
     rotate_before_seconds?: number | null;

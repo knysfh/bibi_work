@@ -226,7 +226,7 @@ export const useAssistantEditor = ({
     setEditDescription(assistant.description || '');
     setEditAvatar(assistant.avatar || '');
     setEditAvatarPreview(undefined);
-    setEditAgent(assistant.agent_id || '');
+    setEditAgent(assistant.runtime_id || assistant.agent_id || '');
     resetDefaultConfigState();
     resetSkillEditorState();
 
@@ -245,7 +245,9 @@ export const useAssistantEditor = ({
       );
       setEditAvatar(detail.profile.avatar || '');
       setEditAvatarPreview(undefined);
-      setEditAgent(detail.engine.agent_id || assistant.agent_id || '');
+      setEditAgent(
+        detail.engine.runtime_id || detail.engine.agent_id || assistant.runtime_id || assistant.agent_id || ''
+      );
       setEditContext(detail.rules.content || '');
       setEditRecommendedPromptsText(resolveLocalizedRecommendedPrompts(detail, localeKey).join('\n'));
       setDefaultModelMode(detail.defaults.model.mode === 'fixed' ? 'fixed' : 'auto');
@@ -313,7 +315,7 @@ export const useAssistantEditor = ({
     setEditDescription(assistant.description_i18n?.[localeKey] || assistant.description || '');
     setEditAvatar(assistant.avatar || '\u{1F916}');
     setEditAvatarPreview(undefined);
-    setEditAgent(assistant.agent_id || '');
+    setEditAgent(assistant.runtime_id || assistant.agent_id || '');
     resetDefaultConfigState();
     resetSkillEditorState();
 
@@ -447,7 +449,7 @@ export const useAssistantEditor = ({
           name: editName,
           description: editDescription || undefined,
           avatar: editAvatar || undefined,
-          agent_id: editAgent || undefined,
+          runtime_id: editAgent || undefined,
           enabled_skills: selectedSkills,
           custom_skill_names: finalCustomSkills,
           disabled_builtin_skills: disabledBuiltinSkills.length > 0 ? disabledBuiltinSkills : undefined,
@@ -467,7 +469,7 @@ export const useAssistantEditor = ({
         if (isBuiltinAssistant(activeAssistant)) {
           updateRequest = {
             id: activeAssistant.id,
-            agent_id: editAgent || undefined,
+            runtime_id: editAgent || undefined,
             defaults: {
               model:
                 defaultModelMode === 'fixed'
@@ -499,7 +501,7 @@ export const useAssistantEditor = ({
             name: editName,
             description: editDescription || undefined,
             avatar: editAvatar || undefined,
-            agent_id: editAgent || undefined,
+            runtime_id: editAgent || undefined,
             enabled_skills: selectedSkills,
             custom_skill_names: finalCustomSkills,
             disabled_builtin_skills: disabledBuiltinSkills.length > 0 ? disabledBuiltinSkills : undefined,

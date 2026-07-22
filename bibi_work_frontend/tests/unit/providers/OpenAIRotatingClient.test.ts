@@ -43,6 +43,7 @@ describe('OpenAIRotatingClient', () => {
         'HTTP-Referer': 'https://biwork.com',
       },
       httpAgent,
+      maxRetries: 0,
     });
 
     expect(client.hasMultipleKeys()).toBe(false);

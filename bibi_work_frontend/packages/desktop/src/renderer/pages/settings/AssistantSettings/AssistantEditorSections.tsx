@@ -400,7 +400,7 @@ const AssistantEditorSections: React.FC<AssistantEditorSectionsProps> = ({ edito
       >
         <div className='mb-12px flex items-center gap-8px'>
           <div className='text-14px font-500 text-t-primary'>
-            {t('settings.assistantEngineSection', { defaultValue: 'Engine' })}
+            {t('settings.assistantEngineSection', { defaultValue: 'Execution' })}
           </div>
           <span className='rounded-6px border border-warning-8 bg-warning-8 px-8px py-2px text-10px font-600 text-white'>
             {t('settings.assistantOnlyNewConversation', { defaultValue: 'New conversations only' })}
@@ -412,7 +412,7 @@ const AssistantEditorSections: React.FC<AssistantEditorSectionsProps> = ({ edito
               <span className='inline-flex shrink-0 items-center text-t-tertiary'>
                 <Robot theme='outline' size='14' />
               </span>
-              <span>{t('settings.assistantMainAgent', { defaultValue: 'Agent' })}</span>
+              <span>{t('settings.assistantMainAgent', { defaultValue: 'Execution Runtime' })}</span>
             </span>
           </div>
           <div className='min-w-0 flex-1'>

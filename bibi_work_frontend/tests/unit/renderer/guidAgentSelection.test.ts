@@ -22,8 +22,8 @@ describe('guid assistant selection helpers', () => {
     expect(resolveAssistantSelectionKey('codex', assistants)).toBeUndefined();
   });
 
-  it('defaults to the generated codex assistant when available', () => {
-    expect(pickDefaultAssistantSelectionKey(assistants)).toBe('bare-codex');
+  it('does not synthesize a default assistant before the user chooses one', () => {
+    expect(pickDefaultAssistantSelectionKey(assistants)).toBeNull();
   });
 
   it('returns null when no assistants are available', () => {

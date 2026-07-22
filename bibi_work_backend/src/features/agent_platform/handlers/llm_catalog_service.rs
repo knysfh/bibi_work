@@ -277,6 +277,12 @@ pub async fn create_llm_credential(
                  'provider_id', c.provider_id,
                  'provider_key', p.provider_key,
                  'provider_name', p.display_name,
+                 'resolver_scheme', CASE
+                   WHEN c.secret_ref LIKE 'local://%' THEN 'local'
+                   WHEN c.secret_ref LIKE 'vault://%' THEN 'vault'
+                   WHEN c.secret_ref LIKE 'kms://%' THEN 'kms'
+                   ELSE 'env'
+                 END,
                  'owner_scope', c.owner_scope,
                  'owner_resource_id', c.owner_resource_id,
                  'has_secret_ref', c.secret_ref IS NOT NULL,
@@ -331,6 +337,12 @@ pub async fn list_llm_credentials(
                  'provider_id', c.provider_id,
                  'provider_key', p.provider_key,
                  'provider_name', p.display_name,
+                 'resolver_scheme', CASE
+                   WHEN c.secret_ref LIKE 'local://%' THEN 'local'
+                   WHEN c.secret_ref LIKE 'vault://%' THEN 'vault'
+                   WHEN c.secret_ref LIKE 'kms://%' THEN 'kms'
+                   ELSE 'env'
+                 END,
                  'owner_scope', c.owner_scope,
                  'owner_resource_id', c.owner_resource_id,
                  'has_secret_ref', c.secret_ref IS NOT NULL,
@@ -351,6 +363,7 @@ pub async fn list_llm_credentials(
         FROM llm_credentials c
         JOIN llm_providers p ON p.id = c.provider_id
         WHERE c.tenant_id = $1
+          AND p.status <> 'deleted'
           AND ($2::uuid IS NULL OR c.provider_id = $2)
           AND (
             $3::text IS NULL
@@ -550,6 +563,22 @@ pub async fn update_llm_credential_rotation_policy(
         None,
     )
     .await?;
+    if payload.enabled {
+        let secret_ref = sqlx::query_scalar::<_, String>(
+            "SELECT secret_ref FROM llm_credentials WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(credential_id)
+        .bind(payload.tenant_id)
+        .fetch_optional(&state.connect_pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound("active llm credential not found".to_string()))?;
+        if secret_ref.starts_with("local://") {
+            return Err(AppError::InvalidInput(
+                "locally stored credentials are replaced manually and cannot use automatic rotation"
+                    .to_string(),
+            ));
+        }
+    }
     let interval_seconds = if payload.enabled {
         if !state.credential_rotation_worker_enabled
             || !state.secret_resolver.rotation_gateway_configured()
@@ -655,7 +684,10 @@ pub async fn get_llm_credential_rotation_health(
                (SELECT COUNT(*) FROM llm_credential_rotation_attempts attempt
                 WHERE attempt.tenant_id = $1 AND attempt.status = 'failed'
                   AND attempt.started_at > CURRENT_TIMESTAMP - INTERVAL '24 hours') AS failed_24h
-        FROM llm_credentials WHERE tenant_id = $1
+        FROM llm_credentials credential
+        JOIN llm_providers provider ON provider.id = credential.provider_id
+        WHERE credential.tenant_id = $1
+          AND provider.status <> 'deleted'
         "#,
     )
     .bind(query.tenant_id)
@@ -836,7 +868,7 @@ pub(super) async fn test_llm_model_profile_for_tenant(
         .build()
         .map_err(|err| AppError::InvalidInput(format!("failed to build LLM test client: {err}")))?;
     let mut request = http.get(url);
-    request = apply_llm_test_auth(&state.secret_resolver, request, &target).await?;
+    request = apply_llm_test_auth(state, tenant_id, request, &target).await?;
 
     let started = Instant::now();
     let response = request.send().await;
@@ -1022,6 +1054,13 @@ pub async fn disable_llm_model_profile(
         None,
     )
     .await?;
+    let mut tx = state.connect_pool.begin().await?;
+    super::biwork_provider_service::ensure_model_profiles_not_referenced_by_fixed_assistants_tx(
+        &mut tx,
+        payload.tenant_id,
+        &[profile_id],
+    )
+    .await?;
     let row = sqlx::query(
         r#"
         UPDATE llm_model_profiles
@@ -1048,9 +1087,13 @@ pub async fn disable_llm_model_profile(
     )
     .bind(profile_id)
     .bind(payload.tenant_id)
-    .fetch_optional(&state.connect_pool)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| AppError::NotFound("llm model profile not found".to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|_| AppError::DatabaseTransaction)?;
 
     Ok(Json(resource_from_row(row)?))
 }
@@ -1243,14 +1286,15 @@ fn llm_model_id_matches(candidate: &str, target: &str) -> bool {
 }
 
 async fn apply_llm_test_auth(
-    secret_resolver: &secret_resolver::SecretResolver,
+    state: &AppState,
+    tenant_id: Uuid,
     request: reqwest::RequestBuilder,
     target: &LlmProfileTestTarget,
 ) -> Result<reqwest::RequestBuilder, AppError> {
     let Some(secret_ref) = target.secret_ref.as_deref() else {
         return Ok(request);
     };
-    let secret = secret_resolver.resolve(secret_ref).await?;
+    let secret = secret_resolver::resolve_secret_for_tenant(state, tenant_id, secret_ref).await?;
     match target.auth_scheme.as_str() {
         "bearer" => Ok(request.bearer_auth(secret)),
         "api_key_header" => {

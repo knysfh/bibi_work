@@ -18,12 +18,11 @@ import useSWR from 'swr';
 const BOUND_ASSISTANTS_SWR_KEY = 'agents.boundAssistants.list';
 
 /**
- * Assistants bound to this managed agent. `agent_id` is the backend
- * `agent_metadata.id`; runtime backend labels are intentionally ignored here
- * because multiple agent rows can share a backend.
+ * Assistants bound to this execution runtime. `agent_id` remains a
+ * compatibility alias for older backend responses.
  */
 export const getBoundAssistants = (agent: Pick<ManagedAgent, 'id'>, assistants: Assistant[]): Assistant[] =>
-  assistants.filter((assistant) => assistant.agent_id === agent.id);
+  assistants.filter((assistant) => (assistant.runtime_id || assistant.agent_id) === agent.id);
 
 /**
  * Read-only assistant catalog for the Agent settings surface. Shares a single

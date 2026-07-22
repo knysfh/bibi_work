@@ -208,7 +208,8 @@ def test_resume_run_payload_redacts_failure_before_reraising(monkeypatch) -> Non
     failed = fake_rust.emitted_batches[-1]["events"][0]
     assert failed["type"] == "run.failed"
     assert "plain-secret" not in failed["payload"]["error"]
-    assert "access_token=[REDACTED]" in failed["payload"]["error"]
+    assert "access_token=[REDACTED]" in failed["payload"]["detail"]
+    assert failed["payload"]["code"] == "BIWORK_INTERNAL_ERROR"
 
 
 def test_resume_run_payload_rejects_desktop_runtime_before_started(monkeypatch) -> None:
@@ -241,7 +242,8 @@ def test_resume_run_payload_rejects_desktop_runtime_before_started(monkeypatch) 
     failed = fake_rust.emitted_batches[-1]["events"][0]
     assert failed["payload"]["run_id"] == payload["run_id"]
     assert failed["payload"]["approval_id"] == payload["approval_id"]
-    assert "runtime.kind=biwork_cli" in failed["payload"]["error"]
+    assert "runtime.kind=biwork_cli" in failed["payload"]["detail"]
+    assert "runtime.kind=biwork_cli" not in failed["payload"]["error"]
     assert fake_store.failed == [payload["approval_id"]]
 
 

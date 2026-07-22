@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import httpx
 from opentelemetry.trace import SpanKind
 
 from bibi_work_agent.runtime.resume_executor import resume_run_payload
@@ -20,9 +19,6 @@ from bibi_work_agent.telemetry import extract_context, tracer
 @celery_app.task(
     name="bibi_work_agent.execute_run",
     bind=True,
-    autoretry_for=(httpx.HTTPError,),
-    retry_backoff=True,
-    max_retries=3,
 )
 def execute_run(self: Any, payload: dict[str, Any]) -> None:
     task_id = str(self.request.id)
@@ -55,9 +51,6 @@ def execute_run(self: Any, payload: dict[str, Any]) -> None:
 @celery_app.task(
     name="bibi_work_agent.resume_run",
     bind=True,
-    autoretry_for=(httpx.HTTPError,),
-    retry_backoff=True,
-    max_retries=3,
 )
 def resume_agent_run(self: Any, run_id: str, payload: dict[str, Any]) -> None:
     task_id = str(self.request.id)

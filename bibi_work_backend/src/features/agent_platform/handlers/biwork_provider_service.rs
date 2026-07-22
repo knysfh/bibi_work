@@ -4,7 +4,9 @@ use axum::{
 };
 use reqwest::Url;
 use serde_json::{Map, Value, json};
-use sqlx::Row;
+use sha2::{Digest, Sha256};
+use sqlx::{Postgres, Row, Transaction};
+use std::collections::HashSet;
 use std::time::{Duration as StdDuration, Instant};
 use uuid::Uuid;
 
@@ -134,12 +136,33 @@ pub async fn biwork_list_providers(
     let rows = sqlx::query(
         r#"
         SELECT p.id, p.provider_key, p.display_name, p.base_url, p.status,
-               COALESCE(jsonb_agg(DISTINCT mp.model_name) FILTER (WHERE mp.id IS NOT NULL), '[]'::jsonb) AS models
+               credential.secret_mask, credential.secret_count,
+               COALESCE(jsonb_agg(DISTINCT mp.model_name) FILTER (WHERE mp.id IS NOT NULL), '[]'::jsonb) AS models,
+               COALESCE(
+                   jsonb_object_agg(mp.model_name, COALESCE(mp.display_name, mp.model_name))
+                       FILTER (WHERE mp.id IS NOT NULL),
+                   '{}'::jsonb
+               ) AS model_labels,
+               COALESCE(
+                   jsonb_object_agg(mp.model_name, mp.id::text) FILTER (WHERE mp.id IS NOT NULL),
+                   '{}'::jsonb
+               ) AS model_profile_ids
         FROM llm_providers p
         LEFT JOIN llm_model_profiles mp
           ON mp.provider_id = p.id AND mp.tenant_id = p.tenant_id AND mp.status = 'active'
-        WHERE p.tenant_id = $1
-        GROUP BY p.id, p.provider_key, p.display_name, p.base_url, p.status
+        LEFT JOIN LATERAL (
+          SELECT c.secret_mask, c.secret_count
+          FROM llm_credentials c
+          WHERE c.provider_id = p.id
+            AND c.tenant_id = p.tenant_id
+            AND c.revoked_at IS NULL
+            AND c.rotation_status = 'active'
+          ORDER BY c.created_at DESC, c.id DESC
+          LIMIT 1
+        ) credential ON TRUE
+        WHERE p.tenant_id = $1 AND p.status <> 'deleted'
+        GROUP BY p.id, p.provider_key, p.display_name, p.base_url, p.status,
+                 credential.secret_mask, credential.secret_count
         ORDER BY p.updated_at DESC, p.created_at DESC
         LIMIT 500
         "#,
@@ -158,7 +181,11 @@ pub async fn biwork_list_providers(
             "name": row.try_get::<String, _>("display_name")?,
             "base_url": row.try_get::<Option<String>, _>("base_url")?.unwrap_or_default(),
             "api_key": "",
+            "api_key_mask": row.try_get::<Option<String>, _>("secret_mask")?,
+            "api_key_count": row.try_get::<Option<i32>, _>("secret_count")?.unwrap_or(0),
             "models": models,
+            "model_labels": row.try_get::<Value, _>("model_labels")?,
+            "model_profile_ids": row.try_get::<Value, _>("model_profile_ids")?,
             "enabled": row.try_get::<String, _>("status")? == "active",
             "model_enabled": enabled_models,
         }));
@@ -199,12 +226,19 @@ pub async fn biwork_create_provider(
     } else {
         "disabled"
     };
+    let api_key = provider_api_key_replacement(&payload)?;
+    let mut tx = state.connect_pool.begin().await?;
     let provider_id: Uuid = sqlx::query_scalar(
         r#"
         INSERT INTO llm_providers (
             tenant_id, provider_key, display_name, base_url, status
         )
         VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (tenant_id, provider_key, display_name)
+        DO UPDATE SET base_url = EXCLUDED.base_url,
+                      status = EXCLUDED.status,
+                      updated_at = CURRENT_TIMESTAMP
+        WHERE llm_providers.status = 'deleted'
         RETURNING id
         "#,
     )
@@ -213,10 +247,35 @@ pub async fn biwork_create_provider(
     .bind(name)
     .bind(base_url)
     .bind(status)
-    .fetch_one(&state.connect_pool)
+    .fetch_one(&mut *tx)
     .await?;
-    replace_biwork_provider_models(&state, ctx.tenant_id, provider_id, payload.get("models"))
-        .await?;
+    let credential_id = if let Some(api_key) = api_key {
+        Some(
+            replace_biwork_provider_credential_tx(
+                &mut tx,
+                &state,
+                ctx.tenant_id,
+                provider_id,
+                ctx.platform_user_id,
+                &api_key,
+            )
+            .await?,
+        )
+    } else {
+        active_provider_credential_id_tx(&mut tx, ctx.tenant_id, provider_id).await?
+    };
+    replace_biwork_provider_models_tx(
+        &mut tx,
+        ctx.tenant_id,
+        provider_id,
+        payload.get("models"),
+        payload.get("model_labels"),
+        credential_id,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|_| AppError::DatabaseTransaction)?;
     Ok(ok(
         biwork_load_provider(&state, ctx.tenant_id, provider_id).await?
     ))
@@ -248,7 +307,9 @@ pub async fn biwork_update_provider(
                 "disabled".to_string()
             }
         });
-    sqlx::query(
+    let api_key = provider_api_key_replacement(&payload)?;
+    let mut tx = state.connect_pool.begin().await?;
+    let updated = sqlx::query(
         r#"
         UPDATE llm_providers
         SET provider_key = COALESCE($3, provider_key),
@@ -265,12 +326,54 @@ pub async fn biwork_update_provider(
     .bind(value_string(&payload, "name"))
     .bind(value_string(&payload, "base_url"))
     .bind(status)
-    .execute(&state.connect_pool)
+    .execute(&mut *tx)
     .await?;
-    if payload.get("models").is_some() {
-        replace_biwork_provider_models(&state, ctx.tenant_id, provider_id, payload.get("models"))
-            .await?;
+    if updated.rows_affected() == 0 {
+        return Err(AppError::NotFound("provider not found".to_string()));
     }
+    let replaces_api_key = api_key.is_some();
+    let credential_id = if let Some(api_key) = api_key.as_deref() {
+        let credential_id = replace_biwork_provider_credential_tx(
+            &mut tx,
+            &state,
+            ctx.tenant_id,
+            provider_id,
+            ctx.platform_user_id,
+            api_key,
+        )
+        .await?;
+        Some(credential_id)
+    } else {
+        active_provider_credential_id_tx(&mut tx, ctx.tenant_id, provider_id).await?
+    };
+    if payload.get("models").is_some() {
+        replace_biwork_provider_models_tx(
+            &mut tx,
+            ctx.tenant_id,
+            provider_id,
+            payload.get("models"),
+            payload.get("model_labels"),
+            credential_id,
+        )
+        .await?;
+    } else if replaces_api_key {
+        sqlx::query(
+            r#"
+            UPDATE llm_model_profiles
+            SET credential_id = $3,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE tenant_id = $1 AND provider_id = $2 AND status = 'active'
+            "#,
+        )
+        .bind(ctx.tenant_id)
+        .bind(provider_id)
+        .bind(credential_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit()
+        .await
+        .map_err(|_| AppError::DatabaseTransaction)?;
     Ok(ok(
         biwork_load_provider(&state, ctx.tenant_id, provider_id).await?
     ))
@@ -291,18 +394,75 @@ pub async fn biwork_delete_provider(
         None,
     )
     .await?;
-    sqlx::query(
+    let mut tx = state.connect_pool.begin().await?;
+    let model_profile_ids = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT id
+        FROM llm_model_profiles
+        WHERE tenant_id = $1 AND provider_id = $2
+        "#,
+    )
+    .bind(ctx.tenant_id)
+    .bind(provider_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    ensure_model_profiles_not_referenced_by_fixed_assistants_tx(
+        &mut tx,
+        ctx.tenant_id,
+        &model_profile_ids,
+    )
+    .await?;
+    let deleted = sqlx::query_scalar::<_, Uuid>(
         r#"
         UPDATE llm_providers
-        SET status = 'disabled',
+        SET status = 'deleted',
             updated_at = CURRENT_TIMESTAMP
         WHERE id = $1 AND tenant_id = $2
+        RETURNING id
         "#,
     )
     .bind(provider_id)
     .bind(ctx.tenant_id)
-    .execute(&state.connect_pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    if deleted.is_none() {
+        return Err(AppError::NotFound("provider not found".to_string()));
+    }
+    sqlx::query(
+        r#"
+        DELETE FROM llm_local_secrets secret
+        USING llm_credentials credential
+        WHERE credential.tenant_id = $1
+          AND credential.provider_id = $2
+          AND credential.secret_ref = 'local://' || secret.id::text
+          AND secret.tenant_id = $1
+        "#,
+    )
+    .bind(ctx.tenant_id)
+    .bind(provider_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE llm_credentials
+        SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP),
+            rotation_status = 'revoked',
+            auto_rotation_enabled = false,
+            rotation_interval_seconds = NULL,
+            next_rotation_at = NULL,
+            rotation_started_at = NULL,
+            rotation_claim_id = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE tenant_id = $1 AND provider_id = $2 AND revoked_at IS NULL
+        "#,
+    )
+    .bind(ctx.tenant_id)
+    .bind(provider_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|_| AppError::DatabaseTransaction)?;
     Ok(ok(Value::Null))
 }
 
@@ -405,14 +565,35 @@ async fn biwork_load_provider(
     let row = sqlx::query(
         r#"
         SELECT p.id, p.provider_key, p.display_name, p.base_url, p.status,
-               COALESCE(jsonb_agg(DISTINCT mp.model_name) FILTER (WHERE mp.id IS NOT NULL), '[]'::jsonb) AS models
+               credential.secret_mask, credential.secret_count,
+               COALESCE(jsonb_agg(DISTINCT mp.model_name) FILTER (WHERE mp.id IS NOT NULL), '[]'::jsonb) AS models,
+               COALESCE(
+                   jsonb_object_agg(mp.model_name, COALESCE(mp.display_name, mp.model_name))
+                       FILTER (WHERE mp.id IS NOT NULL),
+                   '{}'::jsonb
+               ) AS model_labels,
+               COALESCE(
+                   jsonb_object_agg(mp.model_name, mp.id::text) FILTER (WHERE mp.id IS NOT NULL),
+                   '{}'::jsonb
+               ) AS model_profile_ids
         FROM llm_providers p
         LEFT JOIN llm_model_profiles mp
           ON mp.provider_id = p.id
          AND mp.tenant_id = p.tenant_id
          AND mp.status = 'active'
+        LEFT JOIN LATERAL (
+          SELECT c.secret_mask, c.secret_count
+          FROM llm_credentials c
+          WHERE c.provider_id = p.id
+            AND c.tenant_id = p.tenant_id
+            AND c.revoked_at IS NULL
+            AND c.rotation_status = 'active'
+          ORDER BY c.created_at DESC, c.id DESC
+          LIMIT 1
+        ) credential ON TRUE
         WHERE p.id = $1 AND p.tenant_id = $2
-        GROUP BY p.id, p.provider_key, p.display_name, p.base_url, p.status
+        GROUP BY p.id, p.provider_key, p.display_name, p.base_url, p.status,
+                 credential.secret_mask, credential.secret_count
         "#,
     )
     .bind(provider_id)
@@ -427,22 +608,59 @@ async fn biwork_load_provider(
         "name": row.try_get::<String, _>("display_name")?,
         "base_url": row.try_get::<Option<String>, _>("base_url")?.unwrap_or_default(),
         "api_key": "",
+        "api_key_mask": row.try_get::<Option<String>, _>("secret_mask")?,
+        "api_key_count": row.try_get::<Option<i32>, _>("secret_count")?.unwrap_or(0),
         "models": models,
+        "model_labels": row.try_get::<Value, _>("model_labels")?,
+        "model_profile_ids": row.try_get::<Value, _>("model_profile_ids")?,
         "enabled": row.try_get::<String, _>("status")? == "active",
         "model_enabled": model_enabled_map(&models),
     }))
 }
 
-async fn replace_biwork_provider_models(
-    state: &AppState,
+async fn replace_biwork_provider_models_tx(
+    tx: &mut Transaction<'_, Postgres>,
     tenant_id: Uuid,
     provider_id: Uuid,
     models: Option<&Value>,
+    model_labels: Option<&Value>,
+    credential_id: Option<Uuid>,
 ) -> Result<(), AppError> {
     let Some(models) = models.and_then(Value::as_array) else {
         return Ok(());
     };
-    let mut tx = state.connect_pool.begin().await?;
+    let selected_model_names = models
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<HashSet<_>>();
+    let existing_profiles = sqlx::query(
+        r#"
+        SELECT id, model_name
+        FROM llm_model_profiles
+        WHERE tenant_id = $1 AND provider_id = $2 AND status = 'active'
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(provider_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let removed_profile_ids = existing_profiles
+        .iter()
+        .filter_map(|row| {
+            let model_name = row.try_get::<String, _>("model_name").ok()?;
+            (!selected_model_names.contains(model_name.as_str()))
+                .then(|| row.try_get::<Uuid, _>("id").ok())
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    ensure_model_profiles_not_referenced_by_fixed_assistants_tx(
+        tx,
+        tenant_id,
+        &removed_profile_ids,
+    )
+    .await?;
     sqlx::query(
         r#"
         UPDATE llm_model_profiles
@@ -453,7 +671,7 @@ async fn replace_biwork_provider_models(
     )
     .bind(tenant_id)
     .bind(provider_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     for model in models {
         let Some(model_name) = model
@@ -463,28 +681,224 @@ async fn replace_biwork_provider_models(
         else {
             continue;
         };
+        let display_name = model_labels
+            .and_then(Value::as_object)
+            .and_then(|labels| labels.get(model_name))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(model_name);
         let profile_name = format!("{provider_id}:{model_name}");
         sqlx::query(
             r#"
             INSERT INTO llm_model_profiles (
-                tenant_id, provider_id, profile_name, model_name, status
+                tenant_id, provider_id, credential_id, profile_name, model_name, display_name, status
             )
-            VALUES ($1, $2, $3, $4, 'active')
+            VALUES ($1, $2, $3, $4, $5, $6, 'active')
             ON CONFLICT (tenant_id, profile_name)
             DO UPDATE SET model_name = EXCLUDED.model_name,
+                          display_name = EXCLUDED.display_name,
                           provider_id = EXCLUDED.provider_id,
+                          credential_id = EXCLUDED.credential_id,
                           status = 'active',
                           updated_at = CURRENT_TIMESTAMP
             "#,
         )
         .bind(tenant_id)
         .bind(provider_id)
+        .bind(credential_id)
         .bind(profile_name)
         .bind(model_name)
-        .execute(&mut *tx)
+        .bind(display_name)
+        .execute(&mut **tx)
         .await?;
     }
-    tx.commit().await.map_err(|_| AppError::DatabaseTransaction)
+    Ok(())
+}
+
+pub(super) async fn ensure_model_profiles_not_referenced_by_fixed_assistants_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    model_profile_ids: &[Uuid],
+) -> Result<(), AppError> {
+    if model_profile_ids.is_empty() {
+        return Ok(());
+    }
+    let assistant_names = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT DISTINCT agent.name
+        FROM agent_versions version
+        JOIN agents agent
+          ON agent.id = version.agent_id
+         AND agent.tenant_id = version.tenant_id
+         AND agent.deleted_at IS NULL
+         AND agent.status <> 'disabled'
+        JOIN llm_model_profiles profile
+          ON profile.tenant_id = version.tenant_id
+         AND profile.id::text = COALESCE(
+               version.config_snapshot->>'model_profile_id',
+               version.config_snapshot#>>'{agent,model_profile_id}'
+             )
+        WHERE version.tenant_id = $1
+          AND version.status = 'published'
+          AND profile.id = ANY($2)
+          AND COALESCE(version.config_snapshot#>>'{defaults,model,mode}', 'fixed') <> 'auto'
+        ORDER BY agent.name
+        LIMIT 20
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(model_profile_ids)
+    .fetch_all(&mut **tx)
+    .await?;
+    if assistant_names.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::Conflict(format!(
+        "model is used by fixed assistant(s): {}; reassign those assistants before deleting the model or provider",
+        assistant_names.join(", ")
+    )))
+}
+
+fn provider_api_key_replacement(payload: &Value) -> Result<Option<String>, AppError> {
+    let Some(raw) = payload
+        .get("api_key")
+        .or_else(|| payload.get("apiKey"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let keys = raw
+        .split([',', '\n', '\r'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if keys.len() != 1 {
+        return Err(AppError::InvalidInput(
+            "only one API key is supported; replace it as one complete value".to_string(),
+        ));
+    }
+    Ok(Some(keys[0].to_string()))
+}
+
+fn mask_api_key(value: &str) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() < 4 {
+        return format!("******{value}");
+    }
+    let prefix = chars.iter().take(4).collect::<String>();
+    let suffix = chars.iter().rev().take(4).rev().collect::<String>();
+    format!("{prefix}******{suffix}")
+}
+
+async fn active_provider_credential_id_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    provider_id: Uuid,
+) -> Result<Option<Uuid>, AppError> {
+    Ok(sqlx::query_scalar(
+        r#"
+        SELECT id
+        FROM llm_credentials
+        WHERE tenant_id = $1
+          AND provider_id = $2
+          AND revoked_at IS NULL
+          AND rotation_status = 'active'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(provider_id)
+    .fetch_optional(&mut **tx)
+    .await?)
+}
+
+async fn replace_biwork_provider_credential_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    state: &AppState,
+    tenant_id: Uuid,
+    provider_id: Uuid,
+    actor_user_id: Uuid,
+    api_key: &str,
+) -> Result<Uuid, AppError> {
+    sqlx::query(
+        r#"
+        DELETE FROM llm_local_secrets secret
+        USING llm_credentials credential
+        WHERE credential.tenant_id = $1
+          AND credential.provider_id = $2
+          AND credential.secret_ref = 'local://' || secret.id::text
+          AND secret.tenant_id = $1
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(provider_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE llm_credentials
+        SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP),
+            rotation_status = 'revoked',
+            auto_rotation_enabled = false,
+            rotation_interval_seconds = NULL,
+            next_rotation_at = NULL,
+            rotation_started_at = NULL,
+            rotation_claim_id = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE tenant_id = $1 AND provider_id = $2 AND revoked_at IS NULL
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(provider_id)
+    .execute(&mut **tx)
+    .await?;
+
+    let secret_id = Uuid::new_v4();
+    let encryption_key =
+        super::super::secret_resolver::local_secret_encryption_key(&state.internal_shared_token);
+    sqlx::query(
+        r#"
+        INSERT INTO llm_local_secrets (
+            id, tenant_id, ciphertext, created_by_user_id
+        )
+        VALUES (
+            $1, $2, pgp_sym_encrypt($3, $4, 'cipher-algo=aes256, compress-algo=0'), $5
+        )
+        "#,
+    )
+    .bind(secret_id)
+    .bind(tenant_id)
+    .bind(api_key)
+    .bind(encryption_key)
+    .bind(actor_user_id)
+    .execute(&mut **tx)
+    .await?;
+
+    let secret_hash = format!("sha256:{}", hex::encode(Sha256::digest(api_key.as_bytes())));
+    let credential_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO llm_credentials (
+            id, tenant_id, provider_id, secret_ref, secret_hash,
+            secret_mask, secret_count, created_by_user_id
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, 1, $7)
+        "#,
+    )
+    .bind(credential_id)
+    .bind(tenant_id)
+    .bind(provider_id)
+    .bind(format!("local://{secret_id}"))
+    .bind(secret_hash)
+    .bind(mask_api_key(api_key))
+    .bind(actor_user_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(credential_id)
 }
 
 fn model_enabled_map(models: &Value) -> Value {
@@ -807,6 +1221,8 @@ fn provider_detection_success_response(result: ProviderModelFetch) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use sqlx::postgres::PgPoolOptions;
+
     use super::*;
 
     #[test]
@@ -876,5 +1292,161 @@ mod tests {
             provider_protocol_detection_candidates(&payload, None)[..3],
             ["gemini", "openai", "anthropic"]
         );
+    }
+
+    #[test]
+    fn api_key_mask_uses_fixed_six_asterisks() {
+        assert_eq!(mask_api_key("sk-example-secret-1234"), "sk-e******1234");
+        assert_eq!(mask_api_key("abcd"), "abcd******abcd");
+        assert_eq!(mask_api_key("abc"), "******abc");
+        assert_eq!(mask_api_key("密钥"), "******密钥");
+    }
+
+    #[test]
+    fn provider_api_key_replacement_is_single_and_complete() {
+        assert_eq!(
+            provider_api_key_replacement(&json!({ "api_key": "  sk-test  " })).unwrap(),
+            Some("sk-test".to_string())
+        );
+        assert_eq!(
+            provider_api_key_replacement(&json!({ "api_key": "" })).unwrap(),
+            None
+        );
+        assert!(provider_api_key_replacement(&json!({ "api_key": "first\nsecond" })).is_err());
+        assert!(provider_api_key_replacement(&json!({ "api_key": "first,second" })).is_err());
+    }
+
+    #[tokio::test]
+    async fn fixed_assistant_blocks_model_deletion_but_auto_assistant_does_not()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:password@127.0.0.1:5433/bibi_work".to_string()
+        });
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        let mut tx = pool.begin().await?;
+        let tenant_id = Uuid::new_v4();
+        let provider_id = Uuid::new_v4();
+        let profile_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO tenants (id, name, slug) VALUES ($1, $2, $3)")
+            .bind(tenant_id)
+            .bind("Model reference guard test")
+            .bind(format!("model-reference-guard-{tenant_id}"))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO llm_providers (id, tenant_id, provider_key, display_name, status)
+            VALUES ($1, $2, 'custom', $3, 'active')
+            "#,
+        )
+        .bind(provider_id)
+        .bind(tenant_id)
+        .bind(format!("Provider {provider_id}"))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO llm_model_profiles (
+                id, tenant_id, provider_id, profile_name, model_name, status
+            )
+            VALUES ($1, $2, $3, $4, 'guard-model', 'active')
+            "#,
+        )
+        .bind(profile_id)
+        .bind(tenant_id)
+        .bind(provider_id)
+        .bind(format!("{provider_id}:guard-model"))
+        .execute(&mut *tx)
+        .await?;
+
+        let runtime_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO agent_runtimes (
+                id, tenant_id, name, runtime_kind, source, metadata, status
+            ) VALUES ($1, $2, 'Test Runtime', 'deepagents', 'internal',
+                      '{"builtin_runtime":true}'::jsonb, 'active')
+            "#,
+        )
+        .bind(runtime_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        let fixed_agent_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO assistants (id, tenant_id, runtime_id, name, draft_config, status) VALUES ($1, $2, $3, 'Fixed assistant', jsonb_build_object('engine_agent_id', $3::text), 'active')",
+        )
+        .bind(fixed_agent_id)
+        .bind(tenant_id)
+        .bind(runtime_id)
+        .execute(&mut *tx)
+        .await?;
+        let fixed_version_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO agent_versions (
+                tenant_id, agent_id, version_label, config_snapshot, status
+            ) VALUES ($1, $2, 'fixed-v1', $3, 'published')
+            RETURNING id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(fixed_agent_id)
+        .bind(json!({
+            "model_profile_id": profile_id,
+            "defaults": {"model": {"mode": "fixed", "value": profile_id}}
+        }))
+        .fetch_one(&mut *tx)
+        .await?;
+        assert!(
+            ensure_model_profiles_not_referenced_by_fixed_assistants_tx(
+                &mut tx,
+                tenant_id,
+                &[profile_id],
+            )
+            .await
+            .is_err()
+        );
+
+        sqlx::query("UPDATE agent_versions SET status = 'disabled' WHERE id = $1")
+            .bind(fixed_version_id)
+            .execute(&mut *tx)
+            .await?;
+        let auto_agent_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO assistants (id, tenant_id, runtime_id, name, draft_config, status) VALUES ($1, $2, $3, 'Auto assistant', jsonb_build_object('engine_agent_id', $3::text), 'active')",
+        )
+        .bind(auto_agent_id)
+        .bind(tenant_id)
+        .bind(runtime_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO agent_versions (
+                tenant_id, agent_id, version_label, config_snapshot, status
+            ) VALUES ($1, $2, 'auto-v1', $3, 'published')
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(auto_agent_id)
+        .bind(json!({
+            "model_profile_id": profile_id,
+            "defaults": {"model": {"mode": "auto"}}
+        }))
+        .execute(&mut *tx)
+        .await?;
+        ensure_model_profiles_not_referenced_by_fixed_assistants_tx(
+            &mut tx,
+            tenant_id,
+            &[profile_id],
+        )
+        .await?;
+
+        tx.rollback().await?;
+        Ok(())
     }
 }

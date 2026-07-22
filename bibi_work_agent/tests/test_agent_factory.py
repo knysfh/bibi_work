@@ -10,6 +10,7 @@ from bibi_work_agent.api.schemas import ActorRef
 from bibi_work_agent.backends.platform_composite_backend import PlatformCompositeBackend
 from bibi_work_agent.runtime.cancellation import RunCancelled
 from bibi_work_agent.runtime.agent_factory import (
+    OpenAICompatibleChatModel,
     build_platform_tools,
     build_runtime_chat_model,
     build_system_prompt,
@@ -1004,6 +1005,24 @@ def test_build_runtime_chat_model_supports_openai_compatible_config() -> None:
     assert model.temperature == 0.2
     assert model.top_p == 0.8
     assert model.max_tokens == 128
+    assert model.max_retries == 0
+    assert model.root_client.max_retries == 0
+
+
+def test_build_runtime_chat_model_treats_custom_provider_as_openai_compatible() -> None:
+    model = build_runtime_chat_model(
+        {
+            "provider": "custom",
+            "model_name": "gpt-custom",
+            "base_url": "https://llm.example.test/v1",
+            "api_key": "test-key",
+            "auth_scheme": "bearer",
+        }
+    )
+
+    assert isinstance(model, OpenAICompatibleChatModel)
+    assert model.model_name == "gpt-custom"
+    assert str(model.openai_api_base) == "https://llm.example.test/v1"
 
 
 def test_build_runtime_chat_model_supports_credentialless_local_endpoint() -> None:

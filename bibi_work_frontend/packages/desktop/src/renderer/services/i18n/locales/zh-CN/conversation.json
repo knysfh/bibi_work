@@ -145,7 +145,7 @@
       },
       "BIWORK_INTERNAL_ERROR": {
         "title": "应用处理失败",
-        "body": "本次请求在应用处理过程中失败。请先重试一次；如果仍然出现，可以提交反馈。"
+        "body": "本次请求未能完成。请联系管理员处理；技术详情已保留，供专业人员排查。"
       },
       "BIWORK_CONVERSATION_BUSY": {
         "title": "会话正在处理上一条消息",
@@ -229,7 +229,7 @@
       },
       "USER_LLM_PROVIDER_AUTH_FAILED": {
         "title": "模型服务商鉴权失败",
-        "body": "所选服务商拒绝了 API Key 或账号凭证。请检查模型设置后重试。"
+        "body": "所选服务商拒绝了 API Key 或账号凭证。请联系管理员检查模型配置。"
       },
       "USER_LLM_PROVIDER_AWS_SSO_EXPIRED": {
         "title": "AWS SSO 会话已过期",
@@ -237,7 +237,7 @@
       },
       "USER_LLM_PROVIDER_CONFIG_ERROR": {
         "title": "模型服务商配置无效",
-        "body": "当前设置无法构造服务商请求。请检查凭证、区域、Base URL 和服务商专属配置后再重试。"
+        "body": "当前模型配置无效。请联系管理员检查凭证、区域、Base URL 和服务商专属配置。"
       },
       "USER_LLM_PROVIDER_MODEL_NOT_FOUND": {
         "title": "找不到所选模型",
@@ -261,7 +261,7 @@
       },
       "USER_LLM_PROVIDER_PERMISSION_DENIED": {
         "title": "模型服务商无权处理请求",
-        "body": "当前服务商账号没有使用该模型或执行该操作的权限。请检查账号权限，或切换其他模型。"
+        "body": "当前服务商账号没有使用该模型或执行该操作的权限。请联系管理员检查账号权限。"
       },
       "USER_LLM_PROVIDER_BILLING_REQUIRED": {
         "title": "模型服务商需要开通计费",

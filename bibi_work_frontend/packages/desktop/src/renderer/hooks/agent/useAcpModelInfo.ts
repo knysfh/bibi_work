@@ -9,6 +9,8 @@ import type { IResponseMessage } from '@/common/adapter/ipcBridge';
 import type { AcpConfigOptionDto, AcpModelInfo } from '@/common/types/platform/acpTypes';
 import { type AcpConfigSetStatus, type AcpDerivedOption, useAcpConfigOptions } from './useAcpConfigOptions';
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useProvidersQuery } from './useModelProviderList';
+import { findConfiguredModelDisplayName } from '@/renderer/utils/model/modelDisplayName';
 
 type UseAcpModelInfoArgs = {
   conversation_id: string;
@@ -70,6 +72,7 @@ export const useAcpModelInfo = ({
     enabled,
   });
   const [legacyModelInfo, setLegacyModelInfo] = useState<AcpModelInfo | null>(null);
+  const { data: providers } = useProvidersQuery();
 
   const configModelInfo = useMemo<AcpModelInfo | null>(() => {
     if (!model) return null;
@@ -112,7 +115,19 @@ export const useAcpModelInfo = ({
     return ipcBridge.acpConversation.responseStream.on(handler);
   }, [conversation_id, enabled, initialModelId]);
 
-  const model_info = configModelInfo ?? legacyModelInfo;
+  const rawModelInfo = configModelInfo ?? legacyModelInfo;
+  const model_info = useMemo<AcpModelInfo | null>(() => {
+    if (!rawModelInfo) return null;
+    return {
+      ...rawModelInfo,
+      current_model_label:
+        findConfiguredModelDisplayName(providers, rawModelInfo.current_model_id) || rawModelInfo.current_model_label,
+      available_models: rawModelInfo.available_models.map((modelOption) => ({
+        ...modelOption,
+        label: findConfiguredModelDisplayName(providers, modelOption.id) || modelOption.label,
+      })),
+    };
+  }, [providers, rawModelInfo]);
 
   const selectModel = useCallback(
     (model_id: string) => {

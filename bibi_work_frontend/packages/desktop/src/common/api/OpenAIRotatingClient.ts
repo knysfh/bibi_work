@@ -20,6 +20,7 @@ export class OpenAIRotatingClient extends RotatingApiClient<OpenAI> {
         baseURL: config.baseURL,
         apiKey: cleanedApiKey,
         defaultHeaders: config.defaultHeaders,
+        maxRetries: 0,
       };
 
       if (config.httpAgent) {
@@ -48,7 +49,7 @@ export class OpenAIRotatingClient extends RotatingApiClient<OpenAI> {
     options?: OpenAI.RequestOptions
   ): Promise<OpenAI.Chat.Completions.ChatCompletion> {
     return await this.executeWithRetry(async (client) => {
-      const result = await client.chat.completions.create(params, options);
+      const result = await client.chat.completions.create(params, { ...options, maxRetries: 0 });
       return result as OpenAI.Chat.Completions.ChatCompletion;
     });
   }
@@ -58,7 +59,7 @@ export class OpenAIRotatingClient extends RotatingApiClient<OpenAI> {
     options?: OpenAI.RequestOptions
   ): Promise<OpenAI.Images.ImagesResponse> {
     return await this.executeWithRetry((client) => {
-      return client.images.generate(params, options) as Promise<OpenAI.Images.ImagesResponse>;
+      return client.images.generate(params, { ...options, maxRetries: 0 }) as Promise<OpenAI.Images.ImagesResponse>;
     });
   }
 
@@ -67,7 +68,7 @@ export class OpenAIRotatingClient extends RotatingApiClient<OpenAI> {
     options?: OpenAI.RequestOptions
   ): Promise<OpenAI.Embeddings.CreateEmbeddingResponse> {
     return await this.executeWithRetry((client) => {
-      return client.embeddings.create(params, options);
+      return client.embeddings.create(params, { ...options, maxRetries: 0 });
     });
   }
 }

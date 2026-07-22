@@ -36,6 +36,7 @@ pub struct ConversationRunSnapshotRequest<'a> {
     pub requested_agent_id: Option<Uuid>,
     pub agent_version_id: Option<Uuid>,
     pub project_id: Option<Uuid>,
+    pub selected_model_profile_id: Option<Uuid>,
     pub selected_mcp_server_ids: Vec<Uuid>,
     pub thread_id: Option<String>,
     pub client_snapshot: Option<Value>,
@@ -64,6 +65,7 @@ pub struct WorkflowNodeRunSnapshotRequest<'a> {
 struct AgentVersionSnapshot {
     agent_id: Uuid,
     agent_version_id: Uuid,
+    runtime_id: Uuid,
     policy_version: String,
     schema_hash: Option<String>,
     snapshot: Value,
@@ -103,9 +105,6 @@ pub async fn compile_conversation_run_snapshot(
         request.requested_agent_id,
     )
     .await?;
-    let browser_enabled = agent_version
-        .as_ref()
-        .is_some_and(|version| agent_browser_capability_enabled(&version.snapshot));
     let mut snapshot = base_snapshot(
         agent_version.as_ref(),
         request.client_snapshot,
@@ -114,20 +113,33 @@ pub async fn compile_conversation_run_snapshot(
         request.project_id,
     )?;
 
-    apply_desktop_agent_snapshot(
-        pool,
-        request.tenant_id,
-        &mut snapshot,
-        agent_version.as_ref(),
-        request.requested_agent_id,
-    )
-    .await?;
+    if agent_version
+        .as_ref()
+        .is_some_and(|version| assistant_model_mode(&version.snapshot) == Some("auto"))
+        && request.selected_model_profile_id.is_none()
+    {
+        return Err(AppError::InvalidInput(
+            "assistant uses automatic model selection; select an active model for this conversation"
+                .to_string(),
+        ));
+    }
+    if let Some(model_profile_id) = request.selected_model_profile_id {
+        override_snapshot_model_profile_id(&mut snapshot, model_profile_id)?;
+    }
 
     apply_agent_version_snapshot(
         pool,
         request.tenant_id,
         &mut snapshot,
         agent_version.as_ref(),
+    )
+    .await?;
+    apply_execution_runtime_snapshot(
+        pool,
+        request.tenant_id,
+        &mut snapshot,
+        agent_version.as_ref(),
+        request.requested_agent_id,
     )
     .await?;
     apply_selected_mcp_server_snapshot(&mut snapshot, &request.selected_mcp_server_ids)?;
@@ -164,6 +176,7 @@ pub async fn compile_conversation_run_snapshot(
         request.project_id,
         &scope_snapshot,
     )?;
+    let browser_enabled = agent_browser_capability_enabled(&snapshot);
     insert_actor_from_context(&mut snapshot, request.ctx, browser_enabled)?;
     ensure_runtime_contract_fields(&mut snapshot)?;
 
@@ -202,6 +215,14 @@ pub async fn compile_workflow_node_run_snapshot(
     )?;
     apply_agent_version_snapshot(pool, request.tenant_id, &mut snapshot, Some(&agent_version))
         .await?;
+    apply_execution_runtime_snapshot(
+        pool,
+        request.tenant_id,
+        &mut snapshot,
+        Some(&agent_version),
+        Some(request.agent_id),
+    )
+    .await?;
     insert_common_runtime_fields(
         &mut snapshot,
         request.tenant_id,
@@ -259,77 +280,123 @@ pub fn execution_runtime_kind(snapshot: &Value) -> Result<&str, AppError> {
         })
 }
 
-async fn apply_desktop_agent_snapshot(
+async fn apply_execution_runtime_snapshot(
     pool: &PgPool,
     tenant_id: Uuid,
     snapshot: &mut Value,
     agent_version: Option<&AgentVersionSnapshot>,
     requested_agent_id: Option<Uuid>,
 ) -> Result<(), AppError> {
-    if agent_version.is_some() {
-        return Ok(());
-    }
-    let Some(agent_id) = requested_agent_id else {
+    let runtime_id = if let Some(version) = agent_version {
+        Some(version.runtime_id)
+    } else if let Some(assistant_id) = requested_agent_id {
+        sqlx::query_scalar(
+            r#"
+            SELECT runtime_id
+            FROM assistants
+            WHERE id = $1
+              AND tenant_id = $2
+              AND status <> 'disabled'
+              AND deleted_at IS NULL
+            "#,
+        )
+        .bind(assistant_id)
+        .bind(tenant_id)
+        .fetch_optional(pool)
+        .await?
+    } else {
+        None
+    };
+    let Some(runtime_id) = runtime_id else {
         return Ok(());
     };
     let row = sqlx::query(
         r#"
-        SELECT draft_config, metadata
-        FROM agents
+        SELECT runtime_kind, draft_config, capabilities, metadata, status
+        FROM agent_runtimes
         WHERE id = $1
           AND tenant_id = $2
-          AND status <> 'disabled'
           AND deleted_at IS NULL
         "#,
     )
-    .bind(agent_id)
+    .bind(runtime_id)
     .bind(tenant_id)
     .fetch_optional(pool)
-    .await?;
-    let Some(row) = row else {
-        return Ok(());
-    };
-    let draft_config: Value = row.try_get("draft_config")?;
-    let metadata: Value = row.try_get("metadata")?;
-    let runtime_kind = draft_config
-        .pointer("/runtime/kind")
-        .and_then(Value::as_str)
-        .or_else(|| draft_config.get("acp_backend").and_then(Value::as_str))
-        .or_else(|| metadata.get("runtime_kind").and_then(Value::as_str));
-    if runtime_kind != Some(DESKTOP_ACP_RUNTIME_KIND) {
-        return Ok(());
+    .await?
+    .ok_or_else(|| AppError::NotFound("execution runtime not found".to_string()))?;
+    let status: String = row.try_get("status")?;
+    if status == "disabled" {
+        return Err(AppError::Conflict(
+            "execution runtime is disabled".to_string(),
+        ));
     }
-
-    let command = draft_config
-        .get("command_override")
-        .or_else(|| draft_config.get("command"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            AppError::InvalidInput("desktop ACP agent command is required".to_string())
-        })?;
-    let args = draft_config
-        .get("args")
+    let runtime_kind: String = row.try_get("runtime_kind")?;
+    let draft_config: Value = row.try_get("draft_config")?;
+    let capabilities: Value = row.try_get("capabilities")?;
+    let mut runtime = draft_config
+        .get("runtime")
         .cloned()
-        .filter(Value::is_array)
-        .unwrap_or_else(|| json!([]));
-    let env = draft_config
-        .get("env_override")
-        .or_else(|| draft_config.get("env"))
-        .cloned()
-        .filter(Value::is_array)
-        .unwrap_or_else(|| json!([]));
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    runtime
+        .as_object_mut()
+        .expect("runtime snapshot is an object")
+        .insert("kind".to_string(), json!(runtime_kind));
+    if runtime_kind == DESKTOP_ACP_RUNTIME_KIND {
+        let command = draft_config
+            .get("command_override")
+            .or_else(|| draft_config.get("command"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AppError::InvalidInput("desktop ACP runtime command is required".to_string())
+            })?;
+        let args = draft_config
+            .get("args")
+            .cloned()
+            .filter(Value::is_array)
+            .unwrap_or_else(|| json!([]));
+        let env = draft_config
+            .get("env_override")
+            .or_else(|| draft_config.get("env"))
+            .cloned()
+            .filter(Value::is_array)
+            .unwrap_or_else(|| json!([]));
+        let runtime_object = runtime
+            .as_object_mut()
+            .expect("runtime snapshot is an object");
+        runtime_object.insert("command".to_string(), json!(command));
+        runtime_object.insert("args".to_string(), args);
+        runtime_object.insert("env".to_string(), sanitize_snapshot_value(env));
+    }
+    let runtime_mcp_tools = load_runtime_mcp_tool_snapshots(pool, tenant_id, &capabilities).await?;
     let object = snapshot_object_mut(snapshot)?;
-    object.insert(
-        "runtime".to_string(),
-        json!({
-            "kind": DESKTOP_ACP_RUNTIME_KIND,
-            "command": command,
-            "args": args,
-            "env": sanitize_snapshot_value(env)
-        }),
-    );
+    object.insert("runtime_id".to_string(), json!(runtime_id));
+    object.insert("runtime".to_string(), runtime);
+    object.insert("capabilities".to_string(), capabilities);
+    let mut mcp_tools = object
+        .remove("mcp_tools")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    for tool in runtime_mcp_tools {
+        let tool_id = tool.get("mcp_tool_id").cloned();
+        if !mcp_tools
+            .iter()
+            .any(|existing| existing.get("mcp_tool_id") == tool_id.as_ref())
+        {
+            mcp_tools.push(tool);
+        }
+    }
+    object.insert("mcp_tools".to_string(), Value::Array(mcp_tools));
+    let agent = object
+        .entry("agent")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            AppError::InvalidInput("run snapshot agent must be an object".to_string())
+        })?;
+    agent.insert("runtime_id".to_string(), json!(runtime_id));
     Ok(())
 }
 
@@ -360,8 +427,8 @@ async fn load_agent_version(
 ) -> Result<AgentVersionSnapshot, AppError> {
     let row = sqlx::query(
         r#"
-        SELECT agent_id, policy_version, schema_hash, config_snapshot
-        FROM agent_versions
+        SELECT assistant_id, runtime_id, policy_version, schema_hash, config_snapshot
+        FROM assistant_versions
         WHERE id = $1
           AND tenant_id = $2
           AND status = 'published'
@@ -374,8 +441,9 @@ async fn load_agent_version(
     .ok_or_else(|| AppError::NotFound("agent version not found".to_string()))?;
 
     Ok(AgentVersionSnapshot {
-        agent_id: row.try_get("agent_id")?,
+        agent_id: row.try_get("assistant_id")?,
         agent_version_id,
+        runtime_id: row.try_get("runtime_id")?,
         policy_version: row.try_get("policy_version")?,
         schema_hash: row.try_get("schema_hash")?,
         snapshot: row.try_get("config_snapshot")?,
@@ -583,6 +651,54 @@ async fn load_model_profile(
         rate_limit_policy: row.try_get("rate_limit_policy")?,
         cost_policy: row.try_get("cost_policy")?,
     })
+}
+
+pub async fn resolve_active_model_profile_reference(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    reference: &str,
+) -> Result<Uuid, AppError> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return Err(AppError::InvalidInput(
+            "conversation model selection is empty".to_string(),
+        ));
+    }
+    if let Ok(model_profile_id) = Uuid::parse_str(reference) {
+        load_model_profile(pool, tenant_id, model_profile_id).await?;
+        return Ok(model_profile_id);
+    }
+
+    let rows = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT mp.id
+        FROM llm_model_profiles mp
+        JOIN llm_providers provider
+          ON provider.id = mp.provider_id
+         AND provider.tenant_id = mp.tenant_id
+         AND provider.status = 'active'
+        LEFT JOIN llm_credentials credential ON credential.id = mp.credential_id
+        WHERE mp.tenant_id = $1
+          AND mp.status = 'active'
+          AND (credential.id IS NULL OR credential.revoked_at IS NULL)
+          AND (mp.profile_name = $2 OR mp.model_name = $2)
+        ORDER BY (mp.profile_name = $2) DESC, mp.created_at ASC, mp.id ASC
+        LIMIT 2
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(reference)
+    .fetch_all(pool)
+    .await?;
+    match rows.as_slice() {
+        [] => Err(AppError::InvalidInput(format!(
+            "selected model '{reference}' is not active; choose another configured model"
+        ))),
+        [model_profile_id] => Ok(*model_profile_id),
+        _ => Err(AppError::InvalidInput(format!(
+            "selected model '{reference}' is ambiguous; choose a provider-specific model"
+        ))),
+    }
 }
 
 async fn load_model_profile_by_name(
@@ -795,6 +911,74 @@ async fn load_mcp_tool_snapshots(
             }))
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?)
+}
+
+async fn load_runtime_mcp_tool_snapshots(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    capabilities: &Value,
+) -> Result<Vec<Value>, AppError> {
+    let bindings = capabilities
+        .get("mcp_tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|binding| {
+            let tool_id = binding
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())?;
+            let schema_hash = binding
+                .get("schema_hash")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            Some((tool_id, schema_hash))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    if bindings.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tool_ids = bindings.keys().copied().collect::<Vec<_>>();
+    let rows = sqlx::query(
+        r#"
+        SELECT tool.id AS mcp_tool_id, tool.mcp_server_id,
+               server.name AS server_name, tool.name AS tool_name,
+               tool.schema_hash, tool.schema
+        FROM mcp_tools tool
+        JOIN mcp_servers server
+          ON server.id = tool.mcp_server_id
+         AND server.tenant_id = tool.tenant_id
+        WHERE tool.tenant_id = $1
+          AND tool.id = ANY($2::uuid[])
+          AND tool.status = 'active'
+          AND server.status = 'active'
+          AND server.deleted_at IS NULL
+        ORDER BY tool.id ASC
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(&tool_ids)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .filter_map(|row| {
+            let tool_id = row.try_get::<Uuid, _>("mcp_tool_id").ok()?;
+            let current_hash = row.try_get::<Option<String>, _>("schema_hash").ok()?;
+            (bindings.get(&tool_id) == Some(&current_hash)).then_some((row, tool_id))
+        })
+        .map(|(row, tool_id)| {
+            Ok(json!({
+                "mcp_tool_id": tool_id,
+                "server_id": row.try_get::<Uuid, _>("mcp_server_id")?,
+                "server_name": row.try_get::<String, _>("server_name")?,
+                "tool_name": row.try_get::<String, _>("tool_name")?,
+                "schema_hash": row.try_get::<Option<String>, _>("schema_hash")?,
+                "schema": row.try_get::<Value, _>("schema")?
+            }))
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()
+        .map_err(AppError::from)
 }
 
 fn apply_selected_mcp_server_snapshot(
@@ -1339,6 +1523,26 @@ fn model_profile_id(snapshot: &Value) -> Option<Uuid> {
         .and_then(|value| Uuid::parse_str(value).ok())
 }
 
+fn assistant_model_mode(snapshot: &Value) -> Option<&str> {
+    snapshot
+        .pointer("/defaults/model/mode")
+        .and_then(Value::as_str)
+}
+
+fn override_snapshot_model_profile_id(
+    snapshot: &mut Value,
+    model_profile_id: Uuid,
+) -> Result<(), AppError> {
+    let object = snapshot_object_mut(snapshot)?;
+    object.remove("model");
+    object.insert("model_profile_id".to_string(), json!(model_profile_id));
+    if let Some(agent) = object.get_mut("agent").and_then(Value::as_object_mut) {
+        agent.remove("model");
+        agent.insert("model_profile_id".to_string(), json!(model_profile_id));
+    }
+    Ok(())
+}
+
 fn snapshot_object_mut(snapshot: &mut Value) -> Result<&mut Map<String, Value>, AppError> {
     snapshot.as_object_mut().ok_or_else(|| {
         AppError::InvalidInput("run_config_snapshot must be a JSON object".to_string())
@@ -1417,6 +1621,27 @@ mod tests {
     }
 
     #[test]
+    fn conversation_model_override_replaces_stale_assistant_model_identity() {
+        let stale_id = Uuid::new_v4();
+        let selected_id = Uuid::new_v4();
+        let mut snapshot = json!({
+            "model_profile_id": stale_id,
+            "model": {"model_name": "stale"},
+            "agent": {
+                "model_profile_id": stale_id,
+                "model": {"model_name": "stale"}
+            }
+        });
+
+        override_snapshot_model_profile_id(&mut snapshot, selected_id).unwrap();
+
+        assert_eq!(model_profile_id(&snapshot), Some(selected_id));
+        assert_eq!(snapshot["agent"]["model_profile_id"], json!(selected_id));
+        assert!(snapshot.get("model").is_none());
+        assert!(snapshot["agent"].get("model").is_none());
+    }
+
+    #[test]
     fn base_snapshot_rejects_non_object_client_snapshot() {
         let err = base_snapshot(None, Some(json!("bad")), None, None, None).unwrap_err();
         assert!(err.to_string().contains("run_config_snapshot"));
@@ -1444,6 +1669,7 @@ mod tests {
         let version = AgentVersionSnapshot {
             agent_id: Uuid::new_v4(),
             agent_version_id: Uuid::new_v4(),
+            runtime_id: Uuid::new_v4(),
             policy_version: "policy-v1".to_string(),
             schema_hash: None,
             snapshot: json!({
@@ -1963,6 +2189,54 @@ mod tests {
             .bind(tenant_id)
             .execute(pool)
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_model_reference_resolves_provider_specific_profile_name()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pool = test_pool().await?;
+        let tenant_id = Uuid::new_v4();
+        let provider_id = Uuid::new_v4();
+        let profile_id = Uuid::new_v4();
+        let profile_name = format!("{provider_id}:gpt-test");
+        sqlx::query("INSERT INTO tenants (id, name, slug) VALUES ($1, $2, $3)")
+            .bind(tenant_id)
+            .bind("Conversation model resolver test")
+            .bind(format!("conversation-model-resolver-{tenant_id}"))
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO llm_providers (id, tenant_id, provider_key, display_name, status)
+            VALUES ($1, $2, 'custom', $3, 'active')
+            "#,
+        )
+        .bind(provider_id)
+        .bind(tenant_id)
+        .bind(format!("Provider {provider_id}"))
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO llm_model_profiles (
+                id, tenant_id, provider_id, profile_name, model_name, status
+            )
+            VALUES ($1, $2, $3, $4, 'gpt-test', 'active')
+            "#,
+        )
+        .bind(profile_id)
+        .bind(tenant_id)
+        .bind(provider_id)
+        .bind(&profile_name)
+        .execute(&pool)
+        .await?;
+
+        let resolved =
+            resolve_active_model_profile_reference(&pool, tenant_id, &profile_name).await?;
+
+        assert_eq!(resolved, profile_id);
+        cleanup_tenant(&pool, tenant_id).await?;
         Ok(())
     }
 

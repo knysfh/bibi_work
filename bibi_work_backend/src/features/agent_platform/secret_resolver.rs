@@ -306,7 +306,7 @@ pub async fn attach_llm_runtime_credential(
     };
     let secret = load_llm_credential_secret(state, tenant_id, credential_id).await?;
     let resolver_scheme = secret_ref_scheme(&secret.secret_ref);
-    let secret_value = state.secret_resolver.resolve(&secret.secret_ref).await?;
+    let secret_value = resolve_secret_for_tenant(state, tenant_id, &secret.secret_ref).await?;
     let runtime_credential_id =
         issue_runtime_credential(state, tenant_id, run_id, secret, secret_value).await?;
     let credential_resource_id = credential_id.to_string();
@@ -540,7 +540,45 @@ pub fn resolve_env_secret_ref(secret_ref: &str) -> Result<String, AppError> {
     })
 }
 
+pub async fn resolve_secret_for_tenant(
+    state: &AppState,
+    tenant_id: Uuid,
+    secret_ref: &str,
+) -> Result<String, AppError> {
+    let Some(id) = secret_ref.strip_prefix("local://") else {
+        return state.secret_resolver.resolve(secret_ref).await;
+    };
+    let secret_id = Uuid::parse_str(id)
+        .map_err(|_| AppError::InvalidInput("local secret_ref is invalid".to_string()))?;
+    sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT pgp_sym_decrypt(ciphertext, $3)
+        FROM llm_local_secrets
+        WHERE id = $1 AND tenant_id = $2
+        "#,
+    )
+    .bind(secret_id)
+    .bind(tenant_id)
+    .bind(local_secret_encryption_key(&state.internal_shared_token))
+    .fetch_optional(&state.connect_pool)
+    .await?
+    .ok_or_else(|| AppError::InvalidInput("local LLM secret is unavailable".to_string()))
+}
+
+pub(crate) fn local_secret_encryption_key(internal_shared_token: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"biwork-local-secret-v1\0");
+    hasher.update(internal_shared_token.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 pub fn validate_secret_ref(secret_ref: &str) -> Result<(), AppError> {
+    if let Some(id) = secret_ref.strip_prefix("local://") {
+        Uuid::parse_str(id)
+            .map_err(|_| AppError::InvalidInput("local secret_ref is invalid".to_string()))?;
+        return Ok(());
+    }
     if secret_ref.starts_with("env://") || secret_ref.starts_with("env:") {
         env_name_from_secret_ref(secret_ref)?;
         return Ok(());
@@ -554,7 +592,7 @@ pub fn validate_secret_ref(secret_ref: &str) -> Result<(), AppError> {
         return Ok(());
     }
     Err(AppError::InvalidInput(
-        "unsupported secret_ref scheme; supported schemes are env://, vault://, and kms://"
+        "unsupported secret_ref scheme; supported schemes are local://, env://, vault://, and kms://"
             .to_string(),
     ))
 }
@@ -674,7 +712,9 @@ fn runtime_credential_index_key(credential_id: Uuid) -> String {
 }
 
 fn secret_ref_scheme(secret_ref: &str) -> &'static str {
-    if secret_ref.starts_with("vault://") {
+    if secret_ref.starts_with("local://") {
+        "local"
+    } else if secret_ref.starts_with("vault://") {
         "vault"
     } else if secret_ref.starts_with("kms://") {
         "kms"

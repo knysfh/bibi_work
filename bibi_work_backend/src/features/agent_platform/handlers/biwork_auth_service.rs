@@ -18,6 +18,7 @@ use super::biwork_compat_service::{biwork_failure, ok, response_trace_id};
 pub(super) const BIWORK_OIDC_CLIENT_ID: &str = "bibi-work-desktop";
 pub(super) const BIWORK_DESKTOP_OIDC_REDIRECT_URI: &str = "http://127.0.0.1:48123/callback";
 pub(super) const BIWORK_WEB_OIDC_REDIRECT_URI: &str = "http://127.0.0.1:25808/auth/callback";
+const DESKTOP_SESSION_IDLE_TIMEOUT_SECONDS: i64 = 30 * 60;
 
 #[derive(Debug, Deserialize)]
 pub struct BiWorkOidcTokenExchangePayload {
@@ -284,6 +285,38 @@ pub async fn biwork_logout(
     .await?;
 
     Ok(ok(json!({ "revoked": true })))
+}
+
+pub async fn biwork_record_session_activity(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<PlatformRequestContext>,
+) -> Result<Json<Value>, AppError> {
+    let idle_expires_at = sqlx::query_scalar::<_, time::OffsetDateTime>(
+        r#"
+        UPDATE platform_sessions
+        SET last_user_activity_at = CURRENT_TIMESTAMP,
+            idle_expires_at = CURRENT_TIMESTAMP + ($4 * INTERVAL '1 second'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1
+          AND tenant_id = $2
+          AND user_id = $3
+          AND revoked_at IS NULL
+          AND idle_expires_at > CURRENT_TIMESTAMP
+        RETURNING idle_expires_at
+        "#,
+    )
+    .bind(ctx.session_id)
+    .bind(ctx.tenant_id)
+    .bind(ctx.platform_user_id)
+    .bind(DESKTOP_SESSION_IDLE_TIMEOUT_SECONDS)
+    .fetch_optional(&state.connect_pool)
+    .await?
+    .ok_or_else(|| AppError::Unauthorized("platform session idle timeout expired".to_string()))?;
+
+    Ok(ok(json!({
+        "active": true,
+        "idle_expires_at": idle_expires_at,
+    })))
 }
 
 pub async fn biwork_webui_password_auth_unsupported() -> impl IntoResponse {

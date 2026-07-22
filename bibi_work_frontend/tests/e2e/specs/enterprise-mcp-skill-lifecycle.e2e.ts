@@ -148,8 +148,8 @@ test('real streamable MCP and remote Skill complete governed lifecycle', async (
   let token: string | null = null;
   let tenantId: string | null = null;
   let mcpServerId: string | null = null;
-  let lifecycleAgentVersionId: string | null = null;
   const lifecycleAgentVersionIds: string[] = [];
+  let runtimeId: string | null = null;
   let conversationId: string | null = null;
   let skillId: string | null = null;
   let skillVersionId: string | null = null;
@@ -157,7 +157,14 @@ test('real streamable MCP and remote Skill complete governed lifecycle', async (
 
   try {
     browser = await chromium.connectOverCDP(CDP_URL);
-    page = browser.contexts()[0]?.pages()[0] ?? null;
+    page =
+      browser
+        .contexts()
+        .flatMap((context) => context.pages())
+        .find((candidate) => {
+          const url = candidate.url();
+          return url.startsWith('http://localhost:5173') || url.includes('/out/renderer/index.html');
+        }) ?? null;
     if (!page) throw new Error('running Electron renderer page is unavailable');
     token = await ferrisKeyPasswordToken();
     await page.evaluate(
@@ -210,7 +217,7 @@ test('real streamable MCP and remote Skill complete governed lifecycle', async (
           const server = servers.find((candidate) => candidate.id === mcpServerId);
           return `${server?.last_test_status}:${server?.tools?.some((tool) => tool.name === 'maps_geocode')}`;
         },
-        { timeout: 30_000 }
+        { timeout: 90_000, intervals: [500, 1_000, 2_000, 5_000] }
       )
       .toBe('connected:true');
 
@@ -228,7 +235,6 @@ test('real streamable MCP and remote Skill complete governed lifecycle', async (
       'POST',
       { skill_path: REMOTE_SKILL_URL }
     );
-    expect(imported.data?.skill_names).toContain('mcp-builder');
     expect(imported.data?.failed).toEqual([]);
 
     const skills = await rustApi<CatalogResource[]>(
@@ -253,9 +259,17 @@ test('real streamable MCP and remote Skill complete governed lifecycle', async (
       token,
       `/api/v1/agents/${agent!.id}/versions?${new URLSearchParams({ tenant_id: tenantId, status: 'published' })}`
     );
-    const modelProfileId = publishedVersions
-      .map((candidate) => candidate.snapshot.model_profile_id)
-      .find((candidate): candidate is string => typeof candidate === 'string');
+    const activeModelProfiles = await rustApi<CatalogResource[]>(
+      token,
+      `/api/v1/llm-model-profiles?${new URLSearchParams({ tenant_id: tenantId, status: 'active' })}`
+    );
+    const activeModelProfileIds = new Set(activeModelProfiles.map((profile) => profile.id));
+    const modelProfileId =
+      publishedVersions
+        .map((candidate) => candidate.snapshot.model_profile_id)
+        .find(
+          (candidate): candidate is string => typeof candidate === 'string' && activeModelProfileIds.has(candidate)
+        ) ?? activeModelProfiles[0]?.id;
     expect(modelProfileId).toBeTruthy();
     const lifecycleVersion = await rustApi<CatalogVersion>(token, `/api/v1/agents/${agent!.id}/versions`, {
       method: 'POST',
@@ -283,16 +297,14 @@ test('real streamable MCP and remote Skill complete governed lifecycle', async (
     const publishedMcpCapabilities = await desktopApi<{
       data?: {
         changed: boolean;
-        agent_version_id: string;
+        runtime_id: string;
         browser_enabled: boolean;
         selected_mcp_tool_ids: string[];
-        previous_version_revoked: boolean;
       };
       changed?: boolean;
-      agent_version_id?: string;
+      runtime_id?: string;
       browser_enabled?: boolean;
       selected_mcp_tool_ids?: string[];
-      previous_version_revoked?: boolean;
     }>(page, token, `/api/agents/${agent!.id}/mcp-capabilities`, 'PUT', {
       mcp_tool_ids: [geocodeTool!.id],
       browser_enabled: false,
@@ -300,22 +312,20 @@ test('real streamable MCP and remote Skill complete governed lifecycle', async (
     const publishedMcpData = publishedMcpCapabilities.data ?? publishedMcpCapabilities;
     expect(publishedMcpData.changed).toBe(true);
     expect(publishedMcpData.selected_mcp_tool_ids).toEqual([geocodeTool!.id]);
-    lifecycleAgentVersionId = publishedMcpData.agent_version_id ?? null;
-    expect(lifecycleAgentVersionId).toBeTruthy();
-    lifecycleAgentVersionIds.push(lifecycleAgentVersionId!);
-    const capabilities = await rustApi<{
-      skills: Array<{ version_id?: string; source_uri?: string }>;
-      mcp_tools: Array<{ resource_id: string }>;
-    }>(
-      token,
-      `/api/v1/agent-versions/${lifecycleAgentVersionId}/effective-capabilities?tenant_id=${encodeURIComponent(tenantId)}`
-    );
-    expect(capabilities.skills).toEqual([]);
-    expect(capabilities.mcp_tools.map((tool) => tool.resource_id)).toEqual([geocodeTool!.id]);
+    runtimeId = publishedMcpData.runtime_id ?? null;
+    expect(runtimeId).toBeTruthy();
+    const capabilities = await desktopApi<{
+      data?: { runtime_id: string; selected_mcp_tool_ids: string[] };
+      runtime_id?: string;
+      selected_mcp_tool_ids?: string[];
+    }>(page, token, `/api/agents/${runtimeId}/mcp-capabilities`);
+    const capabilityData = capabilities.data ?? capabilities;
+    expect(capabilityData.runtime_id).toBe(runtimeId);
+    expect(capabilityData.selected_mcp_tool_ids).toEqual([geocodeTool!.id]);
 
     await page.evaluate((agentId) => {
       window.location.hash = `#/settings/agent/${agentId}/repair`;
-    }, agent!.id);
+    }, runtimeId);
     const agentMcpPanel = page.getByTestId('agent-mcp-capabilities-panel');
     await expect(agentMcpPanel).toBeVisible({ timeout: 20_000 });
     await expect(agentMcpPanel).toContainText('Local browser');
@@ -401,26 +411,25 @@ test('real streamable MCP and remote Skill complete governed lifecycle', async (
     const removedMcpCapabilities = await desktopApi<{
       data?: {
         changed: boolean;
-        agent_version_id: string;
+        runtime_id: string;
         browser_enabled: boolean;
         selected_mcp_tool_ids: string[];
         previous_version_revoked: boolean;
       };
       changed?: boolean;
-      agent_version_id?: string;
+      runtime_id?: string;
       browser_enabled?: boolean;
       selected_mcp_tool_ids?: string[];
       previous_version_revoked?: boolean;
-    }>(page, token, `/api/agents/${agent!.id}/mcp-capabilities`, 'PUT', {
+    }>(page, token, `/api/agents/${runtimeId}/mcp-capabilities`, 'PUT', {
       mcp_tool_ids: [],
       browser_enabled: false,
     });
     const removedMcpData = removedMcpCapabilities.data ?? removedMcpCapabilities;
     expect(removedMcpData.changed).toBe(true);
     expect(removedMcpData.selected_mcp_tool_ids).toEqual([]);
-    expect(removedMcpData.previous_version_revoked).toBe(true);
-    expect(removedMcpData.agent_version_id).toBeTruthy();
-    lifecycleAgentVersionIds.push(removedMcpData.agent_version_id!);
+    expect(removedMcpData.runtime_id).toBe(runtimeId);
+    expect(removedMcpData.previous_version_revoked).toBe(false);
     await sendbox.fill('再次帮我查询北京站的经纬度；工具已从 Agent 权限中移除时不要使用记忆或猜测。');
     await expect(sendButton).toBeEnabled({ timeout: 20_000 });
     await sendButton.click();

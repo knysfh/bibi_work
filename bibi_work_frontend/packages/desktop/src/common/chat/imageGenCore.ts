@@ -239,7 +239,7 @@ export async function executeImageGeneration(
     // Create client and call API
     const rotatingClient: RotatingClient = await ClientFactory.createRotatingClient(provider, {
       proxy,
-      rotatingOptions: { maxRetries: 3, retryDelay: 1000 },
+      rotatingOptions: { maxRetries: 3 },
     });
 
     const completion: UnifiedChatCompletionResponse = await rotatingClient.createChatCompletion(

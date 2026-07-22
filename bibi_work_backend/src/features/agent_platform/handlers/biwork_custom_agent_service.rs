@@ -4,7 +4,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::{Postgres, Row, Transaction};
+use sqlx::Row;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -50,19 +50,6 @@ pub struct AgentMcpCapabilitiesPayload {
     browser_enabled: bool,
 }
 
-#[derive(Debug)]
-struct AgentMcpBindingRow {
-    tool_id: Uuid,
-    schema_hash_at_publish: Option<String>,
-    current_schema_hash: Option<String>,
-}
-
-#[derive(Debug)]
-struct LatestAgentVersionRow {
-    id: Uuid,
-    config_snapshot: Value,
-}
-
 pub async fn biwork_list_agents_management(
     State(state): State<AppState>,
     Extension(ctx): Extension<PlatformRequestContext>,
@@ -71,7 +58,7 @@ pub async fn biwork_list_agents_management(
         r#"
         SELECT a.id, a.name, a.description, a.status, a.metadata, a.draft_config,
                a.created_at, a.updated_at
-        FROM agents a
+        FROM agent_runtimes a
         WHERE a.tenant_id = $1 AND a.deleted_at IS NULL
         ORDER BY a.updated_at DESC, a.created_at DESC
         LIMIT 500
@@ -158,23 +145,62 @@ pub async fn biwork_create_custom_agent(
         payload.env,
         payload.advanced,
     );
+    let runtime_id = Uuid::new_v4();
+    let assistant_config = json!({
+        "engine_agent_id": runtime_id,
+        "acp_backend": "biwork_cli",
+        "runtime": { "kind": "biwork_cli" },
+        "defaults": {
+            "model": { "mode": "inherit" },
+            "permission": { "mode": "inherit" },
+            "thought_level": { "mode": "inherit" },
+            "skills": { "mode": "replace", "value": [] },
+            "mcps": { "mode": "replace", "value": [] }
+        }
+    });
+    let assistant_metadata = metadata.clone();
+    let mut tx = state.connect_pool.begin().await?;
     let row = sqlx::query(
         r#"
-        INSERT INTO agents (
-            tenant_id, owner_user_id, name, description, draft_config, metadata, status
+        INSERT INTO agent_runtimes (
+            id, tenant_id, owner_user_id, name, description, runtime_kind, source,
+            draft_config, metadata, status
         )
-        VALUES ($1, $2, $3, $4, $5, $6, 'draft')
+        VALUES ($1, $2, $3, $4, $5, 'biwork_cli', 'custom', $6, $7, 'draft')
         RETURNING id, name, description, status, metadata, draft_config, created_at, updated_at
         "#,
     )
+    .bind(runtime_id)
     .bind(ctx.tenant_id)
     .bind(ctx.platform_user_id)
     .bind(name)
-    .bind(description)
-    .bind(draft_config)
-    .bind(metadata)
-    .fetch_one(&state.connect_pool)
+    .bind(&description)
+    .bind(&draft_config)
+    .bind(&metadata)
+    .fetch_one(&mut *tx)
     .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO assistants (
+            id, tenant_id, owner_user_id, runtime_id, name, description,
+            draft_config, metadata, status
+        )
+        VALUES ($1, $2, $3, $1, $4, $5, $6, $7, 'draft')
+        "#,
+    )
+    .bind(runtime_id)
+    .bind(ctx.tenant_id)
+    .bind(ctx.platform_user_id)
+    .bind(name)
+    .bind(&description)
+    .bind(assistant_config)
+    .bind(assistant_metadata)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|_| AppError::DatabaseTransaction)?;
 
     Ok(ok(custom_agent_from_row(&row)?))
 }
@@ -201,9 +227,10 @@ pub async fn biwork_update_custom_agent(
         payload.env,
         payload.advanced,
     );
+    let mut tx = state.connect_pool.begin().await?;
     let row = sqlx::query(
         r#"
-        UPDATE agents
+        UPDATE agent_runtimes
         SET name = $4,
             description = $5,
             draft_config = $6,
@@ -221,12 +248,38 @@ pub async fn biwork_update_custom_agent(
     .bind(ctx.tenant_id)
     .bind(ctx.platform_user_id)
     .bind(name)
-    .bind(description)
-    .bind(draft_config)
-    .bind(metadata)
-    .fetch_optional(&state.connect_pool)
+    .bind(&description)
+    .bind(&draft_config)
+    .bind(&metadata)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| AppError::NotFound("custom agent not found".to_string()))?;
+
+    sqlx::query(
+        r#"
+        UPDATE assistants
+        SET name = $4,
+            description = $5,
+            metadata = metadata || $6,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1
+          AND tenant_id = $2
+          AND owner_user_id = $3
+          AND runtime_id = $1
+          AND deleted_at IS NULL
+        "#,
+    )
+    .bind(agent_id)
+    .bind(ctx.tenant_id)
+    .bind(ctx.platform_user_id)
+    .bind(name)
+    .bind(&description)
+    .bind(&metadata)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|_| AppError::DatabaseTransaction)?;
 
     Ok(ok(custom_agent_from_row(&row)?))
 }
@@ -236,9 +289,49 @@ pub async fn biwork_delete_custom_agent(
     Extension(ctx): Extension<PlatformRequestContext>,
     Path(agent_id): Path<Uuid>,
 ) -> Result<Json<Value>, AppError> {
+    let dependent_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM assistants
+        WHERE tenant_id = $1
+          AND runtime_id = $2
+          AND id <> $2
+          AND deleted_at IS NULL
+        "#,
+    )
+    .bind(ctx.tenant_id)
+    .bind(agent_id)
+    .fetch_one(&state.connect_pool)
+    .await?;
+    if dependent_count > 0 {
+        return Err(AppError::InvalidInput(
+            "runtime is still referenced by one or more assistants".to_string(),
+        ));
+    }
+
+    let mut tx = state.connect_pool.begin().await?;
+    sqlx::query(
+        r#"
+        UPDATE assistants
+        SET deleted_at = CURRENT_TIMESTAMP,
+            status = 'disabled',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1
+          AND tenant_id = $2
+          AND owner_user_id = $3
+          AND runtime_id = $1
+          AND deleted_at IS NULL
+        "#,
+    )
+    .bind(agent_id)
+    .bind(ctx.tenant_id)
+    .bind(ctx.platform_user_id)
+    .execute(&mut *tx)
+    .await?;
+
     let result = sqlx::query(
         r#"
-        UPDATE agents
+        UPDATE agent_runtimes
         SET deleted_at = CURRENT_TIMESTAMP,
             status = 'disabled',
             updated_at = CURRENT_TIMESTAMP
@@ -252,8 +345,11 @@ pub async fn biwork_delete_custom_agent(
     .bind(agent_id)
     .bind(ctx.tenant_id)
     .bind(ctx.platform_user_id)
-    .execute(&state.connect_pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit()
+        .await
+        .map_err(|_| AppError::DatabaseTransaction)?;
 
     Ok(ok(json!({ "deleted": result.rows_affected() > 0 })))
 }
@@ -267,7 +363,7 @@ pub async fn biwork_set_agent_enabled(
     let status = if payload.enabled { "draft" } else { "disabled" };
     let row = sqlx::query(
         r#"
-        UPDATE agents
+        UPDATE agent_runtimes
         SET status = $4,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = $1
@@ -296,7 +392,7 @@ pub async fn biwork_get_agent_overrides(
     let row = sqlx::query(
         r#"
         SELECT draft_config
-        FROM agents
+        FROM agent_runtimes
         WHERE id = $1
           AND tenant_id = $2
           AND deleted_at IS NULL
@@ -328,7 +424,7 @@ pub async fn biwork_set_agent_overrides(
 ) -> Result<Json<Value>, AppError> {
     let row = sqlx::query(
         r#"
-        UPDATE agents
+        UPDATE agent_runtimes
         SET draft_config = jsonb_set(
                 jsonb_set(
                     draft_config,
@@ -366,28 +462,24 @@ pub async fn biwork_get_agent_mcp_capabilities(
     Path(agent_id): Path<Uuid>,
 ) -> Result<Json<Value>, AppError> {
     ensure_agent_manage_access(&state, &ctx, agent_id).await?;
-
-    let version = latest_agent_version(&state.connect_pool, ctx.tenant_id, agent_id).await?;
-    let version_id = version.as_ref().map(|version| version.id);
-    let browser_enabled = version
-        .as_ref()
-        .is_some_and(|version| browser_capability_enabled(&version.config_snapshot));
-    let bindings = if let Some(version_id) = version_id {
-        load_agent_mcp_bindings(&state.connect_pool, ctx.tenant_id, version_id).await?
-    } else {
-        Vec::new()
-    };
-    let selected_ids = bindings
+    let runtime_id = resolve_runtime_id(&state, ctx.tenant_id, agent_id).await?;
+    let capabilities: Value = sqlx::query_scalar(
+        r#"
+        SELECT capabilities
+        FROM agent_runtimes
+        WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+        "#,
+    )
+    .bind(runtime_id)
+    .bind(ctx.tenant_id)
+    .fetch_optional(&state.connect_pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("runtime not found".to_string()))?;
+    let browser_enabled = browser_capability_enabled(&capabilities);
+    let selected_bindings = runtime_mcp_bindings(&capabilities);
+    let selected_ids = selected_bindings
         .iter()
-        .map(|binding| binding.tool_id)
-        .collect::<Vec<_>>();
-    let stale_ids = bindings
-        .iter()
-        .filter(|binding| {
-            binding.schema_hash_at_publish.is_none()
-                || binding.schema_hash_at_publish != binding.current_schema_hash
-        })
-        .map(|binding| binding.tool_id)
+        .map(|(tool_id, _)| *tool_id)
         .collect::<Vec<_>>();
 
     let rows = sqlx::query(
@@ -408,6 +500,23 @@ pub async fn biwork_get_agent_mcp_capabilities(
     .bind(ctx.tenant_id)
     .fetch_all(&state.connect_pool)
     .await?;
+
+    let current_hashes = rows
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<Uuid, _>("tool_id")?,
+                row.try_get::<Option<String>, _>("schema_hash")?,
+            ))
+        })
+        .collect::<Result<std::collections::HashMap<_, _>, sqlx::Error>>()?;
+    let stale_ids = selected_bindings
+        .iter()
+        .filter_map(|(tool_id, published_hash)| {
+            let current_hash = current_hashes.get(tool_id).and_then(|value| value.as_ref());
+            (published_hash.as_ref() != current_hash).then_some(*tool_id)
+        })
+        .collect::<Vec<_>>();
 
     let mut servers: Vec<Value> = Vec::new();
     let selected = selected_ids
@@ -458,7 +567,8 @@ pub async fn biwork_get_agent_mcp_capabilities(
 
     Ok(ok(json!({
         "agent_id": agent_id,
-        "agent_version_id": version_id,
+        "runtime_id": runtime_id,
+        "agent_version_id": capabilities.get("revision").cloned().unwrap_or(Value::Null),
         "browser_enabled": browser_enabled,
         "selected_mcp_tool_ids": selected_ids,
         "stale_mcp_tool_ids": stale_ids,
@@ -473,159 +583,69 @@ pub async fn biwork_publish_agent_mcp_capabilities(
     Json(payload): Json<AgentMcpCapabilitiesPayload>,
 ) -> Result<Json<Value>, AppError> {
     ensure_agent_manage_access(&state, &ctx, agent_id).await?;
+    let runtime_id = resolve_runtime_id(&state, ctx.tenant_id, agent_id).await?;
     let mut selected_ids = payload.mcp_tool_ids;
     let browser_enabled = payload.browser_enabled;
     selected_ids.sort_unstable();
     selected_ids.dedup();
 
     let mut tx = state.connect_pool.begin().await?;
-    let agent_row = sqlx::query(
+    let selected_tools = sqlx::query(
         r#"
-        SELECT draft_config
-        FROM agents
-        WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-        FOR UPDATE
-        "#,
-    )
-    .bind(agent_id)
-    .bind(ctx.tenant_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| AppError::NotFound("agent not found".to_string()))?;
-    let draft_config: Value = agent_row.try_get("draft_config")?;
-
-    let previous = sqlx::query(
-        r#"
-        SELECT id, config_snapshot, policy_version, schema_hash
-        FROM agent_versions
-        WHERE tenant_id = $1 AND agent_id = $2 AND status = 'published'
-        ORDER BY created_at DESC, id DESC
-        LIMIT 1
-        FOR UPDATE
+        SELECT tool.id, tool.schema_hash
+        FROM mcp_tools tool
+        JOIN mcp_servers server
+          ON server.id = tool.mcp_server_id
+         AND server.tenant_id = tool.tenant_id
+        WHERE tool.tenant_id = $1
+          AND tool.id = ANY($2::uuid[])
+          AND tool.status = 'active'
+          AND server.status = 'active'
+          AND server.deleted_at IS NULL
+        ORDER BY tool.id ASC
         "#,
     )
     .bind(ctx.tenant_id)
-    .bind(agent_id)
-    .fetch_optional(&mut *tx)
+    .bind(&selected_ids)
+    .fetch_all(&mut *tx)
     .await?;
-    let previous_version_id = previous
-        .as_ref()
-        .map(|row| row.try_get::<Uuid, _>("id"))
-        .transpose()?;
-    let previous_browser_enabled = previous
-        .as_ref()
-        .map(|row| row.try_get::<Value, _>("config_snapshot"))
-        .transpose()?
-        .as_ref()
-        .is_some_and(browser_capability_enabled);
-    let previous_bindings = if let Some(previous_version_id) = previous_version_id {
-        load_agent_mcp_bindings_tx(&mut tx, ctx.tenant_id, previous_version_id).await?
-    } else {
-        Vec::new()
-    };
-    let mut previous_ids = previous_bindings
-        .iter()
-        .map(|binding| binding.tool_id)
-        .collect::<Vec<_>>();
-    previous_ids.sort_unstable();
-    let has_stale_binding = previous_bindings.iter().any(|binding| {
-        binding.schema_hash_at_publish.is_none()
-            || binding.schema_hash_at_publish != binding.current_schema_hash
-    });
-    if let Some(previous_version_id) = previous_version_id
-        && previous_ids == selected_ids
-        && previous_browser_enabled == browser_enabled
-        && !has_stale_binding
-    {
-        let revoked_versions = revoke_unsafe_published_agent_versions(
-            &mut tx,
-            ctx.tenant_id,
-            agent_id,
-            previous_version_id,
-            &selected_ids,
-        )
-        .await?;
-        tx.commit()
-            .await
-            .map_err(|_| AppError::DatabaseTransaction)?;
-        return Ok(ok(json!({
-            "changed": false,
-            "agent_id": agent_id,
-            "agent_version_id": previous_version_id,
-            "browser_enabled": browser_enabled,
-            "selected_mcp_tool_ids": selected_ids,
-            "previous_version_revoked": revoked_versions > 0,
-        })));
-    }
-
-    let selected_tools = load_bindable_mcp_tools_tx(&mut tx, ctx.tenant_id, &selected_ids).await?;
     if selected_tools.len() != selected_ids.len() {
         return Err(AppError::InvalidInput(
             "one or more MCP tools are not active in the current tenant".to_string(),
         ));
     }
-
-    let mut config_snapshot = previous
-        .as_ref()
-        .map(|row| row.try_get::<Value, _>("config_snapshot"))
-        .transpose()?
-        .unwrap_or(draft_config);
-    set_browser_capability(&mut config_snapshot, browser_enabled)?;
-    let policy_version = previous
-        .as_ref()
-        .map(|row| row.try_get::<String, _>("policy_version"))
-        .transpose()?
-        .unwrap_or_else(|| "local-policy-v1".to_string());
-    let schema_hash = previous
-        .as_ref()
-        .map(|row| row.try_get::<Option<String>, _>("schema_hash"))
-        .transpose()?
-        .flatten();
-    let version_id: Uuid = sqlx::query_scalar(
+    let revision = Uuid::new_v4();
+    let mcp_tools = selected_tools
+        .into_iter()
+        .map(|row| {
+            Ok(json!({
+                "id": row.try_get::<Uuid, _>("id")?,
+                "schema_hash": row.try_get::<Option<String>, _>("schema_hash")?,
+            }))
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    let capabilities = json!({
+        "revision": revision,
+        "browser": { "enabled": browser_enabled },
+        "mcp_tools": mcp_tools,
+    });
+    let result = sqlx::query(
         r#"
-        INSERT INTO agent_versions (
-            tenant_id, agent_id, version_label, config_snapshot, policy_version, schema_hash, status
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, 'published')
-        RETURNING id
+        UPDATE agent_runtimes
+        SET capabilities = $3,
+            draft_config = jsonb_set(draft_config, '{capabilities}', $3, true),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
         "#,
     )
+    .bind(runtime_id)
     .bind(ctx.tenant_id)
-    .bind(agent_id)
-    .bind(format!("agent-capabilities-{}", Uuid::new_v4().simple()))
-    .bind(config_snapshot)
-    .bind(policy_version)
-    .bind(schema_hash)
-    .fetch_one(&mut *tx)
+    .bind(&capabilities)
+    .execute(&mut *tx)
     .await?;
-
-    if let Some(previous_version_id) = previous_version_id {
-        copy_non_mcp_agent_bindings(&mut tx, previous_version_id, version_id).await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound("runtime not found".to_string()));
     }
-    for (tool_id, tool_schema_hash) in selected_tools {
-        sqlx::query(
-            r#"
-            INSERT INTO agent_version_mcp_bindings (
-                agent_version_id, mcp_tool_id, schema_hash_at_publish, binding_mode
-            )
-            VALUES ($1, $2, $3, 'optional')
-            "#,
-        )
-        .bind(version_id)
-        .bind(tool_id)
-        .bind(tool_schema_hash)
-        .execute(&mut *tx)
-        .await?;
-    }
-
-    let revoked_versions = revoke_unsafe_published_agent_versions(
-        &mut tx,
-        ctx.tenant_id,
-        agent_id,
-        version_id,
-        &selected_ids,
-    )
-    .await?;
 
     tx.commit()
         .await
@@ -633,11 +653,36 @@ pub async fn biwork_publish_agent_mcp_capabilities(
     Ok(ok(json!({
         "changed": true,
         "agent_id": agent_id,
-        "agent_version_id": version_id,
+        "runtime_id": runtime_id,
+        "agent_version_id": revision,
         "browser_enabled": browser_enabled,
         "selected_mcp_tool_ids": selected_ids,
-        "previous_version_revoked": revoked_versions > 0,
+        "previous_version_revoked": false,
     })))
+}
+
+async fn resolve_runtime_id(
+    state: &AppState,
+    tenant_id: Uuid,
+    resource_id: Uuid,
+) -> Result<Uuid, AppError> {
+    sqlx::query_scalar(
+        r#"
+        SELECT id
+        FROM agent_runtimes
+        WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+        UNION ALL
+        SELECT runtime_id
+        FROM assistants
+        WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+        LIMIT 1
+        "#,
+    )
+    .bind(resource_id)
+    .bind(tenant_id)
+    .fetch_optional(&state.connect_pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("runtime not found".to_string()))
 }
 
 async fn ensure_agent_manage_access(
@@ -661,33 +706,6 @@ async fn ensure_agent_manage_access(
     .map(|_| ())
 }
 
-async fn latest_agent_version(
-    pool: &sqlx::PgPool,
-    tenant_id: Uuid,
-    agent_id: Uuid,
-) -> Result<Option<LatestAgentVersionRow>, AppError> {
-    let row = sqlx::query(
-        r#"
-        SELECT id, config_snapshot
-        FROM agent_versions
-        WHERE tenant_id = $1 AND agent_id = $2 AND status = 'published'
-        ORDER BY created_at DESC, id DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(tenant_id)
-    .bind(agent_id)
-    .fetch_optional(pool)
-    .await?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    Ok(Some(LatestAgentVersionRow {
-        id: row.try_get("id")?,
-        config_snapshot: row.try_get("config_snapshot")?,
-    }))
-}
-
 fn browser_capability_enabled(config_snapshot: &Value) -> bool {
     config_snapshot
         .pointer("/capabilities/browser/enabled")
@@ -695,6 +713,7 @@ fn browser_capability_enabled(config_snapshot: &Value) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn set_browser_capability(config_snapshot: &mut Value, enabled: bool) -> Result<(), AppError> {
     let root = config_snapshot.as_object_mut().ok_or_else(|| {
         AppError::InvalidInput("agent config_snapshot must be a JSON object".to_string())
@@ -717,181 +736,24 @@ fn set_browser_capability(config_snapshot: &mut Value, enabled: bool) -> Result<
     Ok(())
 }
 
-async fn load_agent_mcp_bindings(
-    pool: &sqlx::PgPool,
-    tenant_id: Uuid,
-    version_id: Uuid,
-) -> Result<Vec<AgentMcpBindingRow>, AppError> {
-    let rows = sqlx::query(
-        r#"
-        SELECT b.mcp_tool_id, b.schema_hash_at_publish, mt.schema_hash AS current_schema_hash
-        FROM agent_version_mcp_bindings b
-        JOIN mcp_tools mt ON mt.id = b.mcp_tool_id AND mt.tenant_id = $2
-        WHERE b.agent_version_id = $1
-        ORDER BY b.created_at ASC, b.mcp_tool_id ASC
-        "#,
-    )
-    .bind(version_id)
-    .bind(tenant_id)
-    .fetch_all(pool)
-    .await?;
-    binding_rows(rows)
-}
-
-async fn load_agent_mcp_bindings_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    tenant_id: Uuid,
-    version_id: Uuid,
-) -> Result<Vec<AgentMcpBindingRow>, AppError> {
-    let rows = sqlx::query(
-        r#"
-        SELECT b.mcp_tool_id, b.schema_hash_at_publish, mt.schema_hash AS current_schema_hash
-        FROM agent_version_mcp_bindings b
-        JOIN mcp_tools mt ON mt.id = b.mcp_tool_id AND mt.tenant_id = $2
-        WHERE b.agent_version_id = $1
-        ORDER BY b.created_at ASC, b.mcp_tool_id ASC
-        "#,
-    )
-    .bind(version_id)
-    .bind(tenant_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    binding_rows(rows)
-}
-
-fn binding_rows(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<AgentMcpBindingRow>, AppError> {
-    rows.into_iter()
-        .map(|row| {
-            Ok(AgentMcpBindingRow {
-                tool_id: row.try_get("mcp_tool_id")?,
-                schema_hash_at_publish: row.try_get("schema_hash_at_publish")?,
-                current_schema_hash: row.try_get("current_schema_hash")?,
-            })
+fn runtime_mcp_bindings(capabilities: &Value) -> Vec<(Uuid, Option<String>)> {
+    capabilities
+        .get("mcp_tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|binding| {
+            let tool_id = binding
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())?;
+            let schema_hash = binding
+                .get("schema_hash")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            Some((tool_id, schema_hash))
         })
         .collect()
-}
-
-async fn load_bindable_mcp_tools_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    tenant_id: Uuid,
-    tool_ids: &[Uuid],
-) -> Result<Vec<(Uuid, Option<String>)>, AppError> {
-    if tool_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let rows = sqlx::query(
-        r#"
-        SELECT mt.id, mt.schema_hash
-        FROM mcp_tools mt
-        JOIN mcp_servers ms ON ms.id = mt.mcp_server_id
-        WHERE mt.tenant_id = $1
-          AND mt.id = ANY($2::uuid[])
-          AND mt.status = 'active'
-          AND ms.tenant_id = $1
-          AND ms.status = 'active'
-          AND ms.deleted_at IS NULL
-        ORDER BY mt.id ASC
-        "#,
-    )
-    .bind(tenant_id)
-    .bind(tool_ids)
-    .fetch_all(&mut **tx)
-    .await?;
-    rows.into_iter()
-        .map(|row| Ok((row.try_get("id")?, row.try_get("schema_hash")?)))
-        .collect::<Result<Vec<_>, sqlx::Error>>()
-        .map_err(AppError::from)
-}
-
-async fn copy_non_mcp_agent_bindings(
-    tx: &mut Transaction<'_, Postgres>,
-    previous_version_id: Uuid,
-    version_id: Uuid,
-) -> Result<(), AppError> {
-    sqlx::query(
-        r#"
-        INSERT INTO agent_version_skill_bindings (agent_version_id, skill_version_id)
-        SELECT $2, skill_version_id
-        FROM agent_version_skill_bindings
-        WHERE agent_version_id = $1
-        "#,
-    )
-    .bind(previous_version_id)
-    .bind(version_id)
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query(
-        r#"
-        INSERT INTO agent_version_tool_bindings (agent_version_id, tool_version_id)
-        SELECT $2, tool_version_id
-        FROM agent_version_tool_bindings
-        WHERE agent_version_id = $1
-        "#,
-    )
-    .bind(previous_version_id)
-    .bind(version_id)
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query(
-        r#"
-        INSERT INTO agent_version_sql_tool_bindings (agent_version_id, sql_tool_version_id)
-        SELECT $2, sql_tool_version_id
-        FROM agent_version_sql_tool_bindings
-        WHERE agent_version_id = $1
-        "#,
-    )
-    .bind(previous_version_id)
-    .bind(version_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-async fn revoke_unsafe_published_agent_versions(
-    tx: &mut Transaction<'_, Postgres>,
-    tenant_id: Uuid,
-    agent_id: Uuid,
-    safe_version_id: Uuid,
-    selected_tool_ids: &[Uuid],
-) -> Result<u64, AppError> {
-    let result = sqlx::query(
-        r#"
-        UPDATE agent_versions AS version
-        SET status = 'disabled'
-        WHERE version.tenant_id = $1
-          AND version.agent_id = $2
-          AND version.id <> $3
-          AND version.status = 'published'
-          AND EXISTS (
-              SELECT 1
-              FROM agent_version_mcp_bindings binding
-              LEFT JOIN mcp_tools tool
-                ON tool.id = binding.mcp_tool_id
-               AND tool.tenant_id = $1
-              LEFT JOIN mcp_servers server
-                ON server.id = tool.mcp_server_id
-               AND server.tenant_id = $1
-              WHERE binding.agent_version_id = version.id
-                AND (
-                    NOT (binding.mcp_tool_id = ANY($4::uuid[]))
-                    OR tool.id IS NULL
-                    OR tool.status <> 'active'
-                    OR server.id IS NULL
-                    OR server.status <> 'active'
-                    OR server.deleted_at IS NOT NULL
-                    OR binding.schema_hash_at_publish IS NULL
-                    OR binding.schema_hash_at_publish IS DISTINCT FROM tool.schema_hash
-                )
-          )
-        "#,
-    )
-    .bind(tenant_id)
-    .bind(agent_id)
-    .bind(safe_version_id)
-    .bind(selected_tool_ids)
-    .execute(&mut **tx)
-    .await?;
-    Ok(result.rows_affected())
 }
 
 fn mcp_tool_risk(schema: &Value, tool_name: String) -> (&'static str, &'static str, bool, bool) {
@@ -936,7 +798,7 @@ pub async fn biwork_check_managed_agent_health(
     let row = sqlx::query(
         r#"
         SELECT id, name, description, status, metadata, draft_config, created_at, updated_at
-        FROM agents
+        FROM agent_runtimes
         WHERE id = $1
           AND tenant_id = $2
           AND deleted_at IS NULL
@@ -1195,7 +1057,9 @@ mod tests {
 
     #[test]
     fn browser_capability_defaults_off_and_preserves_other_config() {
+        let model_profile_id = Uuid::new_v4();
         let mut snapshot = json!({
+            "model_profile_id": model_profile_id,
             "runtime": {"kind": "deepagents"},
             "capabilities": {"memory": {"enabled": true}}
         });
@@ -1204,6 +1068,7 @@ mod tests {
         set_browser_capability(&mut snapshot, true).unwrap();
 
         assert!(browser_capability_enabled(&snapshot));
+        assert_eq!(snapshot["model_profile_id"], json!(model_profile_id));
         assert_eq!(snapshot["runtime"]["kind"], json!("deepagents"));
         assert_eq!(snapshot["capabilities"]["memory"]["enabled"], json!(true));
     }

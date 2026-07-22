@@ -87,6 +87,7 @@ describe('DesktopOidcController', () => {
     expect(url.searchParams.get('state')).toBe('state');
     expect(url.searchParams.get('redirect_uri')).toBe('http://127.0.0.1:45123/callback');
     expect(url.searchParams.get('scope')).toBe('openid profile offline_access');
+    expect(url.searchParams.get('prompt')).toBe('consent');
     expect(harness.openExternal).toHaveBeenCalledWith(authorizationUrl);
 
     await harness.controller.handleCallback({ code: 'authorization-code', state: 'state' });
@@ -225,5 +226,47 @@ describe('DesktopOidcController', () => {
     await expect(controller.getValidAccessToken(true)).resolves.toBeNull();
     expect(storedRefreshToken).toBeNull();
     expect(emitSessionExpired).toHaveBeenCalledWith('refresh_token_rejected');
+  });
+
+  it('does not restore a token from a refresh that finishes after session invalidation', async () => {
+    let storedAccessToken: string | null = null;
+    let storedRefreshToken: string | null = 'refresh-old';
+    let resolveRefresh!: (response: Response) => void;
+    const refreshResponse = new Promise<Response>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    const controller = new DesktopOidcController({
+      apiUrl: (endpoint) => endpoint,
+      emitLoginCompleted: vi.fn(),
+      emitLoginFailed: vi.fn(),
+      getLoopbackPort: () => 45123,
+      getStoredAccessToken: () => storedAccessToken,
+      openExternal: vi.fn(),
+      refreshTokenStore: {
+        load: vi.fn(async () => storedRefreshToken),
+        save: vi.fn(async (token: string) => {
+          storedRefreshToken = token;
+        }),
+        clear: vi.fn(async () => {
+          storedRefreshToken = null;
+        }),
+      },
+      setStoredAccessToken: (token) => {
+        storedAccessToken = token;
+      },
+      fetchImpl: vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(jsonResponse({ data: { client_id: 'desktop-client' } }))
+        .mockReturnValueOnce(refreshResponse),
+    });
+
+    const refresh = controller.getValidAccessToken(true);
+    await Promise.resolve();
+    await controller.invalidateSession();
+    resolveRefresh(jsonResponse({ data: { access_token: 'late-access', refresh_token: 'late-refresh' } }));
+
+    await expect(refresh).resolves.toBeNull();
+    expect(storedAccessToken).toBeNull();
+    expect(storedRefreshToken).toBeNull();
   });
 });

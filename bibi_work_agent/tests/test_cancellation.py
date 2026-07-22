@@ -666,7 +666,9 @@ def test_execute_run_payload_uses_snapshot_dispatch_context_for_fail_closed(
     assert fake_rust.emitted_batches[-1]["run_id"] == run_id
     assert failed["type"] == "run.failed"
     assert failed["payload"]["run_id"] == run_id
-    assert "run_config_snapshot.actor.user_id is required" in failed["payload"]["error"]
+    assert failed["payload"]["code"] == "BIWORK_INTERNAL_ERROR"
+    assert "run_config_snapshot.actor.user_id is required" in failed["payload"]["detail"]
+    assert "run_config_snapshot.actor.user_id is required" not in failed["payload"]["error"]
 
 
 def test_execute_run_payload_rejects_desktop_runtime_before_started(
@@ -705,7 +707,9 @@ def test_execute_run_payload_rejects_desktop_runtime_before_started(
     assert event_types == ["run.failed"]
     failed = fake_rust.emitted_batches[-1]["events"][0]
     assert failed["payload"]["run_id"] == run_id
-    assert "runtime.kind=biwork_cli" in failed["payload"]["error"]
+    assert failed["payload"]["code"] == "BIWORK_INTERNAL_ERROR"
+    assert "runtime.kind=biwork_cli" in failed["payload"]["detail"]
+    assert "runtime.kind=biwork_cli" not in failed["payload"]["error"]
 
 
 def test_execute_run_payload_waits_when_tool_requires_approval(monkeypatch) -> None:
